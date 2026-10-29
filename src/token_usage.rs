@@ -135,6 +135,16 @@ pub(crate) struct SseUsageScanner {
     pub(crate) bytes_seen: usize,
     /// Terminator state of the bytes forwarded so far.
     pub(crate) terminal: SseTerminal,
+    /// A `message_start` carrying a readable `input_tokens` was scanned:
+    /// input and cache tokens are known.
+    pub(crate) saw_input_usage: bool,
+    /// A `message_delta` carrying a readable `output_tokens` was scanned:
+    /// output tokens are known.
+    pub(crate) saw_output_usage: bool,
+    /// The upstream sent a frame other than `error` or `ping`, so content
+    /// may have gone downstream. Keyed on the `event:` name, which is what
+    /// the SDKs and the OpenAI-compatible translator dispatch on.
+    pub(crate) began: bool,
 }
 
 impl SseUsageScanner {
@@ -188,7 +198,9 @@ impl SseUsageScanner {
             if self.event_preview.len() < 5 {
                 self.event_preview.push(ev.trim_start().to_string());
             }
-            match ev.trim() {
+            let ev = ev.trim();
+            self.began |= !matches!(ev, "error" | "ping");
+            match ev {
                 "message_stop" => self.terminal.completed = true,
                 "error" => self.terminal.errored = true,
                 _ => {}
@@ -218,10 +230,12 @@ impl SseUsageScanner {
                     self.model = Some(m.to_owned());
                 }
                 if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
-                    self.usage.input_tokens = msg_usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    // Reported only when the count is readable: `"usage": {}`
+                    // reports nothing, so it must not waive the charge.
+                    if let Some(input) = msg_usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        self.saw_input_usage = true;
+                        self.usage.input_tokens = input;
+                    }
                     self.usage.cache_creation_input_tokens = msg_usage
                         .get("cache_creation_input_tokens")
                         .and_then(|v| v.as_u64())
@@ -233,15 +247,79 @@ impl SseUsageScanner {
                 }
             }
             "message_delta" => {
-                if let Some(delta_usage) = event.get("usage") {
-                    self.usage.output_tokens = delta_usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                // Counts are cumulative: one without a readable count keeps
+                // the last reported one.
+                if let Some(output) = event
+                    .pointer("/usage/output_tokens")
+                    .and_then(|v| v.as_u64())
+                {
+                    self.saw_output_usage = true;
+                    self.usage.output_tokens = output;
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// `max_tokens` charged when a streamed request's body carries none the proxy
+/// can read: at least the largest output any current model returns, so an
+/// unreadable value never charges less than a readable one could.
+const FALLBACK_CHARGE_MAX_TOKENS: u64 = 128_000;
+
+/// Request-body bytes per token for the input estimate. Text tokenises at
+/// roughly four bytes per token; images, sent base64, cost far fewer tokens
+/// than their bytes, so the estimate errs high for them.
+const BODY_BYTES_PER_TOKEN: usize = 4;
+
+/// What a streamed request is charged against its client's budget for usage
+/// the upstream never reported (LAB-7593).
+///
+/// Output tokens arrive only in the final `message_delta`, input and cache
+/// tokens in the opening `message_start`. A stream that ends before either —
+/// a client disconnect, an upstream error, a truncated stream — would
+/// otherwise be charged only what was scanned, so a client could take a
+/// whole generation and pay for its input alone. Budgets err toward less
+/// spend: the missing output is charged at the request's `max_tokens`, the
+/// missing input at an estimate from the request body.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct StreamFallbackCharge {
+    pub(crate) max_tokens: u64,
+    pub(crate) input_estimate: u64,
+}
+
+impl StreamFallbackCharge {
+    /// Read from the Anthropic-shape body sent upstream — the one whose
+    /// `max_tokens` bounds the generation.
+    pub(crate) fn from_request_body(body: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct MaxTokens {
+            max_tokens: Option<u64>,
+        }
+        let max_tokens = serde_json::from_slice::<MaxTokens>(body)
+            .ok()
+            .and_then(|b| b.max_tokens)
+            .unwrap_or(FALLBACK_CHARGE_MAX_TOKENS);
+        Self {
+            max_tokens,
+            input_estimate: body.len().div_ceil(BODY_BYTES_PER_TOKEN) as u64,
+        }
+    }
+
+    /// `(input, output)` tokens to charge on top of the scanned usage: zero
+    /// for each half the upstream reported.
+    pub(crate) fn unreported(&self, scanner: &SseUsageScanner) -> (u64, u64) {
+        let input = if scanner.saw_input_usage {
+            0
+        } else {
+            self.input_estimate
+        };
+        let output = if scanner.saw_output_usage {
+            0
+        } else {
+            self.max_tokens
+        };
+        (input, output)
     }
 }
 
@@ -313,7 +391,9 @@ pub(crate) fn inject_account_auth(
 
 /// Client identity extracted from request headers.
 pub(crate) struct RequestContext {
-    pub(crate) client_id: String,
+    /// Who the request is from, and the client-policy snapshot it carries.
+    /// `caller.name()` is the request's `client_id`.
+    pub(crate) caller: Caller,
     pub(crate) client_ver: String,
     pub(crate) agent_id: String,
     pub(crate) session_id: String,
@@ -345,22 +425,24 @@ pub(crate) fn affinity_routing_key(
 }
 
 impl RequestContext {
-    /// `principal` is the authenticated client from `AppState::authenticate`.
-    /// When present it IS the identity — `x-client-id` and the `client_names`
+    /// `auth` is what `AppState::authenticate` established. Its principal,
+    /// when present, IS the identity — `x-client-id` and the `client_names`
     /// IP map are not consulted at all. This one substitution is what makes
     /// budgets, ceilings, operator bypass, the model allow-list and the
     /// response-cache tenant unspoofable: every one of them keys on
-    /// `client_id`, and this is where `client_id` is born.
+    /// `client_id`, and this is where `client_id` is born. The caller keeps
+    /// the policy snapshot `auth` read, for the whole request.
     pub(crate) fn from_request(
         state: &AppState,
         client_ip: &IpAddr,
         headers: &axum::http::HeaderMap,
-        principal: Option<&ClientConfig>,
+        auth: Authenticated,
     ) -> Self {
+        let Authenticated { policy, principal } = auth;
         Self {
-            client_id: match principal {
-                Some(c) => c.name.clone(),
-                None => state.resolve_client_id(client_ip, headers),
+            caller: match principal {
+                Some(principal) => Caller { policy, principal },
+                None => Caller::named(policy, state.resolve_client_id(client_ip, headers)),
             },
             client_ver: headers
                 .get("user-agent")
@@ -402,7 +484,7 @@ impl RequestContext {
     pub(crate) fn affinity_key(&self, client_ip: &IpAddr, fp: Option<&str>) -> Option<String> {
         affinity_routing_key(
             client_ip,
-            &self.client_id,
+            self.caller.name(),
             &self.agent_id,
             &self.session_id,
             fp,

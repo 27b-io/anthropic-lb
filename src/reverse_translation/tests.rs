@@ -16,6 +16,42 @@ fn translate_a2o_drops_temperature_for_rejecting_model() {
     assert_eq!(result["top_p"], 0.9);
 }
 
+/// LAB-6894: `model` is the one forwarded field the routing gate reads, and
+/// the gate reads a non-string one as no model. Any model that is not
+/// a non-empty string is an error, which makes the fallback body
+/// `Untranslatable`; a string one is copied as is.
+#[test]
+fn translate_a2o_requires_a_non_empty_string_model() {
+    let messages = serde_json::json!([{"role": "user", "content": "Hello"}]);
+    for model in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!(["claude-opus-5"]),
+        serde_json::json!({"id": "claude-opus-5"}),
+        serde_json::json!(7),
+    ] {
+        let body = serde_json::json!({"model": model, "messages": messages});
+        assert_eq!(
+            translate_anthropic_request_to_openai(&body),
+            Err(MODEL_NOT_A_STRING.to_string()),
+            "{model}"
+        );
+    }
+    let absent = serde_json::json!({"messages": messages});
+    assert_eq!(
+        translate_anthropic_request_to_openai(&absent),
+        Err(MODEL_NOT_A_STRING.to_string())
+    );
+    assert!(matches!(
+        build_openai_fallback_body(br#"{"model":["claude-opus-5"],"messages":[]}"#),
+        FallbackBody::Untranslatable(msg) if msg == MODEL_NOT_A_STRING
+    ));
+
+    let body = serde_json::json!({"model": "claude-haiku-4-5", "messages": messages});
+    let result = translate_anthropic_request_to_openai(&body).unwrap();
+    assert_eq!(result["model"], "claude-haiku-4-5");
+}
+
 #[test]
 fn translate_a2o_keeps_default_temperature_for_rejecting_model() {
     // Default 1 passes through (upstream accepts it); ≤ 4.6 models are
@@ -325,19 +361,19 @@ fn reverse_sse_no_duplicate_message_stop() {
 
     // Start message
     translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     // Text
     translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     // Finish — emits message_stop
     let finish_events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &mut ctx,
+    );
     let stop_count = finish_events
         .iter()
         .filter(|e| e.contains("message_stop"))
@@ -594,25 +630,25 @@ fn reverse_sse_basic_text() {
 
     // First chunk with role
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(ctx.message_started);
     assert!(events.iter().any(|e| e.contains("message_start")));
 
     // Text delta
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("text_delta")));
     assert!(events.iter().any(|e| e.contains("Hello")));
 
     // Finish
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("message_delta")));
     assert!(events.iter().any(|e| e.contains("end_turn")));
     assert!(events.iter().any(|e| e.contains("message_stop")));
@@ -624,9 +660,9 @@ fn reverse_sse_tool_use() {
 
     // Tool call start
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(ctx.message_started);
     assert!(ctx.in_tool_use);
     assert!(events.iter().any(|e| e.contains("content_block_start")));
@@ -635,16 +671,16 @@ fn reverse_sse_tool_use() {
 
     // Tool arguments delta
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\"\"}}]},\"finish_reason\":null}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\"\"}}]},\"finish_reason\":null}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("input_json_delta")));
 
     // Finish
     let events = translate_openai_sse_to_anthropic(
-            "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-            &mut ctx,
-        );
+        "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        &mut ctx,
+    );
     assert!(events.iter().any(|e| e.contains("content_block_stop")));
     assert!(events.iter().any(|e| e.contains("tool_use")));
 }
@@ -842,10 +878,10 @@ async fn openai_chat_streaming_fence_strip_gated_on_response_format() {
             if data == "[DONE]" {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
-                    content.push_str(c);
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+                && let Some(c) = v["choices"][0]["delta"]["content"].as_str()
+            {
+                content.push_str(c);
             }
         }
         content
@@ -929,10 +965,10 @@ async fn openai_chat_streaming() {
     for line in body.lines() {
         if line == "data: [DONE]" {
             got_done = true;
-        } else if let Some(data) = line.strip_prefix("data: ") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                chunks.push(v);
-            }
+        } else if let Some(data) = line.strip_prefix("data: ")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+        {
+            chunks.push(v);
         }
     }
 
@@ -979,7 +1015,7 @@ async fn openai_chat_rejects_missing_auth() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1014,7 +1050,7 @@ async fn openai_chat_accepts_bearer_capitalized() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1031,7 +1067,10 @@ async fn openai_chat_accepts_bearer_capitalized() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("authorization", "Bearer secret-key")
+        .header(
+            "authorization",
+            format!("Bearer {}", test_key("secret-key")),
+        )
         .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
         .send()
         .await
@@ -1050,7 +1089,7 @@ async fn openai_chat_accepts_bearer_lowercase() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1067,7 +1106,10 @@ async fn openai_chat_accepts_bearer_lowercase() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("authorization", "bearer secret-key")
+        .header(
+            "authorization",
+            format!("bearer {}", test_key("secret-key")),
+        )
         .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
         .send()
         .await
@@ -1086,7 +1128,7 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     });
 
     let mock_url = format!("http://{}", mock_addr);
-    let (app, _state) = test_openai_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1100,17 +1142,25 @@ async fn openai_chat_wrong_apikey_valid_bearer() {
     });
 
     let client = Client::new();
-    let resp = client
-        .post(format!("http://{}/v1/chat/completions", addr))
-        .header("content-type", "application/json")
-        .header("x-api-key", "wrong-key")
-        .header("authorization", "Bearer secret-key")
-        .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
-        .send()
-        .await
-        .unwrap();
+    // A wrong key long enough to be compared, and one too short to be any key
+    // at all: either way the Bearer beside it still authenticates, because
+    // each credential is judged on its own.
+    for wrong in [test_key("wrong-key"), "wrong-key".to_string()] {
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("content-type", "application/json")
+            .header("x-api-key", &wrong)
+            .header(
+                "authorization",
+                format!("Bearer {}", test_key("secret-key")),
+            )
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
 
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{wrong}");
+    }
 }
 
 /// LAB-4323: a valid-JSON non-object body reads as `model = ""`, which every
@@ -1126,16 +1176,18 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
     let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = url.clone();
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
-        clients: vec![
-            mk_client("plain", "key-plain", &[]),
-            mk_client("limited", "key-limited", &["claude-haiku-*"]),
-            mk_client("ops", "key-ops", &[]),
-        ],
-        operators: vec!["ops".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("plain", &test_key("key-plain"), &[]),
+            mk_client("limited", &test_key("key-limited"), &["claude-haiku-*"]),
+            mk_client("ops", &test_key("key-ops"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
+            ..test_state_base()
+        }),
+    );
     let addr = serve(build_router(state)).await;
     let client = Client::new();
     let expected = openai_invalid_request_body("request body must be a JSON object");
@@ -1145,7 +1197,7 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
             let resp = client
                 .post(format!("http://{addr}/v1/chat/completions"))
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {key}"))
+                .header("authorization", format!("Bearer {}", test_key(key)))
                 .body(raw)
                 .send()
                 .await
@@ -1163,7 +1215,7 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
             let resp = client
                 .post(format!("http://{addr}/v1/messages"))
                 .header("content-type", "application/json")
-                .header("x-api-key", key)
+                .header("x-api-key", test_key(key))
                 .body(raw)
                 .send()
                 .await
@@ -1188,6 +1240,211 @@ async fn openai_chat_rejects_non_object_json_body_locally() {
         hits.load(Ordering::SeqCst),
         0,
         "a rejected body must never reach an upstream"
+    );
+}
+
+/// LAB-5497: a body that repeats a top-level key, or spells one outside
+/// lowercase ASCII, must 400 locally on both surfaces, for every client
+/// class, before the allow-list, routing or any upstream call. Both surfaces
+/// often forward the client's bytes as sent, so forwarding would let an
+/// upstream that keeps the first key, or ignores key case, act on a field the
+/// proxy never checked. One endpoint per protocol arm points at the counting
+/// upstream, so a forward on either arm is a hit.
+#[tokio::test]
+async fn ambiguous_top_level_key_is_rejected_locally_on_both_surfaces() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url.clone();
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("plain", &test_key("key-plain"), &[]),
+            mk_client("limited", &test_key("key-limited"), &["claude-haiku-*"]),
+            mk_client("ops", &test_key("key-ops"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![mk_endpoint_at("acct", "sk-ant-api-test-aaa", &url), gw],
+            ..test_state_base()
+        }),
+    );
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+    let message = "request body has an ambiguous top-level key";
+
+    for key in ["key-plain", "key-limited", "key-ops"] {
+        for raw in AMBIGUOUS_KEY_BODIES {
+            let resp = client
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-api-key", test_key(key))
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {raw}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": message}
+                }),
+                "{key} {raw}"
+            );
+
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", test_key(key)))
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {raw}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                openai_invalid_request_body(message),
+                "{key} {raw}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a rejected body must never reach an upstream"
+    );
+}
+
+/// LAB-6894: a `Protocol::OpenAI` endpoint gets the client's own `model`
+/// value, on `/v1/chat/completions` as sent and on the `/v1/messages`
+/// fallback through the translator. A non-string model reads as no model,
+/// which every endpoint `models` list allows, and a gateway may read an array
+/// or a comma list as several models. None of these may reach the endpoint,
+/// for any client class. A missing, empty or non-string model is a 400 on
+/// both surfaces, except that on `/v1/messages` the restricted client's gate
+/// refuses an unreadable model first, with a 403. A comma model matches no
+/// `models` list, so the endpoint is never eligible.
+#[tokio::test]
+async fn non_string_or_comma_model_never_reaches_a_restricted_openai_endpoint() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", OPENAI_OK_BODY).await;
+    let mut gw = make_endpoint("gw", Protocol::OpenAI);
+    gw.base_url = url;
+    gw.models = vec!["claude-haiku-*".to_string()];
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("plain", &test_key("key-plain"), &[]),
+            mk_client("limited", &test_key("key-limited"), &["claude-haiku-*"]),
+            mk_client("ops", &test_key("key-ops"), &[]),
+        ])
+        .operators(&["ops"])
+        .install(AppState {
+            endpoints: vec![gw],
+            ..test_state_base()
+        }),
+    );
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+    let body = |model: &str| {
+        format!(r#"{{{model}"max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#)
+    };
+    let unreadable = [
+        r#""model":["claude-opus-5"],"#,
+        r#""model":["claude-haiku-4-5","claude-opus-5"],"#,
+        r#""model":"","#,
+        r#""model":null,"#,
+        r#""model":7,"#,
+    ];
+    let comma = r#""model":"claude-haiku-4-5,claude-opus-5","#;
+
+    for key in ["key-plain", "key-limited", "key-ops"] {
+        for model in unreadable.iter().chain(&[""]) {
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", test_key(key)))
+                .body(body(model))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {model}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await,
+                openai_invalid_request_body(MODEL_NOT_A_STRING),
+                "{key} {model}"
+            );
+        }
+        for model in unreadable {
+            let resp = client
+                .post(format!("http://{addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-api-key", test_key(key))
+                .body(body(model))
+                .send()
+                .await
+                .unwrap();
+            if key == "key-limited" {
+                assert_eq!(
+                    resp.status(),
+                    reqwest::StatusCode::FORBIDDEN,
+                    "{key} {model}"
+                );
+                continue;
+            }
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{key} {model}"
+            );
+            assert_eq!(
+                parse_wire_error_envelope(resp).await["error"]["message"],
+                MODEL_NOT_A_STRING,
+                "{key} {model}"
+            );
+        }
+        for (path, auth, value) in [
+            (
+                "/v1/chat/completions",
+                "authorization",
+                format!("Bearer {}", test_key(key)),
+            ),
+            ("/v1/messages", "x-api-key", test_key(key)),
+        ] {
+            let resp = client
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .header(auth, value)
+                .body(body(comma))
+                .send()
+                .await
+                .unwrap();
+            // The restricted client's gate refuses it; for the others no
+            // endpoint is eligible, which is the model-filtered exhaustion
+            // status.
+            let expected = if key == "key-limited" {
+                reqwest::StatusCode::FORBIDDEN
+            } else {
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(resp.status(), expected, "{key} {path}");
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no unreadable or comma model may reach the endpoint"
     );
 }
 
@@ -1220,16 +1477,17 @@ async fn openai_chat_invalid_json_returns_openai_envelope() {
 /// `Protocol::OpenAI` endpoint forwards the client's own bytes, so they must
 /// arrive byte-identical; the spacing and key order below would not survive a
 /// re-serialization. Unlike the content-guard byte-identity tests, this one
-/// runs without the `guard` feature.
+/// runs without the `guard` feature. The endpoint's `models` list shows the
+/// LAB-6894 model checks leave an allowed model alone too.
 #[tokio::test]
 async fn openai_chat_forwards_object_body_byte_identically() {
     let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
     let mut gw = make_endpoint("gw", Protocol::OpenAI);
     gw.base_url = url;
+    gw.models = vec!["claude-haiku-*".to_string()];
     let addr = serve(build_router(test_state_with(vec![gw]))).await;
 
-    let raw =
-        r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"gpt-x", "max_tokens":5 }"#;
+    let raw = r#"{ "messages": [{"role":"user","content":"hi"}],  "model":"claude-haiku-4-5", "max_tokens":5 }"#;
     let resp = Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("content-type", "application/json")
@@ -1243,6 +1501,143 @@ async fn openai_chat_forwards_object_body_byte_identically() {
         .try_recv()
         .expect("an object body must reach the upstream");
     assert_eq!(received.as_ref(), raw.as_bytes());
+}
+
+/// LAB-6794: the body-level fallback lists an OpenAI-compatible gateway can
+/// honour, each naming a model outside every `models` list in these tests.
+/// `router_settings_override` carries the same lists one level down.
+const FALLBACK_FIELD_ROWS: [(&str, &str); 4] = [
+    ("fallbacks", r#"["claude-opus-5"]"#),
+    (
+        "context_window_fallbacks",
+        r#"[{"gpt-x": ["claude-opus-5"]}]"#,
+    ),
+    (
+        "content_policy_fallbacks",
+        r#"[{"gpt-x": ["claude-opus-5"]}]"#,
+    ),
+    (
+        "router_settings_override",
+        r#"{"fallbacks": [{"gpt-x": ["claude-opus-5"]}]}"#,
+    ),
+];
+
+/// A chat body carrying one fallback field. Its spacing and key order would
+/// not survive a re-serialization, so a verbatim forward is observable.
+fn fallback_field_body(field: &str, value: &str) -> String {
+    format!(
+        r#"{{ "model":"gpt-x", "{field}": {value}, "messages": [{{"role": "user", "content": "hi"}}],  "max_tokens":5 }}"#
+    )
+}
+
+/// What a restricted endpoint must receive for every `fallback_field_body`:
+/// the field gone and each kept value as the client wrote it.
+const STRIPPED_FALLBACK_BODY: &str =
+    r#"{"model":"gpt-x","messages":[{"role": "user", "content": "hi"}],"max_tokens":5}"#;
+
+/// LAB-6794: a `Protocol::OpenAI` endpoint gets the client's bytes, so a
+/// fallback list would let a gateway serve a model neither `models` gate saw.
+/// A restricted client, a restricted endpoint, or both, must forward without
+/// it; the same body from an unrestricted client to an unrestricted endpoint
+/// arrives byte-identical.
+#[tokio::test]
+async fn restricted_openai_endpoint_never_receives_fallback_fields() {
+    for endpoint_models in [&[][..], &["gpt-x"][..]] {
+        let (url, mut rx) = spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+        let mut gw = make_endpoint("gw", Protocol::OpenAI);
+        gw.base_url = url;
+        gw.models = endpoint_models.iter().map(|m| m.to_string()).collect();
+        let state = Arc::new(
+            TestPolicy::clients(vec![
+                mk_client("plain", &test_key("key-plain"), &[]),
+                mk_client("limited", &test_key("key-limited"), &["gpt-x*"]),
+            ])
+            .install(AppState {
+                endpoints: vec![gw],
+                ..test_state_base()
+            }),
+        );
+        let addr = serve(build_router(state)).await;
+        let client = Client::new();
+
+        for (field, value) in FALLBACK_FIELD_ROWS {
+            let raw = fallback_field_body(field, value);
+            for key in ["key-plain", "key-limited"] {
+                let resp = client
+                    .post(format!("http://{addr}/v1/chat/completions"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", test_key(key)))
+                    .body(raw.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                let case = format!("{field} {key} endpoint models {endpoint_models:?}");
+                assert_eq!(resp.status(), reqwest::StatusCode::OK, "{case}");
+                // The mock sends before it replies, so the capture is queued.
+                let (_, received) = rx.try_recv().expect("the body must reach the upstream");
+                let received = std::str::from_utf8(&received).unwrap();
+                if key == "key-limited" || !endpoint_models.is_empty() {
+                    assert_eq!(received, STRIPPED_FALLBACK_BODY, "{case}");
+                } else {
+                    assert_eq!(received, raw, "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// LAB-6794: the strip is judged per attempt, on the endpoint the retry loop
+/// actually picked, as in `forward_anthropic`. A 500 on the first endpoint
+/// rotates to the second; whichever of the two is restricted gets the
+/// stripped body, the other the client's bytes.
+#[tokio::test]
+async fn fallback_field_strip_follows_each_attempts_endpoint() {
+    let (field, value) = FALLBACK_FIELD_ROWS[1];
+    let raw = fallback_field_body(field, value);
+    for first_restricted in [true, false] {
+        let (first_url, mut first_rx) =
+            spawn_capturing_upstream(StatusCode::INTERNAL_SERVER_ERROR, OPENAI_OK_BODY).await;
+        let (second_url, mut second_rx) =
+            spawn_capturing_upstream(StatusCode::OK, OPENAI_OK_BODY).await;
+        let mut first = make_endpoint("first", Protocol::OpenAI);
+        first.base_url = first_url;
+        let mut second = make_endpoint("second", Protocol::OpenAI);
+        second.base_url = second_url;
+        second.priority = 1;
+        let restricted = if first_restricted {
+            &mut first
+        } else {
+            &mut second
+        };
+        restricted.models = vec!["gpt-x".to_string()];
+        let addr = serve(build_router(test_state_with(vec![first, second]))).await;
+
+        let resp = Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(raw.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let (_, first_body) = first_rx.try_recv().expect("first endpoint must be tried");
+        let (_, second_body) = second_rx.try_recv().expect("the 500 must rotate");
+        let (stripped, verbatim) = if first_restricted {
+            (first_body, second_body)
+        } else {
+            (second_body, first_body)
+        };
+        assert_eq!(
+            std::str::from_utf8(&stripped).unwrap(),
+            STRIPPED_FALLBACK_BODY,
+            "first restricted: {first_restricted}"
+        );
+        assert_eq!(
+            std::str::from_utf8(&verbatim).unwrap(),
+            raw,
+            "first restricted: {first_restricted}"
+        );
+    }
 }
 
 /// Integration test: verify OAuth accounts get the CC system prompt injected

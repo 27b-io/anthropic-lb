@@ -48,7 +48,7 @@ impl CacheSurface {
 /// collision could not decrypt another client's entry. The map doubles as
 /// the opt-in allow-list: no entry, no cache (AC2). All values are
 /// encrypted before any storage layer sees them, in-process L1 included
-/// (verified against cachekit-rs 0.5.0 `SecureCache::set_with_ttl`, which
+/// (verified against cachekit-rs 0.13.1 `SecureCache::set_with_ttl`, which
 /// writes ciphertext to both L1 and the backend).
 pub(crate) struct ResponseCache {
     pub(crate) clients: HashMap<String, cachekit::CacheKit>,
@@ -64,6 +64,207 @@ pub(crate) struct ResponseCache {
     count_tokens_misses: AtomicU64,
     count_tokens_errors: AtomicU64,
     count_tokens_stores: AtomicU64,
+    /// Redis backend only: the cachekitio backend's HTTP client cancels an
+    /// abandoned request, so nothing piles up there.
+    gate: Option<Arc<AbandonGate>>,
+}
+
+/// Bounds what a Redis outage can pile up in memory (LAB-10850). An op
+/// abandoned at `op_timeout` is still queued in fred, value included, until
+/// the connection is back: fred skips a queued command only when its OWN
+/// command timeout fired, and cachekit-rs 0.13 exposes no queue bound.
+///
+/// A write reaches fred only while writes in flight plus ops abandoned and
+/// not yet known drained stay at or under `CAP`, so fred never holds more
+/// than `CAP` values. On a healthy Redis that also caps concurrent writes at
+/// `CAP`. Reads carry no value; they pass until `CAP` ops are abandoned.
+/// From then on the gate is closed: no op passes, and a PING checks Redis,
+/// inside the probing op's own `op_timeout`.
+///
+/// A miss, a completed write or a PING reply (not a hit, which may come from
+/// L1, nor an error) clears only the ops abandoned before the answered op
+/// was admitted. fred answers in queue order, and an op abandoned before
+/// another was admitted was queued before it, if at all, so those have
+/// drained. An op abandoned later may sit behind the answered one and stays
+/// counted.
+///
+/// That queue-order argument needs one ordered connection, so only
+/// `redis://` and `rediss://` URLs are accepted, never a cluster.
+///
+/// Cancelled requests and lookups that time out on cachekit's per-key lock
+/// count as abandoned too, though they may never have reached fred, so a
+/// healthy Redis can close the gate. A PING is therefore sent at once when
+/// the gate closes, and again at once after any answer that leaves it
+/// closed. Only a PING that times out or is refused pushes the next one a
+/// probe interval out. The PING runs on its own task, so a request
+/// cancelled mid-PING does not cancel it: its outcome still counts.
+pub(crate) struct AbandonGate {
+    /// The backend the probe PINGs, the same one every op goes through.
+    backend: cachekit::SharedBackend,
+    probe_interval: Duration,
+    counts: std::sync::Mutex<GateCounts>,
+}
+
+/// Held only for a few integer updates, never across an await.
+struct GateCounts {
+    writes_in_flight: u64,
+    /// Abandoned ops not yet known drained, always the latest abandoned;
+    /// fred may still hold them.
+    abandoned: u64,
+    /// Every op ever abandoned. A slot records it at admission, so an answer
+    /// can tell which abandonments came after its op was admitted.
+    abandoned_ever: u64,
+    next_probe: std::time::Instant,
+}
+
+impl AbandonGate {
+    pub(crate) const CAP: u64 = 16;
+    pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Shared, so a slot, and the PING's task, can outlive its request.
+    fn new(backend: cachekit::SharedBackend, probe_interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            probe_interval,
+            counts: std::sync::Mutex::new(GateCounts {
+                writes_in_flight: 0,
+                abandoned: 0,
+                abandoned_ever: 0,
+                next_probe: std::time::Instant::now(),
+            }),
+        })
+    }
+
+    /// No code path panics while holding the lock, and a poisoned one still
+    /// holds consistent counts.
+    fn counts(&self) -> std::sync::MutexGuard<'_, GateCounts> {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A slot for one backend op, or `None` if the op must fail open
+    /// without reaching fred. A closed gate first lets the op that wins the
+    /// probe slot PING Redis, within the same `deadline` as the op itself.
+    async fn admit(self: &Arc<Self>, write: bool, deadline: tokio::time::Instant) -> Option<Slot> {
+        if let Some(ping) = self.probe_slot() {
+            let backend = self.backend.clone();
+            // Spawned, so a caller that disconnects mid-PING cannot drop the
+            // probe slot and push the next PING an interval out. A JoinError
+            // is a panic the hook already reported, or runtime shutdown.
+            let _ = tokio::spawn(async move {
+                match tokio::time::timeout_at(deadline, backend.health()).await {
+                    Ok(Ok(_)) => ping.answered(),
+                    Ok(Err(_)) => ping.finished(),
+                    Err(_) => drop(ping),
+                }
+            })
+            .await;
+        }
+        let mut counts = self.counts();
+        if counts.abandoned >= Self::CAP {
+            return None;
+        }
+        if write {
+            if counts.writes_in_flight + counts.abandoned >= Self::CAP {
+                return None;
+            }
+            counts.writes_in_flight += 1;
+        }
+        Some(self.slot(&counts, write))
+    }
+
+    /// The slot for a PING, if the gate is closed and a probe is due.
+    fn probe_slot(self: &Arc<Self>) -> Option<Slot> {
+        let mut counts = self.counts();
+        let now = std::time::Instant::now();
+        if counts.abandoned < Self::CAP || now < counts.next_probe {
+            return None;
+        }
+        counts.next_probe = now + self.probe_interval;
+        Some(self.slot(&counts, false))
+    }
+
+    fn slot(self: &Arc<Self>, counts: &GateCounts, write: bool) -> Slot {
+        Slot(Some(Held {
+            gate: self.clone(),
+            write,
+            abandoned_ever_at_admit: counts.abandoned_ever,
+        }))
+    }
+}
+
+/// One admitted backend op (`None` inside: no gate). Dropped without an
+/// outcome — timed out, or the caller's future cancelled — it counts as
+/// abandoned, since fred may still hold it.
+struct Slot(Option<Held>);
+
+struct Held {
+    gate: Arc<AbandonGate>,
+    write: bool,
+    abandoned_ever_at_admit: u64,
+}
+
+impl Held {
+    fn release(&self, counts: &mut GateCounts) {
+        if self.write {
+            counts.writes_in_flight -= 1;
+        }
+    }
+}
+
+impl Slot {
+    /// Redis answered: a miss, a completed write or a PING. A hit does not
+    /// count, as it may have come from L1.
+    fn answered(mut self) {
+        let Some(held) = self.0.take() else {
+            return;
+        };
+        let mut counts = held.gate.counts();
+        held.release(&mut counts);
+        let was = counts.abandoned;
+        // The ops still counted are always the latest ones abandoned, so
+        // keeping those abandoned after this op's admission is a `min`.
+        counts.abandoned = was.min(counts.abandoned_ever - held.abandoned_ever_at_admit);
+        if counts.abandoned >= AbandonGate::CAP {
+            // Still closed by ops abandoned after this one was admitted. Redis
+            // just answered, so PING again now rather than an interval out.
+            counts.next_probe = std::time::Instant::now();
+        } else if was >= AbandonGate::CAP {
+            info!("response cache: Redis answered again — gate reopened");
+        }
+    }
+
+    /// Done without showing that Redis answered: a hit or an error.
+    fn finished(mut self) {
+        if let Some(held) = self.0.take() {
+            held.release(&mut held.gate.counts());
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let Some(held) = self.0.take() else {
+            return;
+        };
+        let mut counts = held.gate.counts();
+        held.release(&mut counts);
+        counts.abandoned += 1;
+        counts.abandoned_ever += 1;
+        if counts.abandoned == AbandonGate::CAP {
+            // Probe at once: cancelled requests and per-key lock waits also
+            // count, so a healthy Redis can close the gate. Its PONG then
+            // reopens it within one round trip, not one interval. In an
+            // outage the PING times out and the next one waits the interval.
+            counts.next_probe = std::time::Instant::now();
+            warn!(
+                cap = AbandonGate::CAP,
+                probe_ms = held.gate.probe_interval.as_millis() as u64,
+                "response cache: Redis ops keep timing out — cache paused, PINGing Redis now, then every interval while it does not answer"
+            );
+        }
+    }
 }
 
 /// First 16 hex chars of a cache-key digest — the ONLY form a cache key may
@@ -72,7 +273,8 @@ pub(crate) fn key_digest_prefix(key: &str) -> &str {
     &key[..key.len().min(16)]
 }
 
-/// Decode a hex master key, enforcing the 32-byte SecureCache minimum.
+/// Decode a hex master key. cachekit-rs (>= 0.9) takes exactly 32 raw bytes,
+/// so any other length fails here, at config load, naming the config field.
 fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if !s.is_ascii() || !s.len().is_multiple_of(2) {
@@ -83,9 +285,9 @@ fn decode_hex_key(s: &str) -> Result<Vec<u8>, String> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
         .collect::<Result<Vec<u8>, _>>()
         .map_err(|_| "response_cache.master_key contains non-hex characters".to_string())?;
-    if bytes.len() < 32 {
+    if bytes.len() != 32 {
         return Err(format!(
-            "response_cache.master_key must decode to at least 32 bytes, got {}",
+            "response_cache.master_key must decode to exactly 32 bytes (64 hex chars), got {}",
             bytes.len()
         ));
     }
@@ -159,8 +361,12 @@ pub(crate) fn response_cache_key(
 }
 
 impl ResponseCache {
-    /// Storage-key namespace: entries land as `alb-resp:<digest>`.
-    const NAMESPACE: &'static str = "alb-resp";
+    /// Storage-key namespace: entries land as `alb-resp-v2:<digest>`. `-v2`
+    /// since cachekit-rs 0.10 (LAB-10850), which binds the namespaced key
+    /// into the AES-GCM AAD: an entry 0.5 wrote under `alb-resp` would fail
+    /// to authenticate (an error on every read until it expired) rather than
+    /// miss. A fresh namespace makes every pre-upgrade entry a plain miss.
+    const NAMESPACE: &'static str = "alb-resp-v2";
     pub(crate) const DEFAULT_TTL_SECS: u64 = 3600;
     const DEFAULT_OP_TIMEOUT_MS: u64 = 250;
     /// Per-client in-process L1 entries (ciphertext at rest). Together with
@@ -172,39 +378,44 @@ impl ResponseCache {
     pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
     /// Build from config. `Ok(None)` when the allow-list is empty (inert,
-    /// AC2). Config errors — bad key, missing backend params — are `Err`:
-    /// startup fails loudly rather than running with a silently-disabled
-    /// cache. Backend REACHABILITY is not required at startup: connection
-    /// failures are logged and every later operation fails open (AC10).
+    /// AC2) or Redis is unreachable at startup. Config errors — bad key,
+    /// missing backend params — are `Err`: startup fails loudly rather than
+    /// running with a silently-disabled cache. Backend REACHABILITY is not
+    /// required at startup: an unreachable cachekitio backend fails every
+    /// op open (AC10), and an unreachable Redis disables the cache.
     pub(crate) async fn from_config(cfg: &ResponseCacheConfig) -> Result<Option<Self>, String> {
         if cfg.clients.is_empty() {
+            info!("response_cache configured with an empty client allow-list — inert");
             return Ok(None);
         }
         let master_key = decode_hex_key(&cfg.master_key)?;
-        let backend: cachekit::SharedBackend = match cfg.backend.as_str() {
+        let (backend, redis): (cachekit::SharedBackend, _) = match cfg.backend.as_str() {
             "redis" => {
                 let url = cfg
                     .redis_url
                     .as_deref()
                     .ok_or("response_cache.redis_url is required for backend = \"redis\"")?;
-                let b = cachekit::backend::redis::RedisBackend::builder()
-                    .url(url)
-                    .build()
-                    .map_err(|e| format!("response_cache redis backend: {e}"))?;
-                // fred's connection task detaches when the handle drops.
-                // KNOWN LIMITATION (cachekit-rs 0.5.0, flagged upstream):
-                // auto-reconnect is pub(crate) and unreachable from this
-                // builder, so after a failed initial connect OR any later
-                // Redis outage the client does NOT recover — every cache op
-                // errors (fail-open, bounded by op_timeout per op) until the
-                // process restarts. Watch anthropic_response_cache_errors_total.
-                match b.connect().await {
-                    Ok(_handle) => info!("response cache redis backend connected"),
-                    Err(e) => {
-                        warn!(error = %e, "response cache redis connect failed — cache disabled until restart (fail-open)")
-                    }
+                // `AbandonGate` relies on one connection answering in order;
+                // fred would also take a cluster URL, which does not.
+                if !(url.starts_with("redis://") || url.starts_with("rediss://")) {
+                    return Err(
+                        "response_cache.redis_url must start with redis:// or rediss://".into(),
+                    );
                 }
-                std::sync::Arc::new(b)
+                // auto_reconnect: after a Redis outage the connection comes
+                // back on its own (backoff 100 ms → 30 s, cachekit's fixed
+                // policy); until then every op fails open within op_timeout,
+                // and `AbandonGate` bounds what the outage leaves queued. It
+                // also recycles a connection with a reply pending past
+                // cachekit's 5 s command timeout, far past any op_timeout.
+                let b = std::sync::Arc::new(
+                    cachekit::backend::redis::RedisBackend::builder()
+                        .url(url)
+                        .auto_reconnect()
+                        .build()
+                        .map_err(|e| format!("response_cache redis backend: {e}"))?,
+                );
+                (b.clone(), Some(b))
             }
             "cachekitio" => {
                 let api_key = cfg
@@ -221,26 +432,45 @@ impl ResponseCache {
                     // private/loopback IPs regardless.
                     builder = builder.api_url(url).allow_custom_host(true);
                 }
-                std::sync::Arc::new(
-                    builder
-                        .build()
-                        .map_err(|e| format!("response_cache cachekitio backend: {e}"))?,
-                )
+                let b = builder
+                    .build()
+                    .map_err(|e| format!("response_cache cachekitio backend: {e}"))?;
+                (std::sync::Arc::new(b), None)
             }
             other => {
                 return Err(format!(
                     "response_cache.backend must be \"cachekitio\" or \"redis\", got \"{other}\""
-                ))
+                ));
             }
         };
-        Self::from_parts(
+        // Every config check runs before the connect below, so an invalid
+        // config fails startup whether or not Redis is up.
+        let rc = Self::from_parts(
             backend,
             &cfg.clients,
             &master_key,
             Duration::from_secs(cfg.ttl_secs.unwrap_or(Self::DEFAULT_TTL_SECS)),
             Duration::from_millis(cfg.op_timeout_ms.unwrap_or(Self::DEFAULT_OP_TIMEOUT_MS)),
-        )
-        .map(Some)
+        )?;
+        let Some(redis) = redis else {
+            return Ok(Some(rc));
+        };
+        // fred's connection task detaches when the handle drops.
+        // KNOWN LIMITATION (cachekit-rs 0.13.1): the reconnect policy covers
+        // only a connection that was once established. The builder keeps
+        // fred's fail_fast on, so after a failed INITIAL connect nothing ever
+        // reads fred's queue: every op would sit there, value included, until
+        // the process restarts. So the cache is disabled instead, until the
+        // next restart.
+        if let Err(e) = redis.connect().await {
+            error!(error = %e, "response cache redis connect failed — cache disabled until restart (fail-open)");
+            return Ok(None);
+        }
+        info!("response cache redis backend connected");
+        Ok(Some(Self {
+            gate: Some(AbandonGate::new(redis, AbandonGate::PROBE_INTERVAL)),
+            ..rc
+        }))
     }
 
     /// Assemble per-client caches over a shared backend. Split out from
@@ -255,6 +485,8 @@ impl ResponseCache {
     ) -> Result<Self, String> {
         let mut map = HashMap::new();
         for client_id in clients {
+            // `ClientPolicy::build` refuses this at boot. The cache refuses it
+            // too, so no other way of building one can open a shared tenant.
             if client_id == "-" {
                 return Err(
                     "response_cache.clients cannot contain \"-\" (the unknown-client sentinel — it would opt in every unidentified caller)"
@@ -285,6 +517,7 @@ impl ResponseCache {
             count_tokens_misses: AtomicU64::new(0),
             count_tokens_errors: AtomicU64::new(0),
             count_tokens_stores: AtomicU64::new(0),
+            gate: None,
         })
     }
 
@@ -316,10 +549,22 @@ impl ResponseCache {
         }
     }
 
+    /// A slot for one backend op, or `None` if the gate refuses it. Without
+    /// a gate every op gets one. `deadline` bounds the gate's probe and the
+    /// op together, so neither pushes a request past `op_timeout`.
+    async fn admit(&self, write: bool, deadline: tokio::time::Instant) -> Option<Slot> {
+        match &self.gate {
+            Some(gate) => gate.admit(write, deadline).await,
+            None => Some(Slot(None)),
+        }
+    }
+
     /// Read an entry. Every failure mode — no encryption handle, backend
-    /// error, decrypt error, timeout — degrades to `None` and the request
-    /// proceeds upstream (AC10). Diagnostics carry the key digest only,
-    /// never content (AC5).
+    /// error, decrypt error, timeout, a closed `AbandonGate` — degrades to
+    /// `None` and the request proceeds upstream (AC10). Diagnostics carry the
+    /// key digest only, never content (AC5). cachekit-rs (after 0.5) holds a per-key lock across
+    /// the backend read, so concurrent lookups of one key queue behind each
+    /// other, and any still queued at `op_timeout` count as errors.
     pub(crate) async fn lookup(
         &self,
         client_id: &str,
@@ -327,22 +572,32 @@ impl ResponseCache {
         surface: CacheSurface,
     ) -> Option<CachedResponse> {
         let cache = self.clients.get(client_id)?;
-        let op = async { cache.secure()?.get::<CachedResponse>(key).await };
-        match tokio::time::timeout(self.op_timeout, op).await {
+        let deadline = tokio::time::Instant::now() + self.op_timeout;
+        let Some(slot) = self.admit(false, deadline).await else {
+            // No per-op log: `AbandonGate` warned once when it closed.
+            self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let op = async { cache.secure_cache()?.get::<CachedResponse>(key).await };
+        match tokio::time::timeout_at(deadline, op).await {
             Ok(Ok(Some(entry))) => {
+                slot.finished();
                 self.hits_for(surface).fetch_add(1, Ordering::Relaxed);
                 Some(entry)
             }
             Ok(Ok(None)) => {
+                slot.answered();
                 self.misses_for(surface).fetch_add(1, Ordering::Relaxed);
                 None
             }
             Ok(Err(e)) => {
+                slot.finished();
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(key_digest = key_digest_prefix(key), error = %e, "response cache read failed — proceeding upstream");
                 None
             }
             Err(_) => {
+                drop(slot); // abandoned: fred may still hold the GET
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(
                     key_digest = key_digest_prefix(key),
@@ -366,16 +621,24 @@ impl ResponseCache {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
-        let op = async { cache.secure()?.set(key, entry).await };
-        match tokio::time::timeout(self.op_timeout, op).await {
+        let deadline = tokio::time::Instant::now() + self.op_timeout;
+        let Some(slot) = self.admit(true, deadline).await else {
+            self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let op = async { cache.secure_cache()?.set(key, entry).await };
+        match tokio::time::timeout_at(deadline, op).await {
             Ok(Ok(())) => {
+                slot.answered();
                 self.stores_for(surface).fetch_add(1, Ordering::Relaxed);
             }
             Ok(Err(e)) => {
+                slot.finished();
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(key_digest = key_digest_prefix(key), error = %e, "response cache write failed — skipped");
             }
             Err(_) => {
+                drop(slot); // abandoned: fred may still hold the SET and its value
                 self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                 warn!(
                     key_digest = key_digest_prefix(key),
@@ -454,6 +717,33 @@ pub(crate) fn parse_ip_entries(entries: Option<&[String]>, field: &str) -> Vec<I
             }
         })
         .collect()
+}
+
+/// Why `authenticate` turned a request away.
+#[derive(Debug)]
+pub(crate) enum AuthRejection {
+    /// No credential matched: a failed credential, counted against the
+    /// client IP's failed-auth throttle.
+    Unauthorized,
+    /// A credential that may well be good, which the client store turns away.
+    Refused(StoreRefusal),
+}
+
+impl AuthRejection {
+    /// The response to answer with. Boxed, so `authenticate_throttled`'s
+    /// `Result` stays small on its hot success path, matching
+    /// `reserve_request_body`: an inline `Response` is 128+ bytes
+    /// (clippy::result_large_err).
+    pub(crate) fn into_response(self) -> Box<Response> {
+        Box::new(match self {
+            Self::Unauthorized => proxy_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "unauthorized",
+            ),
+            Self::Refused(refusal) => refusal.response(),
+        })
+    }
 }
 
 /// Default failed-auth attempts per IP inside the window before 429.
@@ -567,14 +857,13 @@ impl AuthThrottle {
                     // attacker's escape hatch).
                     let window = self.window;
                     entries.retain(|_, (start, _)| start.elapsed() < window);
-                    if entries.len() >= self.capacity {
-                        if let Some(victim) = entries
+                    if entries.len() >= self.capacity
+                        && let Some(victim) = entries
                             .iter()
                             .min_by_key(|(_, (start, count))| (*count, *start))
                             .map(|(k, _)| *k)
-                        {
-                            entries.remove(&victim);
-                        }
+                    {
+                        entries.remove(&victim);
                     }
                 }
                 entries.insert(ip, (Instant::now(), 1));
@@ -635,11 +924,12 @@ impl AppState {
         peer
     }
 
-    /// Authenticate a request's credential (LAB-1083).
+    /// Authenticate a request's credential (LAB-1083), against the client
+    /// policy in force, read once here and returned for the request to carry.
     ///
-    /// Returns the authenticated principal when `[[clients]]` is configured,
-    /// `None` when it is not (legacy `proxy_key`, or an open proxy), and a 401
-    /// `Response` when a configured credential does not match.
+    /// The principal is the authenticated one under `AuthMode::Clients`, and
+    /// `None` under the legacy shared key or an open proxy. A required
+    /// credential that does not match is a 401 `Response`.
     ///
     /// `allow_bearer` additionally accepts `Authorization: Bearer` — set only
     /// on the OpenAI-compat surface, whose SDKs send nothing else. It is NOT
@@ -647,20 +937,21 @@ impl AppState {
     /// carry the caller's own upstream token in `passthrough` mode; widening
     /// acceptance there would be a gratuitous auth surface on a ticket whose
     /// whole purpose is to narrow one.
+    ///
+    /// A presented credential shorter than `MIN_KEY_LEN` never matches, so no
+    /// weak key can authenticate whatever the table holds. The test is per
+    /// credential, not per request: a junk `x-api-key` next to a valid Bearer
+    /// still authenticates on the OpenAI-compat surface.
+    ///
+    /// On an instance that reads a client store, the store's gate then
+    /// decides (`ClientPolicy::store_refusal`): a principal's name may be
+    /// disabled or quarantined, and until the store has loaded, an ordinary
+    /// key, or a key that matches nothing, is answered 503.
     pub(crate) fn authenticate(
         &self,
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
-    ) -> Result<Option<&ClientConfig>, Box<Response>> {
-        // Boxed Err, matching `reserve_request_body` — an inline `Response` is
-        // 128+ bytes on the hot success path (clippy::result_large_err).
-        let unauthorized = || -> Box<Response> {
-            Box::new(proxy_error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "unauthorized",
-            ))
-        };
+    ) -> Result<Authenticated, AuthRejection> {
         let from_header = headers.get("x-api-key").and_then(|v| v.to_str().ok());
         let from_bearer = if allow_bearer {
             headers
@@ -678,28 +969,44 @@ impl AppState {
             None
         };
 
-        if !self.clients.is_empty() {
-            for presented in [from_header, from_bearer].into_iter().flatten() {
-                if let Some(c) = self.match_client(presented) {
-                    return Ok(Some(c));
-                }
-            }
-            return Err(unauthorized());
-        }
+        let mut presented = [from_header, from_bearer]
+            .into_iter()
+            .flatten()
+            .filter(|p| p.len() >= MIN_KEY_LEN)
+            .peekable();
 
-        // Legacy: one shared secret, no principal. Byte-for-byte the same
-        // accept/reject decision as before LAB-1083 — only the comparison
-        // primitive changed (audit finding 4).
-        if let Some(ref key) = self.proxy_key {
-            let ok = [from_header, from_bearer]
-                .into_iter()
-                .flatten()
-                .any(|p| bool::from(key.as_bytes().ct_eq(p.as_bytes())));
-            if !ok {
-                return Err(unauthorized());
+        // Matched as digests (`key_digest` says why timing cannot leak a key).
+        let policy = self.current_client_policy();
+        let principal = match &self.auth_mode {
+            AuthMode::Clients => {
+                let any_presented = presented.peek().is_some();
+                let Some(principal) = presented
+                    .find_map(|p| policy.principals.get(&key_digest(p)))
+                    .cloned()
+                else {
+                    // Until the store has loaded, a key that matches nothing
+                    // may be one its document will bring.
+                    if any_presented && policy.store.as_ref().is_some_and(|g| !g.loaded) {
+                        return Err(AuthRejection::Refused(StoreRefusal::Unloaded));
+                    }
+                    return Err(AuthRejection::Unauthorized);
+                };
+                if let Some(refusal) = policy.store_refusal(&principal) {
+                    return Err(AuthRejection::Refused(refusal));
+                }
+                Some(principal)
             }
-        }
-        Ok(None)
+            // Legacy: one shared secret, no principal. The same accept/reject
+            // decision as before LAB-1083, on digests now.
+            AuthMode::SharedKey(digest) => {
+                if !presented.any(|p| key_digest(p) == *digest) {
+                    return Err(AuthRejection::Unauthorized);
+                }
+                None
+            }
+            AuthMode::Open => None,
+        };
+        Ok(Authenticated { policy, principal })
     }
 
     /// Authenticate, then throttle failed credentials (LAB-1193).
@@ -735,10 +1042,24 @@ impl AppState {
         headers: &hyper::HeaderMap,
         allow_bearer: bool,
         route: &'static str,
-    ) -> Result<Option<&ClientConfig>, Box<Response>> {
+    ) -> Result<Authenticated, Box<Response>> {
         match self.authenticate(headers, allow_bearer) {
-            Ok(principal) => Ok(principal),
-            Err(unauthorized) => {
+            Ok(auth) => Ok(auth),
+            // Not a failed credential: never counted, never throttled.
+            Err(AuthRejection::Refused(refusal)) => {
+                if let Some(store) = &self.client_store {
+                    store.count_refusal(refusal);
+                }
+                debug!(
+                    client = %client_ip,
+                    route,
+                    reason = refusal.as_str(),
+                    "refused by the client store"
+                );
+                Err(AuthRejection::Refused(refusal).into_response())
+            }
+            Err(unauthorized @ AuthRejection::Unauthorized) => {
+                let unauthorized = unauthorized.into_response();
                 let (cred, presented) = presented_credential(headers);
                 let key_fp = credential_fingerprint(presented);
                 let ua = bounded_user_agent(headers);
@@ -789,8 +1110,9 @@ impl AppState {
     }
 
     /// Gate an admin surface (`/_stats`, `/metrics`) behind an OPERATOR
-    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or `None`
-    /// when the caller may proceed.
+    /// or ADMIN-READER principal (LAB-1192 AC-4, LAB-4395). Returns the rejection response, or,
+    /// when the caller may proceed, the policy snapshot it was authorized
+    /// against: the one snapshot the surface renders from.
     ///
     /// Under `[[clients]]`: unauthenticated → 401, an authenticated principal
     /// in neither `operators` nor `admin_readers` → 403 — `/_stats` discloses
@@ -809,17 +1131,18 @@ impl AppState {
         peer: SocketAddr,
         headers: &hyper::HeaderMap,
         route: &'static str,
-    ) -> Option<Box<Response>> {
-        match self.authenticate_throttled(client_ip, peer, headers, false, route) {
-            Err(resp) => Some(resp),
-            Ok(Some(c)) if !self.is_operator(&c.name) && !self.is_admin_reader(&c.name) => {
+    ) -> Result<Arc<ClientPolicy>, Box<Response>> {
+        let Authenticated { policy, principal } =
+            self.authenticate_throttled(client_ip, peer, headers, false, route)?;
+        match principal {
+            Some(p) if p.role == Role::Client => {
                 warn!(
                     client = %client_ip,
-                    client_id = %c.name,
+                    client_id = ?p.name,
                     route,
                     "rejected: admin surface requires an operator or read-only principal"
                 );
-                Some(Box::new(
+                Err(Box::new(
                     (
                         StatusCode::FORBIDDEN,
                         "forbidden: operator or read-only principal required",
@@ -827,22 +1150,22 @@ impl AppState {
                         .into_response(),
                 ))
             }
-            Ok(Some(_)) => None,
-            Ok(None) => {
+            Some(_) => Ok(policy),
+            None => {
                 // allow_unauthenticated: keep the open posture VISIBLE (AC-5)
                 // but rate-limit the warn per route — in the lab a vmagent
                 // scrapes /metrics every ~15s, and one warn per scrape is
                 // ~11k lines/day/replica that drowns the signal it exists to
                 // give. Once per route per OPEN_ADMIN_WARN_INTERVAL preserves
                 // visibility without the firehose.
-                if self.proxy_key.is_none() && self.should_warn_open_admin(route) {
+                if matches!(self.auth_mode, AuthMode::Open) && self.should_warn_open_admin(route) {
                     warn!(
                         client = %client_ip,
                         route,
                         "unauthenticated admin access (allow_unauthenticated) — trusted-network-only; rate-limited log"
                     );
                 }
-                None
+                Ok(policy)
             }
         }
     }
@@ -859,80 +1182,6 @@ impl AppState {
                 true
             }
         }
-    }
-
-    /// Constant-time lookup of a presented credential in the client table.
-    ///
-    /// What this actually guarantees, precisely — do not read more into it:
-    /// `ct_eq` removes the per-byte prefix oracle that `==` has, which is the
-    /// leak that matters (it is what lets an attacker recover a key byte by
-    /// byte). Audit finding 4, closed.
-    ///
-    /// The full-table scan removes the coarse "how far down the table did we
-    /// get" signal. It does NOT make the whole function constant-time: the
-    /// `hit = Some(c)` store is a data-dependent branch the optimizer may
-    /// emit as one, and `ct_eq` short-circuits on unequal lengths. Both
-    /// residuals are a handful of instructions against milliseconds of network
-    /// and TLS jitter, and key length is not a secret — so neither is
-    /// exploitable remotely. Want the stronger property? Accumulate with
-    /// `subtle::Choice`; don't assume this already does.
-    fn match_client(&self, presented: &str) -> Option<&ClientConfig> {
-        let mut hit: Option<&ClientConfig> = None;
-        for c in &self.clients {
-            if bool::from(c.key.as_bytes().ct_eq(presented.as_bytes())) {
-                hit = Some(c);
-            }
-        }
-        hit
-    }
-
-    /// Whether `client_id` has a non-empty `models` list — i.e. whether a
-    /// server-side fallback could serve it a model that list does not name
-    /// (LAB-5970). Same identity semantics as `client_allows_model`.
-    pub(crate) fn client_restricts_models(&self, client_id: &str) -> bool {
-        self.clients
-            .iter()
-            .any(|c| c.name == client_id && !c.models.is_empty())
-    }
-
-    /// Whether `client_id` may request `model` (LAB-1083).
-    ///
-    /// Unknown client, or a client with an empty list, allows everything.
-    /// "Unknown client" is only reachable on the legacy path: with
-    /// `[[clients]]` configured, `client_id` is always a principal name.
-    ///
-    /// FAILS CLOSED on an empty `model`, and this is the one place where the
-    /// shared matcher's semantics are deliberately NOT inherited. An empty
-    /// model means the caller's model is UNKNOWN to us — the body did not
-    /// parse as JSON, or it carries no top-level `model` (the batches API
-    /// nests it under `requests[].params.model`, and `proxy_handler` is the
-    /// catch-all route). For `Endpoint::serves_model` "unknown" rightly means
-    /// "don't narrow the routing pool"; for a policy gate it must mean
-    /// "deny", or a restricted client reaches any model by sending a body we
-    /// cannot read.
-    pub(crate) fn client_allows_model(&self, client_id: &str, model: &str) -> bool {
-        match self.clients.iter().find(|c| c.name == client_id) {
-            Some(c) if c.models.is_empty() => true,
-            Some(c) => !model.is_empty() && model_matches(&c.models, model),
-            None => true,
-        }
-    }
-
-    /// LAB-3877: resolve the Tier 0 guard policy for a client. The operator
-    /// bypass is always `Off` (it forwards operator-trusted content). Otherwise
-    /// the client's configured policy, defaulting to `Annotate` (shadow mode)
-    /// for any caller not in the table — including the legacy unknown-client
-    /// "-" and open-`proxy_key` modes, so shadow mode observes everything.
-    #[cfg(feature = "guard")]
-    fn client_guard_policy(&self, client_id: &str) -> guard::GuardPolicy {
-        if self.is_operator(client_id) {
-            return guard::GuardPolicy::Off;
-        }
-        self.clients
-            .iter()
-            .find(|c| c.name == client_id)
-            .map(|c| c.guard)
-            .unwrap_or_default()
     }
 
     /// LAB-3877: run the Tier 0 content guard for one request — after
@@ -969,11 +1218,12 @@ impl AppState {
     pub(crate) async fn guard_hook(
         &self,
         req_id: &str,
-        client_id: &str,
+        caller: &Caller,
         outcome: &guard::ScanOutcome,
         openai_shape: bool,
     ) -> Result<Option<usize>, Box<Response>> {
-        let policy = self.client_guard_policy(client_id);
+        let client_id = caller.name();
+        let policy = caller.guard_policy();
         let input = match outcome {
             guard::ScanOutcome::Scannable(input) => Some(input),
             guard::ScanOutcome::NothingToScan | guard::ScanOutcome::Unscannable(_) => None,
@@ -1003,7 +1253,7 @@ impl AppState {
             if policy == guard::GuardPolicy::Block {
                 warn!(
                     req_id,
-                    client_id = %client_id,
+                    client_id = ?client_id,
                     verdict = "block",
                     reason,
                     "guard: unscannable request"
@@ -1012,7 +1262,7 @@ impl AppState {
             }
             info!(
                 req_id,
-                client_id = %client_id,
+                client_id = ?client_id,
                 verdict = "would-block",
                 reason,
                 "guard: unscannable request"
@@ -1080,7 +1330,7 @@ impl AppState {
     ) {
         warn!(
             req_id,
-            client_id = %client_id,
+            client_id = ?client_id,
             verdict,
             findings = findings.len(),
             truncated,
@@ -1108,8 +1358,8 @@ impl AppState {
     /// `MAX_LABEL_CHARS` (64) characters share one label.
     ///
     /// The client axis is config-bounded by reachability, not by the header
-    /// filter: this runs only when `client_allows_model` returned false, which
-    /// needs `client_id` to name a configured client. Under legacy
+    /// filter: this runs only when `Caller::allows_model` returned false, which
+    /// needs the caller to have a `[[clients]]` entry. Under legacy
     /// `proxy_key` / `allow_unauthenticated` there is no `[[clients]]` table,
     /// so this is unreachable and the caller-controlled `x-client-id` never
     /// touches this map. The global bucket is defence-in-depth for a future
@@ -1121,7 +1371,8 @@ impl AppState {
     /// unbounded warn-level log volume. The counter records every denial.
     /// Mirrors the once-per-model pattern used for unsupported-model
     /// warnings.
-    pub(crate) fn note_model_denied(&self, client_id: &str, model: &str) {
+    pub(crate) fn note_model_denied(&self, caller: &Caller, model: &str) {
+        let client_id = caller.name();
         let model = truncate_label(model);
         let first_time = {
             let mut counts = lock_recovering(&self.model_denied, "model_denied");
@@ -1129,7 +1380,7 @@ impl AppState {
             let key = (client_id.to_owned(), escape_sentinel(&model, &["other"]));
             let label = if counts.len() < MAX_MODEL_DENIED_LABELS || counts.contains_key(&key) {
                 key
-            } else if self.clients.iter().any(|c| c.name == client_id) {
+            } else if caller.entry().is_some() {
                 // Map full, pair new, client configured: its own bucket.
                 (client_id.to_owned(), "_other".to_owned())
             } else {
@@ -1142,14 +1393,14 @@ impl AppState {
         };
         if first_time {
             warn!(
-                client_id = %client_id,
-                model = ?model,
+                client_id = ?client_id,
+                model = %GoQuoted(&model),
                 "rejected: model not in client allow-list"
             );
         } else {
             debug!(
-                client_id = %client_id,
-                model = ?model,
+                client_id = ?client_id,
+                model = %GoQuoted(&model),
                 "rejected: model not in client allow-list"
             );
         }
@@ -1189,18 +1440,19 @@ impl AppState {
     ///
     /// Header takes precedence to support multiple clients per IP.
     ///
-    /// ONLY reached when no `[[clients]]` table is configured. Under
-    /// `[[clients]]`, identity comes from the verified credential
-    /// (`RequestContext::from_request`) and this client-asserted path is dead.
+    /// ONLY reached outside `AuthMode::Clients`. Under `[[clients]]`, identity
+    /// comes from the verified credential (`RequestContext::from_request`) and
+    /// this client-asserted path is dead.
     ///
     /// The `debug_assert` is the choke point for that invariant. Nothing in the
-    /// type system stops a future handler from calling
-    /// `RequestContext::from_request(.., None)` and silently reinstating
+    /// type system stops a future handler from handing
+    /// `RequestContext::from_request` an `Authenticated` with no principal
+    /// under `[[clients]]` and silently reinstating
     /// header-asserted identity; this makes that mistake fail loudly in tests
     /// and debug builds instead of quietly becoming an identity bypass.
     pub(crate) fn resolve_client_id(&self, ip: &IpAddr, headers: &hyper::HeaderMap) -> String {
         debug_assert!(
-            self.clients.is_empty(),
+            !matches!(self.auth_mode, AuthMode::Clients),
             "resolve_client_id reached with [[clients]] configured — a caller \
              skipped the authenticated principal and identity is now spoofable"
         );

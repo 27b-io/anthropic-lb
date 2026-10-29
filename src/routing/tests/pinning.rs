@@ -13,15 +13,21 @@ fn mk_pinned_client(name: &str, key: &str, preferred: &[&str]) -> ClientConfig {
 /// Two-endpoint pool with a client pinned to "dedicated". `soft_limit` at the
 /// production 0.90 so the healthy/spill boundary is exercised for real.
 fn pinned_test_state() -> Arc<AppState> {
-    Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("general", "sk-ant-api-gen"),
-            mk_endpoint("dedicated", "sk-ant-api-ded"),
-        ],
-        clients: vec![mk_pinned_client("passbolt", "key-pb", &["dedicated"])],
-        soft_limit: 0.90,
-        ..test_state_base()
-    })
+    Arc::new(
+        TestPolicy::clients(vec![mk_pinned_client(
+            "passbolt",
+            &test_key("key-pb"),
+            &["dedicated"],
+        )])
+        .install(AppState {
+            endpoints: vec![
+                mk_endpoint("general", "sk-ant-api-gen"),
+                mk_endpoint("dedicated", "sk-ant-api-ded"),
+            ],
+            soft_limit: 0.90,
+            ..test_state_base()
+        }),
+    )
 }
 
 #[test]
@@ -37,11 +43,12 @@ fn client_config_preferred_endpoints_parses_and_defaults_empty() {
 }
 
 #[test]
-fn validate_clients_rejects_unknown_preferred_endpoint() {
-    let err = validate_clients(&cfg(
-        "[[endpoints]]\nname = \"real\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"k1\"\npreferred_endpoints = [\"typo\"]\n",
-    ))
-    .unwrap_err();
+fn build_rejects_unknown_preferred_endpoint() {
+    let Err(err) = ClientPolicy::build(&cfg(&format!(
+        "[[endpoints]]\nname = \"real\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"{STRONG_KEY}\"\npreferred_endpoints = [\"typo\"]\n",
+    ))) else {
+        panic!("a pin naming no endpoint must be refused");
+    };
     assert!(
         err.contains("preferred_endpoints") && err.contains("typo") && err.contains("pin"),
         "error must name the client and the bad entry: {err}"
@@ -49,10 +56,10 @@ fn validate_clients_rejects_unknown_preferred_endpoint() {
 }
 
 #[test]
-fn validate_clients_accepts_known_preferred_endpoint() {
-    assert!(validate_clients(&cfg(
-        "[[endpoints]]\nname = \"real\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"k1\"\npreferred_endpoints = [\"real\"]\n",
-    ))
+fn build_accepts_known_preferred_endpoint() {
+    assert!(ClientPolicy::build(&cfg(&format!(
+        "[[endpoints]]\nname = \"real\"\ntoken = \"sk-ant-api-x\"\n\n[[clients]]\nname = \"pin\"\nkey = \"{STRONG_KEY}\"\npreferred_endpoints = [\"real\"]\n",
+    )))
     .is_ok());
 }
 
@@ -70,7 +77,14 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
     for i in 0..100 {
         let key = format!("client:sess:{i}");
         if state
-            .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "other", false)
+            .pick_endpoint_for_client(
+                Some(&key),
+                "claude-opus-5",
+                &[],
+                &state.caller("other"),
+                FastRequest::STANDARD,
+                false,
+            )
             .await
             == Some(0)
         {
@@ -78,7 +92,14 @@ async fn pinned_client_always_routes_to_preferred_endpoint() {
         }
         assert_eq!(
             state
-                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[], "passbolt", false)
+                .pick_endpoint_for_client(
+                    Some(&key),
+                    "claude-opus-5",
+                    &[],
+                    &state.caller("passbolt"),
+                    FastRequest::STANDARD,
+                    false
+                )
                 .await,
             Some(1),
             "pinned client must land on 'dedicated' for every affinity key"
@@ -100,11 +121,55 @@ async fn pinned_client_spills_on_soft_limit_overage() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(0),
         "soft-limited preferred endpoint must spill to the general pool"
     );
+}
+
+/// Spill: the preferred endpoint has spent its week before the reset, so it
+/// weighs 0 though its 5h gate is low. A zero-weight pin must not hold the
+/// client: keyed and un-keyed picks spill to the healthy general endpoint
+/// instead of returning `None` (a client-visible 429).
+#[tokio::test]
+async fn pinned_client_spills_on_spent_week() {
+    for strategy in [
+        RoutingStrategy::DynamicCapacityV1,
+        RoutingStrategy::StickyWeightedV2,
+    ] {
+        let mut state = pinned_test_state();
+        Arc::get_mut(&mut state)
+            .expect("test fixture should be uniquely owned")
+            .routing_strategy = strategy;
+        let now = AppState::now_epoch();
+        set_account_utilization(&state, 0, 0.30, 0.30, now + 10_000, now + 4 * 86_400).await;
+        set_account_utilization(&state, 1, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+
+        for key in [None, Some("spent-pin")] {
+            assert_eq!(
+                state
+                    .pick_endpoint_for_client(
+                        key,
+                        "claude-opus-4-6",
+                        &[],
+                        &state.caller("passbolt"),
+                        FastRequest::STANDARD,
+                        true
+                    )
+                    .await,
+                Some(0),
+                "{strategy:?}, key {key:?}: a spent preferred endpoint must spill"
+            );
+        }
+    }
 }
 
 /// Spill: preferred endpoint hard-limited (429) → general pool serves.
@@ -120,7 +185,14 @@ async fn pinned_client_spills_on_hard_limit() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(0),
         "hard-limited preferred endpoint must spill to the general pool"
@@ -140,7 +212,14 @@ async fn pinned_client_spills_on_transport_unhealthy() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(0),
         "transport-unhealthy preferred endpoint must spill to the general pool"
@@ -152,16 +231,29 @@ async fn pinned_client_spills_on_transport_unhealthy() {
 async fn pinned_client_spills_on_model_mismatch() {
     let mut dedicated = mk_endpoint("dedicated", "sk-ant-api-ded");
     dedicated.models = vec!["claude-haiku-*".to_string()];
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint("general", "sk-ant-api-gen"), dedicated],
-        clients: vec![mk_pinned_client("passbolt", "key-pb", &["dedicated"])],
-        soft_limit: 0.90,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_pinned_client(
+            "passbolt",
+            &test_key("key-pb"),
+            &["dedicated"],
+        )])
+        .install(AppState {
+            endpoints: vec![mk_endpoint("general", "sk-ant-api-gen"), dedicated],
+            soft_limit: 0.90,
+            ..test_state_base()
+        }),
+    );
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(0),
         "model not served by the preferred endpoint must spill to the general pool"
@@ -169,7 +261,14 @@ async fn pinned_client_spills_on_model_mismatch() {
     // Sanity: a model the pin DOES serve stays pinned.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-haiku-4-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-haiku-4-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(1)
     );
@@ -187,7 +286,14 @@ async fn pinned_client_fast_request_spills_when_pin_is_fast_mode_disabled() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", true)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::FAST,
+                false
+            )
             .await,
         Some(0),
         "fast request must spill off a fast-mode-disabled pin"
@@ -205,7 +311,14 @@ async fn pinned_client_standard_request_keeps_fast_mode_disabled_pin() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(1),
         "standard request must stay pinned despite the fast-mode mark"
@@ -217,16 +330,22 @@ async fn pinned_client_standard_request_keeps_fast_mode_disabled_pin() {
 /// viable, full pool once none is.
 #[tokio::test]
 async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("general", "sk-ant-api-gen"),
-            mk_endpoint("ded-a", "sk-ant-api-a"),
-            mk_endpoint("ded-b", "sk-ant-api-b"),
-        ],
-        clients: vec![mk_pinned_client("passbolt", "key-pb", &["ded-a", "ded-b"])],
-        soft_limit: 0.90,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_pinned_client(
+            "passbolt",
+            &test_key("key-pb"),
+            &["ded-a", "ded-b"],
+        )])
+        .install(AppState {
+            endpoints: vec![
+                mk_endpoint("general", "sk-ant-api-gen"),
+                mk_endpoint("ded-a", "sk-ant-api-a"),
+                mk_endpoint("ded-b", "sk-ant-api-b"),
+            ],
+            soft_limit: 0.90,
+            ..test_state_base()
+        }),
+    );
 
     // ded-a failed and was skipped → the OTHER preferred endpoint must serve,
     // never the general pool.
@@ -234,7 +353,14 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
         let key = format!("client:sess:{i}");
         assert_eq!(
             state
-                .pick_endpoint_for_client(Some(&key), "claude-opus-5", &[1], "passbolt", false)
+                .pick_endpoint_for_client(
+                    Some(&key),
+                    "claude-opus-5",
+                    &[1],
+                    &state.caller("passbolt"),
+                    FastRequest::STANDARD,
+                    false
+                )
                 .await,
             Some(2),
             "with one preferred endpoint skipped, the remaining one must serve"
@@ -243,7 +369,14 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
     // Both preferred endpoints skipped → spill to the general pool.
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[1, 2], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[1, 2],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(0),
         "with all preferred endpoints skipped, the general pool must serve"
@@ -256,15 +389,21 @@ async fn pinned_client_rotation_prefers_remaining_preferred_then_spills() {
 #[tokio::test]
 async fn native_surface_pins_authenticated_client_to_preferred_endpoint() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url),
-            mk_endpoint_at("acct-b", "sk-ant-api-test-bbb", &mock_url),
-        ],
-        clients: vec![mk_pinned_client("passbolt", "key-pb", &["acct-b"])],
-        soft_limit: 0.90,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_pinned_client(
+            "passbolt",
+            &test_key("key-pb"),
+            &["acct-b"],
+        )])
+        .install(AppState {
+            endpoints: vec![
+                mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url),
+                mk_endpoint_at("acct-b", "sk-ant-api-test-bbb", &mock_url),
+            ],
+            soft_limit: 0.90,
+            ..test_state_base()
+        }),
+    );
     state.endpoints[0].rate_info.write().await.utilization = Some(0.05);
     state.endpoints[1].rate_info.write().await.utilization = Some(0.5);
     let addr = serve(build_router(state.clone())).await;
@@ -274,7 +413,7 @@ async fn native_surface_pins_authenticated_client_to_preferred_endpoint() {
         let resp = client
             .post(format!("http://{addr}/v1/messages"))
             .header("content-type", "application/json")
-            .header("x-api-key", "key-pb")
+            .header("x-api-key", test_key("key-pb"))
             .header("x-session-id", format!("sess-{i}"))
             .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
             .send()
@@ -300,15 +439,21 @@ async fn native_surface_pins_authenticated_client_to_preferred_endpoint() {
 #[tokio::test]
 async fn openai_compat_surface_pins_authenticated_client_to_preferred_endpoint() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url),
-            mk_endpoint_at("acct-b", "sk-ant-api-test-bbb", &mock_url),
-        ],
-        clients: vec![mk_pinned_client("passbolt", "key-pb", &["acct-b"])],
-        soft_limit: 0.90,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_pinned_client(
+            "passbolt",
+            &test_key("key-pb"),
+            &["acct-b"],
+        )])
+        .install(AppState {
+            endpoints: vec![
+                mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url),
+                mk_endpoint_at("acct-b", "sk-ant-api-test-bbb", &mock_url),
+            ],
+            soft_limit: 0.90,
+            ..test_state_base()
+        }),
+    );
     state.endpoints[0].rate_info.write().await.utilization = Some(0.05);
     state.endpoints[1].rate_info.write().await.utilization = Some(0.5);
     let addr = serve(build_router(state.clone())).await;
@@ -318,7 +463,7 @@ async fn openai_compat_surface_pins_authenticated_client_to_preferred_endpoint()
         let resp = client
             .post(format!("http://{addr}/v1/chat/completions"))
             .header("content-type", "application/json")
-            .header("authorization", "Bearer key-pb")
+            .header("authorization", format!("Bearer {}", test_key("key-pb")))
             .header("x-session-id", format!("sess-{i}"))
             .body(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#)
             .send()
@@ -359,7 +504,14 @@ async fn pinned_client_spills_when_preferred_endpoint_at_paid_overage() {
 
     assert_eq!(
         state
-            .pick_endpoint_for_client(Some("s"), "claude-opus-5", &[], "passbolt", false)
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[],
+                &state.caller("passbolt"),
+                FastRequest::STANDARD,
+                false
+            )
             .await,
         Some(0),
         "an overage-covered preferred endpoint must spill to free general-pool capacity"

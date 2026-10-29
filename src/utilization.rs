@@ -138,6 +138,63 @@ pub(crate) const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// permanence.
 pub(crate) const REDIS_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
+/// Period of the Redis sync loop. Every tick reads the hard limits, the
+/// budget counters and the transport-error hash and writes this instance's
+/// heartbeat, so a 429 cooldown reaches every instance within this period.
+pub(crate) const REDIS_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Period of the sync loop's rate-info and routing-weight reads. Each is an
+/// MGET over every account, and the rate-info values are JSON, so these two
+/// reads carry most of the loop's bytes; sync traffic grows with accounts ×
+/// instances. An instance applies its own upstream responses at once, so
+/// only its view of the other instances' traffic lags, by up to this period.
+pub(crate) const REDIS_SLOW_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    REDIS_SLOW_SYNC_INTERVAL
+        .as_secs()
+        .is_multiple_of(REDIS_SYNC_INTERVAL.as_secs()),
+    "the slow sync period must be a whole number of sync ticks"
+);
+
+/// Which reads one `sync_from_redis` tick makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncScope {
+    /// Hard limits, budgets, heartbeats and transport errors.
+    Fast,
+    /// `Fast` plus every account's rate info and routing weight.
+    Full,
+}
+
+/// Picks each sync tick's scope. The first tick and every
+/// `REDIS_SLOW_SYNC_INTERVAL / REDIS_SYNC_INTERVAL`th after it are `Full`, and
+/// a full tick stays due until its rate-info read lands. So an instance that
+/// starts before Redis answers pulls the fleet's rate view on its first tick
+/// that reaches Redis, not a slow period later.
+#[derive(Debug, Default)]
+pub(crate) struct SyncCadence {
+    tick: u64,
+}
+
+impl SyncCadence {
+    pub(crate) fn scope(&self) -> SyncScope {
+        const FULL_EVERY: u64 = REDIS_SLOW_SYNC_INTERVAL.as_secs() / REDIS_SYNC_INTERVAL.as_secs();
+        if self.tick.is_multiple_of(FULL_EVERY) {
+            SyncScope::Full
+        } else {
+            SyncScope::Fast
+        }
+    }
+
+    /// Record the tick just run; `rate_synced` is what `sync_from_redis`
+    /// returned for it.
+    pub(crate) fn advance(&mut self, rate_synced: bool) {
+        if self.scope() == SyncScope::Fast || rate_synced {
+            self.tick = self.tick.wrapping_add(1);
+        }
+    }
+}
+
 /// Build the coordination Redis client and spawn its connection task WITHOUT
 /// waiting for the first connect (LAB-1639). `Err` only for an unparseable
 /// URL — an unreachable backend is not an error here.
@@ -217,8 +274,9 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Default wall-clock ceiling for receiving a request body (seconds). Real
 /// clients push even a max-size body in seconds; 60s is generous headroom for
 /// a slow relayed path while guaranteeing a stalled upload cannot pin its
-/// body-memory reservation (up to `MAX_REQUEST_BODY_BYTES` when Content-Length
-/// is absent) against the P1-01 budget indefinitely. Override with the
+/// body-memory reservation (the full `MAX_REQUEST_BODY_BYTES` when
+/// Content-Length is absent or Transfer-Encoding is present) against the P1-01
+/// budget indefinitely. Override with the
 /// `body_read_timeout_secs` config key; 0 disables.
 pub(crate) const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 60;
 
@@ -323,7 +381,7 @@ pub(crate) const MAX_DROPPED_BETA_FLAG_LEN: usize = 64;
 
 /// Strips counted (and logged) from any ONE request. A request's top-level
 /// key count is client-controlled; without this the per-key cap above is
-/// reachable from a single request (LAB-1261 panel finding).
+/// reachable from a single request (LAB-1261).
 pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 
 /// Clamp a client-controlled string to something safe to use as a metric
@@ -336,11 +394,7 @@ pub(crate) const MAX_STRIPPED_FIELDS_PER_REQUEST: usize = 8;
 /// is the log side, where the plain-text subscriber would otherwise let an
 /// embedded newline forge whole log LINES.
 pub(crate) fn sanitize_metric_key(raw: &str, max_len: usize) -> String {
-    let mut end = raw.len().min(max_len);
-    while !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    let clipped = &raw[..end];
+    let clipped = &raw[..raw.floor_char_boundary(max_len)];
     if clipped.is_empty()
         || !clipped
             .chars()
@@ -468,7 +522,7 @@ const BASE_BODY_FIELDS: &[&str] = &[
 ///
 /// **This table must stay TOTAL over `DEFAULT_CLIENT_BETA_ALLOWLIST`**, and
 /// `beta_body_field_table_covers_the_allowlist` fails the build if it is not.
-/// Totality is the whole mechanism (LAB-1261, Helly R finding 1): a surviving
+/// Totality is the whole mechanism (LAB-1261): a surviving
 /// flag protects its body field only if a row claims it, so a missing row
 /// means the proxy DELETES a field belonging to a feature the caller was
 /// entitled to use. `fallback-credit-*` is the worked example — it is on the
@@ -546,7 +600,7 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
 /// **Declines to strip when a surviving flag is not in `BETA_BODY_FIELDS`.**
 /// The keep-side of the rule is only as good as that table is total: an
 /// unrecognised SURVIVING family may own a top-level field, and stripping it
-/// deletes a capability the caller is entitled to (Helly R finding 1 — a
+/// deletes a capability the caller is entitled to (a
 /// custom `allowed_client_betas` carrying `mcp-client-*` kept the header and
 /// lost `mcp_servers`, leaving `tools[].mcp_server_name` dangling). Forgoing
 /// the degrade costs a 400 the caller already gets today; deleting a live
@@ -571,7 +625,7 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
 /// bytes, so nothing below the top level is reformatted. That is not cosmetic:
 /// a `serde_json::Value` round-trip rewrites an integer too large for `u64` as
 /// a float (`18446744073709551617` → `1.8446744073709552e+19`), silently
-/// changing a value inside retained tool history (Helly R finding 2). Only the
+/// changing a value inside retained tool history. Only the
 /// top-level separators are re-emitted, so the cacheable prefix can still
 /// shift on a body that arrived pretty-printed — accepted, since the only
 /// requests reaching the rewrite are the ones answering a hard 400 today.
@@ -601,7 +655,7 @@ pub(crate) fn strip_orphaned_beta_body_fields(
         }
         if !known {
             debug!(
-                flag = %flag,
+                flag = ?flag,
                 "beta body coherence: surviving flag is not in BETA_BODY_FIELDS, \
                  forwarding the body untouched rather than risk deleting a field \
                  it owns"
@@ -662,11 +716,151 @@ pub(crate) fn strip_orphaned_beta_body_fields(
     Some((render_top_level(kept)?, removed))
 }
 
-/// Remove top-level `fallbacks` from a Messages body (LAB-5970).
+/// The routes whose bodies `BASE_BODY_FIELDS` describes, and so the only ones
+/// `strip_orphaned_beta_body_fields` runs on. `proxy_handler` is the router's
+/// catch-all, so `/v1/messages/batches`, `/v1/complete` and the rest reach the
+/// same forward path with completely different bodies.
+pub(crate) fn is_messages_schema_path(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
+/// True when `flag` matches a `BETA_BODY_FIELDS` row. A surviving flag that
+/// does not makes `strip_orphaned_beta_body_fields` forward the body untouched.
+fn beta_family_known(flag: &str) -> bool {
+    BETA_BODY_FIELDS
+        .iter()
+        .any(|(pattern, _)| suffix_wildcard_match(pattern, flag))
+}
+
+/// True when an endpoint that filters client betas strips `speed` from this
+/// request because the allow-list drops its `fast-mode-*` beta. Mirrors the
+/// filter in `inject_account_auth` and the strip in
+/// `strip_orphaned_beta_body_fields`, so all of these must hold:
+/// - the path is one the strip runs on;
+/// - the request carries a `fast-mode-*` beta and `allowed` passes none of
+///   the ones it carries;
+/// - every flag `allowed` passes has a `BETA_BODY_FIELDS` row, or the strip
+///   declines and `speed` goes upstream untouched.
 ///
-/// Both `models` gates — the client's (`client_allows_model`) and the
-/// endpoint's (`Endpoint::serves_model`) — read only the top-level `model`,
-/// while `fallbacks` asks Anthropic to serve a refusal from ANOTHER model.
+/// A request that sent no `fast-mode-*` beta is not narrowed here.
+pub(crate) fn beta_filter_strips_speed(
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    allowed: &[String],
+) -> bool {
+    if !is_messages_schema_path(path) {
+        return false;
+    }
+    let mut carries_fast_beta = false;
+    for flag in headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let passes = beta_flag_allowed(allowed, flag);
+        if flag.starts_with("fast-mode-") {
+            if passes {
+                return false;
+            }
+            carries_fast_beta = true;
+        } else if passes && !beta_family_known(flag) {
+            return false;
+        }
+    }
+    carries_fast_beta
+}
+
+/// A request's `speed: "fast"` as each endpoint receives it. The beta
+/// allow-list filters client betas on OAuth endpoints only, so under an
+/// allow-list without `fast-mode-*` one request runs at standard speed on an
+/// OAuth account and fast on an API-key or passthrough account. Routing and
+/// the exhaustion gate read it per endpoint.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FastRequest {
+    /// The body asks for fast mode (`body_wants_fast_mode`).
+    pub(crate) requested: bool,
+    /// Endpoints that filter client betas strip `speed` from this request
+    /// (`beta_filter_strips_speed`).
+    pub(crate) stripped_on_oauth: bool,
+}
+
+impl FastRequest {
+    pub(crate) const STANDARD: Self = Self {
+        requested: false,
+        stripped_on_oauth: false,
+    };
+    #[cfg(test)]
+    pub(crate) const FAST: Self = Self {
+        requested: true,
+        stripped_on_oauth: false,
+    };
+
+    /// True when `ep` receives the request with `speed: "fast"`. An
+    /// OpenAI-protocol endpoint never does: its translation drops `speed`.
+    pub(crate) fn reaches(self, ep: &Endpoint) -> bool {
+        self.requested
+            && ep.protocol == Protocol::Anthropic
+            && !(self.stripped_on_oauth && ep.filters_client_betas())
+    }
+
+    /// True when the request must not be served at standard speed, which
+    /// keeps it off OpenAI-protocol endpoints. A request the allow-list
+    /// already downgrades on OAuth endpoints may be served there.
+    pub(crate) fn excludes_openai(self) -> bool {
+        self.requested && !self.stripped_on_oauth
+    }
+
+    /// True when `ep` may serve this request for `model`: its config allows
+    /// the model, and it is not an OpenAI-protocol endpoint facing a request
+    /// that must stay fast. Such an endpoint can never honor speed:"fast"
+    /// (its translation drops the field) and never accrues a fast-mode mark,
+    /// so counting it as eligible would let a pool with only OpenAI capacity
+    /// left look servable to the exhaustion gate.
+    pub(crate) fn eligible(self, ep: &Endpoint, model: &str) -> bool {
+        ep.serves_model(model) && !(self.excludes_openai() && ep.protocol == Protocol::OpenAI)
+    }
+}
+
+/// Remove every top-level entry named in `fields` — `ANTHROPIC_FALLBACK_FIELDS`
+/// or `OPENAI_FALLBACK_FIELDS`, the fields with which a body asks the upstream
+/// to serve ANOTHER model. Both `models` gates — the client's
+/// (`Caller::allows_model`) and the endpoint's (`Endpoint::serves_model`) —
+/// read only the top-level `model`, so a restricted attempt
+/// (`Caller::attempt_restricts_models`) loses these fields.
+///
+/// Every entry of a listed key goes, so a duplicate key cannot keep one
+/// alive. Returns `None` — body untouched — when there is none, or when the
+/// body is not a JSON object: a restricted CLIENT never gets here with one
+/// (`Caller::allows_model` fails closed on an unreadable model), and an
+/// endpoint gate already routes an unreadable body unnarrowed.
+pub(crate) fn strip_top_level_fields(body: &bytes::Bytes, fields: &[&str]) -> Option<bytes::Bytes> {
+    let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
+    if !parsed
+        .0
+        .iter()
+        .any(|(key, _)| fields.contains(&key.as_str()))
+    {
+        return None;
+    }
+    render_top_level(
+        parsed
+            .0
+            .iter()
+            .filter(|(key, _)| !fields.contains(&key.as_str())),
+    )
+}
+
+/// True when `body` is a JSON object with a top-level `field`: what
+/// `strip_top_level_fields` would remove, without building the stripped body.
+pub(crate) fn has_top_level_field(body: &[u8], field: &str) -> bool {
+    serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
+        .is_ok_and(|TopLevelObject(entries)| entries.iter().any(|(key, _)| key == field))
+}
+
+/// `fallbacks` asks Anthropic to serve a refusal from another model (LAB-5970).
 /// The `"default"` form names no target at all (Anthropic routes it by refusal
 /// category), so the targets cannot be checked here without hard-coding
 /// Anthropic's fallback policy. A restricted principal therefore loses the
@@ -676,19 +870,26 @@ pub(crate) fn strip_orphaned_beta_body_fields(
 /// field no fallback runs (the API does not fall back unless asked), and the
 /// header also grants `fallback_credit_token`, whose redemption is a new
 /// request that passes both gates on its own top-level `model`.
+pub(crate) const ANTHROPIC_FALLBACK_FIELDS: &[&str] = &["fallbacks"];
+
+/// Top-level fields with which a chat-completions body asks an
+/// OpenAI-compatible gateway to serve another model when the named one fails
+/// (LAB-6794). LiteLLM's proxy reads `fallbacks`, `context_window_fallbacks`
+/// and `content_policy_fallbacks` from the request, and also merges all three
+/// from a client-supplied `router_settings_override` object. A client can
+/// provoke the context-window failure at will with an oversized prompt.
 ///
-/// Every `fallbacks` entry goes, so a duplicate key cannot keep one alive.
-/// Returns `None` — body untouched — when there is none, or when the body is
-/// not a JSON object: a restricted CLIENT never gets here with one
-/// (`client_allows_model` fails closed on an unreadable model), and an
-/// endpoint gate already routes an unreadable body unnarrowed.
-pub(crate) fn strip_fallbacks(body: &bytes::Bytes) -> Option<bytes::Bytes> {
-    let parsed: TopLevelObject = serde_json::from_slice(body).ok()?;
-    if !parsed.0.iter().any(|(key, _)| key == "fallbacks") {
-        return None;
-    }
-    render_top_level(parsed.0.iter().filter(|(key, _)| key != "fallbacks"))
-}
+/// Only the client's lists go: fallbacks the gateway's operator configured
+/// still apply. `router_settings_override` is dropped whole, on purpose: the
+/// retry, timeout and routing settings it also carries go with it, because
+/// rewriting the nested object to keep them would add parsing surface to a
+/// security strip for settings a restricted client can live without.
+pub(crate) const OPENAI_FALLBACK_FIELDS: &[&str] = &[
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "router_settings_override",
+];
 
 /// Re-emit top-level entries as a JSON object, values spliced through as their
 /// original bytes (see `strip_orphaned_beta_body_fields` for why).
@@ -743,40 +944,125 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for TopLevelObject
     }
 }
 
+/// Top-level fields a policy or routing decision reads: the client allow-list,
+/// endpoint `models` routing, the context window and the negative cache read
+/// `model`, fast-mode routing reads `speed`, the content guard reads
+/// `messages` and `system`, and the budget charge for a stream that ends
+/// before its usage reads `max_tokens`. A field a new decision starts reading
+/// belongs here; until it is added, its respellings pass as they did before
+/// this check existed.
+const DECISION_FIELDS: [&str; 5] = ["model", "speed", "messages", "system", "max_tokens"];
+
+/// Every field whose respelling is refused: `DECISION_FIELDS`, every field a
+/// restricted attempt loses (`ANTHROPIC_FALLBACK_FIELDS`,
+/// `OPENAI_FALLBACK_FIELDS`), and each body field the beta allow-list strips
+/// along with a dropped flag (`BETA_BODY_FIELDS`). The strip lists are read
+/// from their own tables so they cannot drift apart from this one.
+fn protected_fields() -> impl Iterator<Item = &'static str> {
+    DECISION_FIELDS
+        .into_iter()
+        .chain(ANTHROPIC_FALLBACK_FIELDS.iter().copied())
+        .chain(OPENAI_FALLBACK_FIELDS.iter().copied())
+        .chain(
+            BETA_BODY_FIELDS
+                .iter()
+                .flat_map(|(_, fields)| fields.iter().copied()),
+        )
+}
+
+/// A key as a decoder that ignores `_` and `-` when matching names sees it.
+fn without_delimiters(key: &str) -> String {
+    key.chars().filter(|c| !matches!(c, '_' | '-')).collect()
+}
+
+/// Whether `body` is a JSON object whose top-level keys are unambiguous:
+/// spelled in lowercase ASCII, distinct once `_` and `-` are removed, and not
+/// a respelling of a field in `protected_fields`. Keys compare decoded
+/// (`"m\u006fdel"` is `"model"`).
+///
+/// The handlers read every field from a `serde_json::Value`, which keeps the
+/// last of two duplicate keys and matches keys exactly, but often forward the
+/// client's bytes as sent. An upstream decoder that keeps the first key,
+/// matches keys regardless of case (Go's `encoding/json`), or also ignores
+/// `_` and `-` (its v2 case-insensitive option) would then act on a field no
+/// policy check saw: a repeated `model`, a lone `"MODEL"` or `"mo_del"` that
+/// the checks read as no model at all, or a `"fall_backs"` that survives the
+/// strip meant to remove it. Every Anthropic and OpenAI
+/// top-level field is lowercase ASCII, and no two differ only by delimiters,
+/// so these rules cost a valid body nothing.
+///
+/// A lone respelling of any other field still passes: the proxy neither
+/// decides on nor strips such a field, so it has no view to disagree with.
+///
+/// A body this parser cannot read as an object counts as ambiguous. Callers
+/// have already parsed it as an object, so that arm is unreachable in
+/// practice; it fails closed rather than waving an unchecked body through.
+pub(crate) fn top_level_keys_unambiguous(body: &[u8]) -> bool {
+    let Ok(TopLevelObject(entries)) =
+        serde_json::from_slice::<TopLevelObject<serde::de::IgnoredAny>>(body)
+    else {
+        return false;
+    };
+    let mut seen = std::collections::HashSet::with_capacity(entries.len());
+    entries.into_iter().all(|(key, _)| {
+        if !key.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+            return false;
+        }
+        let bare = without_delimiters(&key);
+        let respells_protected_field = !protected_fields().any(|f| f == key)
+            && protected_fields().any(|f| without_delimiters(f) == bare);
+        !respells_protected_field && seen.insert(bare)
+    })
+}
+
 /// Legacy dynamic-capacity override threshold. If the affinity-picked account's
 /// `affinity_headroom` is below 50% of the alternative's, stickiness is broken.
 pub(crate) const LEGACY_AFFINITY_OVERRIDE_RATIO: f64 = 0.5;
 
-/// Sticky-weighted override threshold on `affinity_headroom`. Lower than the
-/// legacy algorithm to preserve cache locality and only break stickiness for
-/// egregious disparities.
-pub(crate) const STICKY_WEIGHTED_OVERRIDE_RATIO: f64 = 0.25;
-
-/// Which window bound the sticky account when an affinity override fired.
-/// Label value of `anthropic_affinity_migrations_total{reason}`; also indexes
-/// `AppState::affinity_migrations`.
+/// Why a keyed session left its account. Label value of
+/// `anthropic_affinity_migrations_total{reason}`; also indexes
+/// `AppState::affinity_migrations`. StickyWeightedV2 counts a session's real
+/// moves (LAB-9360); the legacy DynamicCapacityV1 override counts every
+/// request it overrides, under the first three labels. The first three also
+/// name the window that binds a candidate's `affinity_headroom`.
 #[derive(Clone, Copy)]
-pub(crate) enum AffinityBind {
-    /// The effective gate is tighter, bound by raw (time-adjusted) 5h
-    /// utilisation or overage — the pool is the bottleneck (operator-actionable).
+pub(crate) enum MigrationReason {
+    /// The effective gate binds, set by raw (time-adjusted) 5h utilisation or
+    /// overage: the pool is the bottleneck (operator-actionable).
     Loaded = 0,
-    /// Unused weekly quota is tighter — one account's week is nearly spent.
+    /// Unused weekly quota binds: one account's week is nearly spent.
     Spent = 1,
-    /// The gate is tighter, but set by an Anthropic status floor
-    /// (`status_to_floor`) that exceeds raw utilisation — the LB is moving the
-    /// session off an account Anthropic flagged, onto fresh capacity. Routine,
-    /// not a pool-health signal: logged at INFO, not WARN (LAB-3295).
+    /// The gate binds, but an Anthropic status floor (`status_to_floor`) set
+    /// it above raw utilisation: the LB is moving the session off an account
+    /// Anthropic flagged, onto fresh capacity. Routine, not a pool-health
+    /// signal: the legacy override logs it at INFO, not WARN (LAB-3295).
     Floored = 2,
+    /// The old account is not a candidate in this request's tier: hard-limited
+    /// or cooling after a 429, circuit breaker open, excluded for the model or
+    /// for fast mode, outside the caller's pin, demoted for overage, or the
+    /// request was served from a different tier.
+    Unavailable = 3,
+    /// The old account still passes, but another account won the key's hash:
+    /// its weight rose, or it returned to the set.
+    Rehomed = 4,
 }
 
-impl AffinityBind {
-    pub(crate) const ALL: [Self; 3] = [Self::Loaded, Self::Spent, Self::Floored];
+impl MigrationReason {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Loaded,
+        Self::Spent,
+        Self::Floored,
+        Self::Unavailable,
+        Self::Rehomed,
+    ];
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Loaded => "loaded",
             Self::Spent => "spent",
             Self::Floored => "floored",
+            Self::Unavailable => "unavailable",
+            Self::Rehomed => "rehomed",
         }
     }
 }
@@ -813,18 +1099,18 @@ impl PoolExhaustion {
 /// hours at identical load — which migrated 25% of prod sessions off the
 /// FRESHEST accounts in the pool (GH#156). waste_risk stays in the bucket
 /// weights, where burning expiring quota first is the point.
-pub(crate) fn affinity_headroom(c: &RoutingCandidate) -> (f64, AffinityBind) {
+pub(crate) fn affinity_headroom(c: &RoutingCandidate) -> (f64, MigrationReason) {
     let loaded = (1.0 - c.gate).max(0.0);
     if c.unused_7d < loaded {
-        (c.unused_7d, AffinityBind::Spent)
+        (c.unused_7d, MigrationReason::Spent)
     } else if c.gate_floor_bound {
         // Same headroom value as `Loaded` — routing decision unchanged — but a
         // distinct reason so a status-floor-forced migration is not mistaken
         // for pool exhaustion (LAB-3295). Only when the gate (not weekly quota)
         // binds; a genuinely spent week is `Spent` above and stays WARN.
-        (loaded, AffinityBind::Floored)
+        (loaded, MigrationReason::Floored)
     } else {
-        (loaded, AffinityBind::Loaded)
+        (loaded, MigrationReason::Loaded)
     }
 }
 
@@ -836,11 +1122,7 @@ pub(crate) fn extract_client_version(ua: &str) -> Option<&str> {
     let ver = ua
         .split_once('/')
         .map(|(_, rest)| rest.split_once(' ').map_or(rest, |(ver, _)| ver))?;
-    if ver.is_empty() {
-        None
-    } else {
-        Some(ver)
-    }
+    if ver.is_empty() { None } else { Some(ver) }
 }
 
 /// Used to look up model-specific rate-limit claims (e.g., "seven_day_sonnet").
@@ -908,7 +1190,7 @@ pub(crate) fn drops_deprecated_temperature(model: &str, value: &serde_json::Valu
         return false;
     }
     warn!(
-        model = ?truncate_label(model),
+        model = %GoQuoted(&truncate_label(model)),
         temperature = %value,
         "dropping `temperature`: deprecated and hard-rejected by this model"
     );
@@ -933,7 +1215,7 @@ pub(crate) fn translate_reasoning_effort(value: &serde_json::Value) -> Option<&s
     let effort = value.as_str().filter(|e| EFFORTS.contains(e));
     if effort.is_none() {
         warn!(
-            reasoning_effort = %truncate_label(&value.to_string()),
+            reasoning_effort = %GoQuoted(&truncate_label(&value.to_string())),
             "dropping `reasoning_effort`: no Anthropic effort equivalent"
         );
     }
@@ -1063,6 +1345,15 @@ pub(crate) fn waste_risk(util: Option<f64>, reset_epoch: Option<u64>, now_epoch:
     let remaining_fraction = (reset - now_epoch) as f64 / TOTAL_7D_SECS;
     let unused = (1.0 - util).max(0.0);
     (unused / remaining_fraction).min(10.0)
+}
+
+/// A weekly claim used up before its reset. `waste_risk` is 0 for it, which
+/// would leave the account its full headroom as routing weight; the weight
+/// is 0 instead, so live requests stop re-probing it with 429s until the
+/// reset and the probe loop re-checks it alone. Unknown utilisation or reset
+/// is never spent.
+fn week_spent(claim: &ClaimWindowData, now_epoch: u64) -> bool {
+    claim.utilization.is_some_and(|u| u >= 1.0) && claim.reset.is_some_and(|r| r > now_epoch)
 }
 
 /// Map a rate-limit status string to a utilization floor.
@@ -1344,7 +1635,7 @@ pub(crate) fn compute_routing_weight(
     // this ticket removes (CodeRabbit on #175). The floor-free call shares
     // `gate_5h`'s inputs, so it is `None` exactly on `gate_5h`'s fallback path,
     // where no floor applies → not floor-bound. False under staleness (gate is a
-    // fixed 0.5). Feeds `AffinityBind::Floored` (LAB-3295).
+    // fixed 0.5). Feeds `MigrationReason::Floored` (LAB-3295).
     let gate_5h_floor_bound = !stale_after_hard_limit
         && time_adjusted_utilization(
             info.utilization_5h,
@@ -1417,17 +1708,18 @@ pub(crate) fn compute_routing_weight(
         None => (gate_5h.max(gate_7d), wr_7d, source_7d),
     };
 
-    // Weekly headroom for the affinity override (`affinity_headroom`): 1.0 when
+    // Weekly headroom for the affinity rule (`affinity_headroom`): 1.0 when
     // unknown or superseded by overage, else the tighter of the primary claim
     // and (Fable) the pool it draws from. Reuses the gate's near-reset ramp so
     // quota expiring within NEAR_RESET_7D_SECS reads as headroom, not "spent":
-    // the bucket weights pull sessions ONTO expiring accounts and the override
-    // must not push them straight back off. Status floors are the gate's job
-    // (`None`). Deliberately not hedged under stale_after_hard_limit — a 429
-    // says nothing about how much of the week is spent.
-    // ponytail: 6h ramp; an account with ≤25% of its week left and 6h–~30h to
-    // reset still reads "spent" while the buckets favour it. Widen the ramp if
-    // that WARN band shows up in prod.
+    // the bucket weights pull sessions ONTO expiring accounts and the affinity
+    // rule must not push them straight back off. Status floors are the gate's
+    // job (`None`). Deliberately not hedged under stale_after_hard_limit — a
+    // 429 says nothing about how much of the week is spent.
+    // ponytail: 6h ramp; an account with less than `1 - soft_limit` of its
+    // week left and more than 6h to reset reads "spent" and holds no keyed
+    // sessions, while waste_risk still weights its un-keyed buckets up as the
+    // reset nears. Widen the ramp if that `reason="spent"` band shows up in prod.
     let unused_of = |c: &ClaimWindowData| {
         let util =
             time_adjusted_utilization(c.utilization, c.reset, None, NEAR_RESET_7D_SECS, now_epoch)
@@ -1446,8 +1738,9 @@ pub(crate) fn compute_routing_weight(
 
     // Floor-bound: the effective `gate` is set by an Anthropic status floor that
     // exceeds raw utilisation, not by raw load or overage. Routine — Anthropic
-    // flagged the account and the LB is migrating the session off it — so the
-    // affinity override logs it at INFO, not a pool-health WARN (LAB-3295).
+    // flagged the account and the LB is migrating the session off it — so a
+    // move off it is labelled `floored`, and the legacy DynamicCapacityV1
+    // override logs it at INFO, not a pool-health WARN (LAB-3295).
     // The 7d gate is a pure status floor (`gate_of` forces util=0), so its
     // winning over gate_5h (which is >= 0) means a non-zero floor bound the gate;
     // the 5h case is `gate_5h_floor_bound`. Overage never floors (its gate comes
@@ -1462,9 +1755,22 @@ pub(crate) fn compute_routing_weight(
     // rejected migrations ever need to stay loud, split on the floor tier here.
     let gate_floor_bound = !overage_active && (gate_7d > gate_5h || gate_5h_floor_bound);
 
+    // Overage serves a spent week; otherwise the band or the pool it draws
+    // from being spent stops the account. Not hedged under
+    // stale_after_hard_limit: the week was spent before the 429 too.
+    let week_spent = !overage_active
+        && primary_7d
+            .into_iter()
+            .chain(pool_cap_7d)
+            .any(|c| week_spent(c, now_epoch));
+
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
-    let weight = if gate >= 1.0 { 0.0 } else { weight };
+    let weight = if gate >= 1.0 || week_spent {
+        0.0
+    } else {
+        weight
+    };
 
     Some(RoutingWeight {
         gate_5h,
@@ -1558,9 +1864,9 @@ impl AppState {
         }
         warn!(
             account = endpoint_name,
-            // Debug, not Display: the name is client input, and Display would
+            // Quoted, not Display: the name is client input, and Display would
             // write a newline or escape in it into the log unescaped.
-            model = ?truncate_label(model),
+            model = %GoQuoted(&truncate_label(model)),
             cooldown_secs = UNSUPPORTED_MODEL_TTL.as_secs(),
             "model unsupported on account, routing away"
         );
@@ -1582,44 +1888,35 @@ impl AppState {
             .collect()
     }
 
-    /// True when EVERY endpoint whose config allows `model` carries a live
-    /// negative-cache entry — unsupported model (LAB-941) or, for a
-    /// `speed: "fast"` request, fast mode disabled on its org (LAB-2687) — so
-    /// no rotation can help. Gates the exhaustion reply: only then is a
-    /// stashed upstream 4xx returned (or synthesized on the warm path, where
-    /// the pool emptied before any forward ran). A rejection on one account
-    /// plus rate limits on the rest is a rate-limited pool, and the
+    /// True when EVERY endpoint whose config allows `model` is out for this
+    /// request: it carries a live negative-cache entry (unsupported model or,
+    /// when `fast` reaches it as fast, fast mode disabled on its org), or it
+    /// is `extra_usage_refuser`, the endpoint that refused this request for
+    /// extra usage. Then no rotation can help. Gates the exhaustion reply: only then
+    /// is a stashed upstream 4xx returned (or synthesized on the warm path,
+    /// where the pool emptied before any forward ran). A rejection on one
+    /// account plus rate limits on the rest is a rate-limited pool, and the
     /// retryable 429 stays the truth. Endpoints excluded by their config
     /// `models` allowlist never serve the model and don't count; false when
     /// no endpoint could ever serve it (config-only exclusion keeps its
-    /// pre-existing 429 semantics). `refused` is the endpoint that answered
-    /// THIS request with an entitlement 400 (LAB-4729): never negative-cached,
-    /// but skipped for the rest of the request, so it cannot serve it either.
+    /// pre-existing 429 semantics). `extra_usage_refuser` answered THIS
+    /// request with an entitlement 400: never negative-cached, but skipped
+    /// for the rest of the request, so it cannot serve it either.
     pub(crate) fn pool_cannot_serve(
         &self,
         model: &str,
-        fast: bool,
-        refused: Option<EndpointIdx>,
+        fast: FastRequest,
+        extra_usage_refuser: Option<EndpointIdx>,
     ) -> bool {
         if model.is_empty() {
             return false;
         }
         let mut excluded = self.unsupported_endpoints_for(model);
-        if fast {
-            excluded.extend(self.fast_mode_disabled_endpoints());
-        }
-        excluded.extend(refused);
+        excluded.extend(self.fast_mode_disabled_for(fast));
+        excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
-            if !ep.serves_model(model) {
-                continue;
-            }
-            // An OpenAI-protocol endpoint can never honor speed:"fast" (its
-            // translation drops the field) and never accrues a fast-mode
-            // mark, so it must not count as "eligible" for a fast request —
-            // otherwise a pool with only OpenAI capacity left would look
-            // servable and the exhaustion reply would never fire (LAB-2687).
-            if fast && ep.protocol == Protocol::OpenAI {
+            if !fast.eligible(ep, model) {
                 continue;
             }
             eligible += 1;
@@ -1628,6 +1925,19 @@ impl AppState {
             }
         }
         eligible > 0
+    }
+
+    /// True when SOME endpoint eligible for this request (`FastRequest::eligible`,
+    /// the rule `pool_cannot_serve` counts by) carries a live unsupported-model
+    /// entry for `model`: an account that answered said the model does not
+    /// exist. The weak twin of `pool_cannot_serve` — that one decides the
+    /// status, this one only lets `exhaustion_response` name the rejection in
+    /// its retryable 429, so a bad model id does not read as a capacity
+    /// problem.
+    pub(crate) fn model_rejected_somewhere(&self, model: &str, fast: FastRequest) -> bool {
+        self.unsupported_endpoints_for(model)
+            .into_iter()
+            .any(|i| fast.eligible(&self.endpoints[i], model))
     }
 
     /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
@@ -1653,6 +1963,19 @@ impl AppState {
             .iter()
             .filter(|(_, expiry)| **expiry > now)
             .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// The live fast-mode-disabled endpoints `fast` reaches with
+    /// `speed: "fast"`: the marks that count against this request. Empty for a
+    /// standard request, without taking the lock.
+    pub(crate) fn fast_mode_disabled_for(&self, fast: FastRequest) -> Vec<usize> {
+        if !fast.requested {
+            return Vec::new();
+        }
+        self.fast_mode_disabled_endpoints()
+            .into_iter()
+            .filter(|&i| fast.reaches(&self.endpoints[i]))
             .collect()
     }
 
@@ -1684,7 +2007,7 @@ impl AppState {
             if unsupported.contains(&i) {
                 trace!(
                     endpoint = ep.name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, model unsupported on endpoint"
                 );
                 continue;
@@ -1699,25 +2022,25 @@ impl AppState {
                     // cooldown bounds the window.
                     {
                         let info = ep.rate_info.read().await;
-                        if let Some(until) = info.hard_limited_until {
-                            if now < until {
-                                trace!(
-                                    endpoint = ep.name,
-                                    hard_limited_secs = until.duration_since(now).as_secs(),
-                                    "pick: skipping hard-limited endpoint"
-                                );
-                                continue;
-                            }
+                        if let Some(until) = info.hard_limited_until
+                            && now < until
+                        {
+                            trace!(
+                                endpoint = ep.name,
+                                hard_limited_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping hard-limited endpoint"
+                            );
+                            continue;
                         }
-                        if let Some(until) = info.transport.open_until {
-                            if now < until {
-                                trace!(
-                                    endpoint = ep.name,
-                                    unhealthy_secs = until.duration_since(now).as_secs(),
-                                    "pick: skipping transport-unhealthy endpoint"
-                                );
-                                continue;
-                            }
+                        if let Some(until) = info.transport.open_until
+                            && now < until
+                        {
+                            trace!(
+                                endpoint = ep.name,
+                                unhealthy_secs = until.duration_since(now).as_secs(),
+                                "pick: skipping transport-unhealthy endpoint"
+                            );
+                            continue;
                         }
                     }
                     // Push a fixed candidate at the configured priority. This
@@ -1743,27 +2066,27 @@ impl AppState {
                 }
                 Protocol::Anthropic => {
                     let info = ep.rate_info.read().await;
-                    if let Some(until) = info.hard_limited_until {
-                        if now < until {
-                            trace!(
-                                endpoint = ep.name,
-                                hard_limited_secs = until.duration_since(now).as_secs(),
-                                "pick: skipping hard-limited endpoint"
-                            );
-                            continue;
-                        }
+                    if let Some(until) = info.hard_limited_until
+                        && now < until
+                    {
+                        trace!(
+                            endpoint = ep.name,
+                            hard_limited_secs = until.duration_since(now).as_secs(),
+                            "pick: skipping hard-limited endpoint"
+                        );
+                        continue;
                     }
                     // Transport circuit breaker — independent of the 429 path
                     // above (rate limit ≠ transport health).
-                    if let Some(until) = info.transport.open_until {
-                        if now < until {
-                            trace!(
-                                endpoint = ep.name,
-                                unhealthy_secs = until.duration_since(now).as_secs(),
-                                "pick: skipping transport-unhealthy endpoint"
-                            );
-                            continue;
-                        }
+                    if let Some(until) = info.transport.open_until
+                        && now < until
+                    {
+                        trace!(
+                            endpoint = ep.name,
+                            unhealthy_secs = until.duration_since(now).as_secs(),
+                            "pick: skipping transport-unhealthy endpoint"
+                        );
+                        continue;
                     }
                     let stale_after_hard_limit = info
                         .hard_limited_until
@@ -1778,7 +2101,7 @@ impl AppState {
                         None => {
                             trace!(
                                 endpoint = ep.name,
-                                model = model,
+                                model = %GoQuoted(model),
                                 "pick: skipping, 7d claim rejected"
                             );
                             continue;
@@ -1844,18 +2167,33 @@ impl AppState {
     ///   3. Soft-limit handling matches `pick_account`'s graceful-degradation
     ///      semantics: if at least one account is healthy, soft-limited
     ///      accounts are zeroed; if NO account is healthy, all are kept so
-    ///      the dashboard reflects the still-routable degraded pool.
+    ///      the dashboard reflects the still-routable degraded pool. The weight
+    ///      gauge applies this across the whole pool; the share applies it
+    ///      within each priority tier, as the picker does.
+    ///   4. The share is taken within the priority tier the picker would
+    ///      serve from: tiers in ascending order (configured `priority`, plus
+    ///      `overage_penalty` while an account serves via overage), the first
+    ///      with non-zero weight serves, and every other tier reads 0. Being
+    ///      model-agnostic and per-pool, it cannot mirror per-request state:
+    ///      the Fable demotion of `fable_included = false` accounts (it
+    ///      depends on the request's model), per-client
+    ///      `preferred_endpoints` pins, and fast-mode exclusions.
+    ///   5. Accounts `routing_candidates` skips — an open transport breaker,
+    ///      or a hard limit on an OpenAI endpoint — take no share, so their
+    ///      tier cannot claim traffic the picker sends elsewhere. Their weight
+    ///      and gate gauges still report as before.
     pub(crate) async fn refresh_metrics_weights(&self) {
         let now_epoch = Self::now_epoch();
         let now = Instant::now();
 
-        // Collect (gate, weight) per endpoint. None = excluded entirely
+        // Collect (gate, weight, tier) per endpoint. None = excluded entirely
         // (passthrough or hard-limited — never weighted in any condition).
         // OpenAI endpoints carry no rate-limit data — their representative
         // weight is the fixed (gate 0.0, weight 1.0) candidate that
-        // routing_candidates produces. Anthropic endpoints run the identical
-        // Anthropic computation.
-        let mut entries: Vec<Option<(f64, f64)>> = vec![None; self.endpoints.len()];
+        // routing_candidates produces, at its configured priority. Anthropic
+        // endpoints run the identical Anthropic computation and take the
+        // same overage demotion routing_candidates applies.
+        let mut entries: Vec<Option<MetricsEntry>> = vec![None; self.endpoints.len()];
         for (i, ep) in self.endpoints.iter().enumerate() {
             match ep.protocol {
                 Protocol::OpenAI => {
@@ -1864,14 +2202,33 @@ impl AppState {
                     // emits OpenAI endpoints with a fixed (gate 0.0,
                     // weight 1.0) — an OpenAI endpoint is a real routing
                     // candidate and belongs on dashboards.
-                    entries[i] = Some((0.0, 1.0));
+                    let info = ep.rate_info.read().await;
+                    entries[i] = Some(MetricsEntry {
+                        gate: 0.0,
+                        weight: 1.0,
+                        priority: ep.priority,
+                        routable: metrics_routable(&info, now),
+                    });
                 }
                 Protocol::Anthropic => {
                     if ep.passthrough {
                         continue;
                     }
                     let info = ep.rate_info.read().await;
-                    entries[i] = metrics_gate_weight(&info, now_epoch, now);
+                    entries[i] =
+                        metrics_gate_weight(&info, now_epoch, now).map(|(gate, weight)| {
+                            let priority = if metrics_overage_active(&info, now_epoch) {
+                                ep.priority.saturating_add(self.overage_penalty)
+                            } else {
+                                ep.priority
+                            };
+                            MetricsEntry {
+                                gate,
+                                weight,
+                                priority,
+                                routable: metrics_routable(&info, now),
+                            }
+                        });
                 }
             }
         }
@@ -1879,58 +2236,121 @@ impl AppState {
         self.store_metrics_weights(&entries);
     }
 
-    /// Normalize per-endpoint (gate, weight) pairs into the three gauge atomics
-    /// of each endpoint, applying pick_endpoint's graceful soft-limit
-    /// degradation.
-    fn store_metrics_weights(&self, entries: &[Option<(f64, f64)>]) {
+    /// Store each endpoint's three gauge atomics. The weight gauge applies
+    /// pick_endpoint's graceful soft-limit degradation across the whole pool;
+    /// the share is `metrics_tier_shares`.
+    fn store_metrics_weights(&self, entries: &[Option<MetricsEntry>]) {
         // Mirror pick_endpoint's graceful-degradation: only filter soft-limited
         // members when at least one healthy member exists in the pool.
         let has_healthy = entries
             .iter()
-            .any(|e| matches!(e, Some((gate, _)) if *gate < self.soft_limit));
+            .flatten()
+            .any(|e| self.is_healthy(e.gate, e.weight));
 
-        let mut weights = vec![0f64; self.endpoints.len()];
-        for (i, entry) in entries.iter().enumerate() {
-            if let Some((gate, weight)) = entry {
-                if has_healthy && *gate >= self.soft_limit {
-                    continue; // soft-limited and there's a healthy alternative
-                }
-                weights[i] = *weight;
-            }
-        }
-
-        let total: f64 = weights.iter().sum();
+        let shares = self.metrics_tier_shares(entries);
         for (i, ep) in self.endpoints.iter().enumerate() {
-            let w = weights[i];
-            let share = if total > 0.0 { w / total } else { 0.0 };
+            let w = match entries[i] {
+                // Soft-limited with a healthy alternative → zero.
+                Some(e) if !has_healthy || self.is_healthy(e.gate, e.weight) => e.weight,
+                _ => 0.0,
+            };
             // Excluded members (passthrough, hard-limited) report gate=1.0
             // (fully gated) since they receive zero traffic.
-            let gate = entries[i].map(|(g, _)| g).unwrap_or(1.0);
+            let gate = entries[i].map(|e| e.gate).unwrap_or(1.0);
             // Weight, share and gate are independent gauges, not a joint
             // invariant — a torn read across them is harmless.
             ep.last_routing_weight.store(w.to_bits(), Ordering::Relaxed);
             ep.last_routing_share
-                .store(share.to_bits(), Ordering::Relaxed);
+                .store(shares[i].to_bits(), Ordering::Relaxed);
             ep.last_effective_gate
                 .store(gate.to_bits(), Ordering::Relaxed);
         }
     }
+
+    /// The share `pick_endpoint_for_client` would give each entry: tiers are
+    /// walked in ascending priority, a tier prefers its healthy members
+    /// (`is_healthy`) and degrades to its soft-limited ones when it has
+    /// none, and the first tier with non-zero weight takes the whole share.
+    /// All zero when no tier has weight. Unroutable entries are not candidates.
+    fn metrics_tier_shares(&self, entries: &[Option<MetricsEntry>]) -> Vec<f64> {
+        let entries: Vec<Option<MetricsEntry>> =
+            entries.iter().map(|e| e.filter(|e| e.routable)).collect();
+        let mut tiers: Vec<u32> = entries.iter().flatten().map(|e| e.priority).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+
+        for tier in tiers {
+            let in_tier = |e: &Option<MetricsEntry>| e.filter(|e| e.priority == tier);
+            let has_healthy = entries
+                .iter()
+                .filter_map(in_tier)
+                .any(|e| self.is_healthy(e.gate, e.weight));
+            let weights: Vec<f64> = entries
+                .iter()
+                .map(|e| match in_tier(e) {
+                    Some(e) if !has_healthy || self.is_healthy(e.gate, e.weight) => e.weight,
+                    _ => 0.0,
+                })
+                .collect();
+            let total: f64 = weights.iter().sum();
+            if total > 0.0 {
+                return weights.into_iter().map(|w| w / total).collect();
+            }
+        }
+        vec![0.0; entries.len()]
+    }
+}
+
+/// One endpoint's representative routing inputs for the metrics gauges.
+/// `priority` is the tier `routing_candidates` would place it in; `routable`
+/// is false when `routing_candidates` would skip it.
+#[derive(Clone, Copy)]
+struct MetricsEntry {
+    gate: f64,
+    weight: f64,
+    priority: u32,
+    routable: bool,
+}
+
+/// Neither hard-limited nor transport-unhealthy: the two skips
+/// `routing_candidates` applies to every protocol.
+fn metrics_routable(info: &RateLimitInfo, now: Instant) -> bool {
+    !info.hard_limited_until.is_some_and(|until| now < until)
+        && !info.transport.open_until.is_some_and(|until| now < until)
+}
+
+/// Whether `info` serves via overage — the same test `compute_routing_weight`
+/// sets `overage_active` from, which `routing_candidates` demotes on.
+fn metrics_overage_active(info: &RateLimitInfo, now_epoch: u64) -> bool {
+    overage_gate(info, now_epoch, stale_after_hard_limit(info)).is_some()
+}
+
+/// Rate data not refreshed since the last hard limit was marked.
+fn stale_after_hard_limit(info: &RateLimitInfo) -> bool {
+    info.hard_limited_until
+        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until))
 }
 
 /// Per-entry representative `(gate, weight)` for metrics gauges, model-agnostic.
 /// Returns `None` for hard-limited members (they contribute zero in any state).
 /// Computed purely from a `RateLimitInfo`.
+///
+/// Parity with `compute_routing_weight` covers the representative claim only.
+/// The Fable band's weekly pool cap (`constraining_7d_claims`) is not mirrored:
+/// were the representative the band itself, a spent general `seven_day` pool
+/// would weigh 0 in routing and stay positive here. The API never names the
+/// band as the representative (it arrives as the `7d_oi` triplet, see
+/// `FABLE_BAND_CLAIM`), so in practice the representative is a whole-traffic
+/// claim and the two agree.
 fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Option<(f64, f64)> {
     // Hard-limited members contribute zero (mirrors routing_candidates filter).
-    if let Some(until) = info.hard_limited_until {
-        if now < until {
-            return None;
-        }
+    if let Some(until) = info.hard_limited_until
+        && now < until
+    {
+        return None;
     }
 
-    let stale_after_hard_limit = info
-        .hard_limited_until
-        .is_some_and(|until| info.last_updated.is_none_or(|lu| lu <= until));
+    let stale_after_hard_limit = stale_after_hard_limit(info);
 
     let gate_5h = gate_5h(info, now_epoch, stale_after_hard_limit);
 
@@ -1976,6 +2396,7 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
             })
     };
 
+    let spent = representative.is_some_and(|c| week_spent(c, now_epoch));
     let (gate_7d, wr_7d) = if let Some(claim) = representative {
         let g = if stale_after_hard_limit {
             0.5
@@ -1999,13 +2420,13 @@ fn metrics_gate_weight(info: &RateLimitInfo, now_epoch: u64, now: Instant) -> Op
 
     // Overage supersedes the subscription gates exactly as in
     // `compute_routing_weight`: the overage window governs, waste_risk is moot.
-    let (gate, wr) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
-        Some(g) => (g, 0.0),
-        None => (gate_5h.max(gate_7d), wr_7d),
+    let (gate, wr, spent) = match overage_gate(info, now_epoch, stale_after_hard_limit) {
+        Some(g) => (g, 0.0, false),
+        None => (gate_5h.max(gate_7d), wr_7d, spent),
     };
     let headroom = (1.0 - gate).max(0.01);
     let weight = if wr > 0.0 { wr * headroom } else { headroom };
-    let weight = if gate >= 1.0 { 0.0 } else { weight };
+    let weight = if gate >= 1.0 || spent { 0.0 } else { weight };
 
     Some((gate, weight))
 }

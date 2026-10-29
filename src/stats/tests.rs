@@ -71,7 +71,7 @@ async fn stats_endpoint_exposes_endpoints_array() {
 #[tokio::test]
 async fn stats_includes_burn_rate_and_headroom() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("test-key".to_string()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("test-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -90,7 +90,7 @@ async fn stats_includes_burn_rate_and_headroom() {
     let _ = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "test-key")
+        .header("x-api-key", test_key("test-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -99,7 +99,7 @@ async fn stats_includes_burn_rate_and_headroom() {
     // Now check stats
     let resp = client
         .get(format!("http://{}/_stats", addr))
-        .header("x-api-key", "test-key")
+        .header("x-api-key", test_key("test-key"))
         .send()
         .await
         .unwrap();
@@ -149,11 +149,10 @@ async fn stats_includes_burn_rate_and_headroom() {
 /// Pins their values so the lock-scope refactor cannot change the output.
 #[tokio::test]
 async fn stats_client_usage_and_aggregate_from_snapshots() {
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().operators(&["ray"]).install(AppState {
         endpoints: vec![make_endpoint("acct-a", Protocol::Anthropic)],
-        operators: vec!["ray".to_string()],
         ..test_state_base()
-    });
+    }));
     let ewma = |value: f64| Ewma {
         value,
         tau: 60.0,

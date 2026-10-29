@@ -83,7 +83,7 @@ pub(crate) struct Config {
     /// reading it. This splits the read bit out.
     ///
     /// Only meaningful under `[[clients]]`, where identity is credential-derived:
-    /// `validate_clients` rejects the key on the legacy path rather than let it
+    /// `ClientPolicy::build` rejects the key on the legacy path rather than let it
     /// pretend to scope a shared secret it cannot scope.
     #[serde(default)]
     pub(crate) admin_readers: Vec<String>,
@@ -100,7 +100,7 @@ pub(crate) struct Config {
     /// propagation use Redis for cross-replica coordination. None = local-only (single instance).
     pub(crate) redis_url: Option<String>,
     /// Path for debug log file. When set, writes debug-level logs to this file while
-    /// keeping info-level on stderr. For investigating cache/auth behavior.
+    /// keeping info-level on stdout. For investigating cache/auth behavior.
     pub(crate) debug_log: Option<String>,
     /// Priority penalty added to an account's effective priority tier while it is
     /// serving via Anthropic overage (paid extra usage). Keeps free subscription
@@ -127,6 +127,14 @@ pub(crate) struct Config {
     /// Opt-in encrypted response cache on `/v1/messages` (LAB-933).
     /// Absent, or present with an empty `clients` list = feature entirely inert.
     pub(crate) response_cache: Option<ResponseCacheConfig>,
+    /// The client store this instance reads ordinary clients from
+    /// (docs/client-store.md). Requires `[[clients]]` authentication: the
+    /// operators and admin readers stay in this file.
+    pub(crate) client_store: Option<ClientStoreConfig>,
+    /// Also POST every line written to stdout, batched as JSON lines, to a
+    /// collector. Absent = off. Best effort: a line that finds the queue full,
+    /// or whose batch fails, is counted on `/metrics` and never retried.
+    pub(crate) log_sink: Option<LogSinkConfig>,
     /// Reflect upstream `anthropic-ratelimit-*` response headers to callers.
     /// They reveal the pooled capacity of every account behind the proxy, so
     /// this is trusted-network-only. Default: false (LAB-1191).
@@ -160,8 +168,9 @@ pub(crate) struct ClientConfig {
     /// `[response_cache].clients` must name.
     pub(crate) name: String,
     /// Shared secret this client presents as `x-api-key` (or, on the
-    /// OpenAI-compat surface, `Authorization: Bearer`). Compared in constant
-    /// time against the whole table.
+    /// OpenAI-compat surface, `Authorization: Bearer`). Read only by
+    /// `ClientPolicy::build`, which keeps its digest (`key_digest`) and nothing
+    /// else.
     pub(crate) key: String,
     /// Models this client may request. Empty = all models, mirroring
     /// `EndpointConfig.models` semantics. Same exact + `*`-suffix matcher.
@@ -202,6 +211,36 @@ impl std::fmt::Debug for ClientConfig {
     }
 }
 
+/// `[client_store]`: where to poll, and the token to poll with.
+#[derive(Deserialize, Clone)]
+pub(crate) struct ClientStoreConfig {
+    /// The store's poll URL: `https://`, or `http://` only over a channel that
+    /// never leaves the instance's own platform.
+    pub(crate) poll_url: String,
+    /// Sent as `Authorization: Bearer` on every poll, for a store that
+    /// requires one. Only ever over `https://`.
+    pub(crate) token: Option<String>,
+}
+
+impl std::fmt::Debug for ClientStoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientStoreConfig")
+            .field("poll_url", &self.poll_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `[log_sink]`: where to POST a copy of every stdout log line.
+#[derive(Deserialize, Clone)]
+pub(crate) struct LogSinkConfig {
+    /// The collector's ingest URL, `http://` or `https://`, taking one JSON
+    /// object per line (`{"_time", "_msg"}`), e.g. VictoriaLogs'
+    /// `/insert/jsonline`. Never logged, as its path or query may hold a
+    /// secret; a URL carrying credentials is refused at startup.
+    pub(crate) url: String,
+}
+
 /// `[response_cache]` — opt-in, client-side-encrypted response cache on
 /// non-streaming `/v1/messages` (LAB-933). Cached bodies contain prompt
 /// content, so SecureCache (AES-256-GCM, encrypted before any layer — L1
@@ -216,8 +255,8 @@ pub(crate) struct ResponseCacheConfig {
     /// Cache backend: "cachekitio" (SaaS, rides the existing reqwest/rustls
     /// stack) or "redis" (local Redis/Valkey via cachekit's fred client).
     pub(crate) backend: String,
-    /// Hex-encoded master key for client-side encryption; must decode to at
-    /// least 32 bytes. Per-client keys are derived from it via HKDF-SHA256
+    /// Hex-encoded master key for client-side encryption; must decode to
+    /// exactly 32 bytes (64 hex chars, `openssl rand -hex 32`). Per-client keys are derived from it via HKDF-SHA256
     /// with the client_id as tenant, so clients are cryptographically
     /// isolated from each other (AC7), not just key-string separated.
     pub(crate) master_key: String,

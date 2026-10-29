@@ -42,7 +42,7 @@ Routes requests across multiple Anthropic accounts using dynamic capacity-based 
 | **Status-based routing** | Parses API status headers — `warning`/`throttled`/`rejected` enforce utilization floors |
 | **429 rotation** | Rate-limited accounts cool down, traffic shifts instantly |
 | **5xx retry** | Automatic retry on 500/502/503/504/529 (picks different account) |
-| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution |
+| **Token tracking** | Per-account and per-client input/output/cache token counters, plus a per-(client, model) breakdown (`anthropic_client_model_token_usage_total{client,model,type}`) for model-mix and API-price attribution, and the same breakdown for tokens served on paid extra usage (`anthropic_overage_token_usage_total{client,model,type}`) |
 | **Client budgets** | Daily per-client token budgets with automatic reset |
 | **Utilization limits** | Per-client utilization ceiling — 429 when all Anthropic endpoints exceed limit |
 | **Operator bypass** | Designated client bypasses all budget, utilization, and emergency checks |
@@ -174,8 +174,8 @@ token = "sk-ant-api03-..."
 | `listen` | `String` | — | Bind address (e.g. `"127.0.0.1:8082"`) |
 | `rate_limit_cooldown_secs` | `u64` | `5` | Fallback cooldown after a capacity 429 when upstream sends no usable `retry-after` (burst 429s use their own 5→60s backoff). Must be `1..=86400`; a value outside it is rejected at startup |
 | `probe_interval_secs` | `u64` | `300` | Seconds between utilization probes (0 = disabled) |
-| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id` |
-| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`) |
+| `clients[].name` | `String` | — | Identity this credential resolves to — becomes `client_id`. Must match `^[a-z0-9][a-z0-9_-]{0,62}$`; names starting with `_` are reserved |
+| `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`). At least 32 characters; held only as a digest |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
 | `clients[].preferred_endpoints` | `[String]` | `[]` | Pin this client to named endpoint(s); spills to the full pool when none is healthy (incl. at paid overage). Names are startup-validated |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
@@ -187,7 +187,7 @@ token = "sk-ant-api03-..."
 | `auth_failure_window_secs` | `u64` | `300` | Failed-auth throttle window |
 | `auto_cache` | `bool` | `true` | Inject prompt caching beta header |
 | `shadow_log` | `String?` | `None` | Path to JSONL shadow log file |
-| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stderr stream stays at `info` regardless |
+| `debug_log` | `String?` | `None` | Path to an additional `debug`-level `tracing` log file (see [Logging](#logging)); the stdout stream stays at `info` regardless |
 | `soft_limit` | `f64` | `0.90` | Utilization ceiling — accounts above are excluded from routing |
 | `client_names` | `{IP: name}` | `{}` | IP → client ID mapping |
 | `client_budgets` | `{name: tokens}` | `{}` | Daily token budget per client |
@@ -209,6 +209,9 @@ token = "sk-ant-api03-..."
 | `endpoints[].allow_nonstandard_host` | `bool` | `false` | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` — without it startup fails, because the endpoint token would be sent to that host |
 | `session_registry_max` | `usize` | `1000` | Max live-session entries tracked for `/_stats` `sessions` (0 = disabled) |
 | `session_registry_ttl_secs` | `u64` | `1800` | Seconds after a session's last request before its entry is evicted |
+| `client_store.poll_url` | `String` | — | Read ordinary clients from a client store polled at this URL (see [Client store](#client-store-client_store)). Requires `[[clients]]` |
+| `client_store.token` | `String?` | `None` | Sent as `Authorization: Bearer` on every poll; only over `https://` |
+| `log_sink.url` | `String?` | `None` | Also POST every stdout log line, batched as JSON lines, to this `http(s)://` collector (see [Logging](#logging)). A URL carrying credentials is refused at startup |
 
 > [!NOTE]
 > **Strategy normalization**: Both `"dynamic-capacity"` and `"dynamic-capacity-v1"` are accepted in config, but the runtime normalizes to `"dynamic-capacity-v1"` in logs and `/_stats` output. Similarly, `"sticky-weighted"` normalizes to `"sticky-weighted-v2"`.
@@ -251,6 +254,13 @@ A server-side refusal fallback (`fallbacks`) could be served by a model this
 list does not name, so when the chosen endpoint or the client (see
 `[[clients]]` below) has a non-empty `models` list, the proxy strips the
 top-level `fallbacks` field and a refusal is returned as a refusal.
+The same rule covers `/v1/chat/completions` requests forwarded to a
+`protocol = "openai"` endpoint: they lose the body-level fallback lists an
+OpenAI-compatible gateway may honour (`fallbacks`, `context_window_fallbacks`,
+`content_policy_fallbacks` and `router_settings_override`). Only the client's
+lists go, so fallbacks configured on the gateway itself still apply.
+`router_settings_override` is dropped whole, including any retry, timeout or
+routing settings it carries.
 
 ---
 
@@ -294,7 +304,7 @@ Claude Code sends it as `x-api-key`; the proxy validates it and swaps in the rea
 > [!IMPORTANT]
 > With `[[clients]]` configured, **`x-client-id` and the `client_names` IP map are ignored entirely** — `client_id` comes from the verified credential. That is what makes per-client budgets, utilization ceilings, operator status, model allow-lists and response-cache tenancy enforceable rather than advisory: all five key on `client_id`.
 
-Keys are compared in constant time against the whole table. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
+Once started, the proxy holds client keys only as SHA-256 digests: a presented key is digested and looked up. A presented key shorter than 32 characters never matches. Names must match `^[a-z0-9][a-z0-9_-]{0,62}$`, and names starting with `_` are reserved for internal labels. Startup rejects anything that would otherwise fail silently at runtime: duplicate names, duplicate keys, a name with stray whitespace, and any `client_budgets` / `client_utilization_limits` / `operators` / `admin_readers` / `[response_cache].clients` entry naming no configured client. That last class matters — an unknown client passes the budget and utilization checks, so a one-character typo would mean *unlimited* spend with no log line and no metric.
 
 `[[clients]]` is also incompatible with `token = "passthrough"` endpoints, and that combination is rejected at startup. Passthrough forwards the caller's auth headers upstream untouched, but under `[[clients]]` those headers carry the caller's *proxy* credential — forwarding them would hand every client key to the upstream.
 
@@ -331,11 +341,52 @@ Per-client token usage and budget status appear in `/_stats`.
 
 ### Per-client model allow-lists
 
-`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed.
+`clients[].models` restricts which models a client may request, using the same exact-match + `*`-suffix wildcard semantics as `endpoints[].models`. Empty or absent = all models allowed. A non-empty list, on a client or an endpoint, never matches a model containing `,`, because an OpenAI-compatible upstream may read it as several models.
 
 A request for a model outside the list is rejected with **403** — a policy denial, distinct from the 429s that mean "capacity, try later" — and counted as `anthropic_client_model_denied_total{client,model}`. Operators bypass it, as they do every other gate check. The check sits in `pre_request_gate`, which both `/v1/messages` and `/v1/chat/completions` route through, so it covers both surfaces.
 
-It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a body that does not parse, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected.
+To deny a client every model, set `models = [""]`. The single empty pattern matches no model, so every `/v1` request from that client gets 403 while its credential still authenticates — useful for a principal that should only read the admin surfaces. Do not write `models = []` for this: `[]`, like an omitted `models`, allows all models.
+
+It **fails closed** on a model it cannot read. The proxy takes the model from the top-level `model` key of a JSON body; a multipart upload, or a route that nests the model elsewhere (`/v1/messages/batches` puts it under `requests[].params.model`), yields no model — and a client that has an allow-list is then denied rather than waved through. Clients with no allow-list are unaffected. Any other body that does not parse is refused before this check (see §Credential-path hardening).
+
+
+### Client store (`[client_store]`)
+
+A client store keeps the ordinary clients of a fleet in one place, so a key, a budget or a model list changes without a redeploy. The proxy reads it and never writes it: every instance polls the store and enforces what it receives. [`docs/client-store.md`](docs/client-store.md) is the protocol, and `tests/client-store/` the corpus a store and this reader both pass.
+
+```toml
+operators = ["ops"]
+admin_readers = ["scraper"]
+
+[[clients]]          # operators and admin readers stay in this file
+name = "ops"
+key = "<openssl rand -hex 32>"
+
+[[clients]]
+name = "scraper"
+key = "<openssl rand -hex 32>"
+models = [""]
+
+[client_store]
+poll_url = "https://store.example.com/_clients/poll"
+token = "<the store's reader token>"   # optional; sent only over https
+```
+
+The store sends two things. The **document** grants: clients, their keys (as SHA-256 digests) and their policies. The **restrictions** deny: disabled names and revoked key digests. A document replaces the one held once it passes its checks; restrictions are merged into what the instance holds and never replaced, so a store that loses or rewinds a restriction cannot lift it on a running instance. Operators and admin readers live only in this file: a store can neither grant nor restrict them.
+
+**It fails closed.** Until an instance holds a complete set of restrictions, it serves no ordinary client, keys from this file included; operators and admin readers work from the start. It is *loaded* once it also holds a document. Before that, an ordinary key, or a key that matches nothing yet, gets `503` with `retry-after: 1`, which never counts toward the failed-auth throttle. At boot the listener opens after the first answered poll, or after 3 seconds without one, so a store outage cannot hold the port shut. `GET /_ready` answers `200` once loaded and `503` until then. It needs no credential and is exempt from `allowed_ips`, so a readiness probe from the node can call it; it reveals nothing but that one bit. Polls run every 5 seconds, every second while unloaded.
+
+| Refusal | Status | Body `error.message` |
+|---|---|---|
+| A disabled name, for every key of it, store or file | 403 | `client_disabled` |
+| A store client whose policy fails this instance's checks: every key of the name | 403 | `client_quarantined` |
+| An ordinary key before a complete set of restrictions; any unmatched key while unloaded | 503 | `client table not loaded yet` |
+
+A name in both this file and the document is one client: keys from both authenticate, and the document's policy governs them. The file keeps only what the document's schema has no field for, the guard policy. A revoked digest refuses only a store key, and a disabled name refuses every key of an ordinary client of that name. A pin to an endpoint this instance lacks is dropped with a warning. `[response_cache].clients` may name a store client; its tenant stays inert until the client is loaded.
+
+What an instance holds is saved beside the state file, as `<config>.client-store.json`, at every change, and a change is enforced only once it is saved, so a restart resumes no less than was enforced. A save that fails removes the file instead, so a restart waits for the store, and the `resume_unsaved` alert stands until a later save lands. Two cases are exceptions. A file that can be neither written nor durably removed is logged as an error, and the change is enforced anyway, so a restart in that state may resume less. A disk that hangs holds back new changes on that instance until it answers, and each part's last good arrival stops advancing meanwhile. A process restarted with that file in place resumes from it after the same checks, and counts as loaded only if the saved restrictions are complete.
+
+Every install logs the document's exact bytes as base64, with its version and digest, and every change of restrictions logs the full set held, with its completeness mark and set hash; both are logged again once a day. Each line carries at most 9 KiB of the text, under 16 KiB in all, and the lines of one set reassemble into its set text. The `anthropic_client_store_*` series on `/metrics` export the document and records versions held and the hash of the set held (as labels), whether the instance is loaded, every alert (`anthropic_client_store_alert{alert}`: `store_behind`, `store_edited`, `clock_skew`, `restrictions_behind`, `restrictions_partial`, `enabled_ahead`, `document_refused`, `restrictions_refused`, `privileged_name`, `quarantined`, `revoked_outside_store`, `resume_unsaved`), the quarantined clients, unmatched disabled names (a count and at most 5 names), each part's last good arrival, refusals by reason, and one `anthropic_client_store_toml_client{client}` series per ordinary client in this file.
 
 ---
 
@@ -355,9 +406,10 @@ It **fails closed** on a model it cannot read. The proxy takes the model from th
 | **Failed-auth throttle** | `auth_failure_limit` / `auth_failure_window_secs` | Further invalid credentials get 429 + `retry-after` per client IP after repeated failures; valid credentials always pass | on (10 / 300s) |
 | **Trusted proxies** | `trusted_proxies = ["192.0.2.0/24"]` | Real client IP recovered from `x-forwarded-for` behind a listed LB | header ignored |
 | **Caller-identity privacy** | `forward_caller_identity = false` | Caller IP and `x-client-id`/`x-agent-id`/`x-session-id` headers dropped before the upstream request | **stripped** |
+| **Browser-context headers** | always | `origin`, `referer` and `sec-fetch-*` dropped before the upstream request: a forwarded `Origin` makes Anthropic answer a browser caller's valid request with a CORS 401 | **stripped** |
 | **Model allow-list** | `clients[].models` | Rejects models outside a client's list (403) | all models |
 
-IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are compared in constant time, and startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`).
+IP check runs first, then the credential check; failed credentials are subject to the throttle. All apply to every route including `/_stats` and `/metrics`. Credentials are held and matched as digests. Startup rejects any configured credential shorter than 32 characters (generate with `openssl rand -hex 32`), and a presented credential that short never matches.
 
 **TLS terminates at the ingress.** The proxy speaks plain HTTP and its container port must never be published directly to the internet — put it behind a TLS-terminating load balancer or ingress, list that LB in `trusted_proxies`, and let the ingress carry the certificate. Bearer credentials without TLS are credentials in cleartext.
 
@@ -393,6 +445,19 @@ can steer are locked down by default:
   `redirect::Policy::none()`; a `3xx` from an upstream surfaces to the caller
   as a `502` with a distinct log line instead of re-sending credentials to
   the `Location` target.
+- **Unreadable bodies are refused.** On the Anthropic surface (every route
+  but `/v1/chat/completions`, which answers invalid JSON with its own `400`),
+  a non-empty request body that does not parse as JSON gets a
+  `400 invalid_request_error` before routing, whatever its path or
+  `Content-Type`, and is logged at `warn` with its client and path. Other JSON
+  decoders read a model out of some bodies this proxy's parser refuses (a lone
+  surrogate escape, a UTF-8 BOM, trailing bytes), so forwarding one would let
+  the upstream act on a model the proxy never routed or gated on. A multipart
+  upload (`/v1/files`) passes: it opens with its `--` boundary line, and no
+  JSON text starts with `--`. The proxy decodes no content coding, so a
+  non-empty body under any `Content-Encoding` but `identity`, or any
+  `Transfer-Encoding` but `chunked`, gets the same `400` first: its raw bytes
+  are not what the upstream would read.
 - **Response headers are allow-listed.** Only `content-type`,
   `content-length`, `cache-control`, `request-id`, `retry-after`, and
   `x-should-retry` are reflected to callers (plus the proxy's own
@@ -460,9 +525,12 @@ can steer are locked down by default:
   `fast_mode_disabled_remaining_secs` on `/_stats`). Later fast requests skip
   it — a client pinned to it via `preferred_endpoints` spills to the general
   pool — while requests without `speed: "fast"` keep using it. The proxy
-  never strips `speed` to get around a non-entitled org: if no eligible
-  account is entitled, the client gets a `400` with the upstream's error type
-  and message rather than a silent downgrade or a synthetic `429`. The first
+  never strips `speed` to get around a non-entitled org: once every eligible
+  account has answered with that `400`, the client gets a `400` with the
+  upstream's error type and message rather than a silent downgrade or a
+  synthetic `429`. A fast-mode `400` beside accounts that are merely
+  rate-limited stays a retryable `429`, since those accounts may serve the
+  request once they recover. The first
   such request gets the upstream response itself; while the marks last, the
   proxy answers with the same type and message and no upstream headers. A
   `passthrough` endpoint is never marked: it sends the caller's own
@@ -479,6 +547,16 @@ can steer are locked down by default:
   `429`s (`x-should-retry` with no `retry-after` and no rate-limit headers) are
   excluded: those are per-minute limits on the account itself, so they keep
   their usual backoff and rotation whatever speed was requested.
+- **`speed` on a model that does not support it is dropped, not fatal.**
+  Some models reject a top-level `speed` of any value with a `400` ("`'<model>'`
+  does not support the `speed` parameter"), on every account. On
+  `/v1/messages` and `/v1/messages/count_tokens` the proxy removes `speed` and
+  re-sends once to the same account, and the request is served at standard
+  speed. Nothing is cached or marked, and the `400` itself does not rotate the
+  request to another account. If the re-send then gets a `429` or `5xx`, normal
+  rotation applies, and the next account receives the body without `speed`. A
+  `passthrough` endpoint forwards the `400` unchanged. Occurrences are counted
+  as `anthropic_speed_unsupported_total{model}`.
 
 ### Known Limitations
 
@@ -510,8 +588,13 @@ PII scanner (emails, cards, IPs, JWTs, national ids, provider API-key shapes).
 
 ### What it scans
 
-Only the **newest `user` text and `tool_result` blocks** of the request body —
-the freshest untrusted content. The `system` prompt is never scanned (it is
+Only the **newest `user` turn** of the request body — the freshest untrusted
+content: its `text` blocks, the text of its `document` and `search_result`
+blocks, and the same inside its `tool_result` blocks. For a `document` that is a
+`text` source's `data`, a `content` source's string or `text` blocks, and the
+`title` and `context` of any document; for a `search_result`, its `text` blocks,
+`title` and `source`; and a `text` field on any block. Those are the retrieval and web-fetch paths, where
+indirect prompt injection arrives. The `system` prompt is never scanned (it is
 operator-trusted and a known false-positive surface). Detection is strictly
 read-only: the body forwarded upstream is byte-identical to what the client
 sent, so prompt-cache prefixes and routing are never disturbed. To bound
@@ -527,23 +610,31 @@ body, such as `GET /v1/models`, has nothing to scan and passes through.
 On `/v1/chat/completions` the body is scanned after translation to the Messages
 shape, but judged **readable** on the body the client sent. The translator is
 lossy in three places — a non-array `messages`, a `tool` message's non-string
-`content`, and a malformed `image_url` part all collapse to empty before the
-scanner sees them — so a document that is unreadable on the wire would
-otherwise read as clean, which is worse than reading as unscanned.
+`content` or a `tool` content part's fields other than `text`, and a
+malformed `image_url` part all collapse to empty before the scanner sees them —
+so a document that is unreadable on the wire would otherwise read as clean,
+which is worse than reading as unscanned.
 
 Content the Messages shape does not carry is not scanned: fields translation
-drops outright (`messages[].name`, the top-level `user`), content blocks of a
-type the scanner does not read (`image`, `document`, `thinking`), older turns,
-and a body with no `messages` field at all (`/v1/complete`'s `prompt`, batch
-requests). Those are **coverage** limits — the guard read the document and there
-was nothing in it that it reads.
+drops outright (`messages[].name`, the top-level `user`), content the scanner
+cannot read as text (images, and `document` blocks with a `base64`, `url` or
+`file` source — PDF bytes, or content not in the request at all), blocks with
+no text field (`tool_reference` tool names, `browser_state` tab titles and
+URLs), older turns, and a body with no `messages` field at all
+(`/v1/complete`'s `prompt`, batch requests). Those are **coverage** limits —
+the guard read the document and there was nothing in it that it reads.
 
 A `messages` the scanner cannot **read** is a different thing, and is treated as
 one: an element that is not an object, a `role` that is absent, not a string, or
 not `user`/`assistant`, or a newest-turn `content` that is present in a shape the
 scanner cannot walk (an object, a text block whose `text` is not a string, a
-`tool_result` whose content is neither string nor block array). Those are not
-"nothing to scan" — the guard could not tell what it was looking at, and under
+`tool_result` whose content is neither string nor block array, a `document` or
+`search_result` in a shape the API does not define), or a content block of a
+type the scanner does not know that carries a `text`, `content`, `source`,
+`title`, `context`, `refusal` or `thinking` field. That last pair covers the
+OpenAI `refusal` and `thinking` content parts: the scanner does not read them
+as text, but an OpenAI-compatible upstream may render them as model-visible
+text in any role. Those are not "nothing to scan" — the guard could not tell what it was looking at, and under
 `block` they fail closed (below). Note an absent field is not the same as a
 present unreadable one: absent content cannot be hiding anything.
 
@@ -589,7 +680,9 @@ Operator clients are always `off` regardless of configuration.
 same 400 rather than forwarded unscanned:
 
 - the body is not JSON — a parse differential must not smuggle content past the
-  scan; this includes multipart uploads such as `/v1/files`;
+  scan. Every other unparseable body is already refused for all clients (see
+  §Credential-path hardening), so in practice this is a multipart upload such
+  as `/v1/files`;
 - `messages` is present but is not an array — a string, an object, a number,
   `null`. The scanner reads that field as an array, so none of it reaches the
   scan while all of it reaches the upstream. This applies on every path. A body
@@ -600,15 +693,25 @@ same 400 rather than forwarded unscanned:
 - `messages` is an array the scanner cannot read — an element that is not an
   object, a `role` absent / not a string / not `user` or `assistant` (`"User"`
   included: the compare is exact), or a newest-turn `content` present in a shape
-  it cannot walk. Each of these is content the guard never saw and the upstream
-  would have;
+  it cannot walk. That includes a malformed `document` or `search_result`, and
+  a block of a type the scanner does not know that carries a `text`, `content`,
+  `source`, `title`, `context`, `refusal` or `thinking` field
+  (`{"type": "x", "text": "..."}`). A newest-turn `refusal` or `thinking` part
+  or block that carries its text is therefore rejected, on `/v1/messages` and
+  `/v1/chat/completions` alike. On `/v1/chat/completions` so is one in any
+  `tool` message, older turns included (below).
+  Audio, file, `tool_reference` and `browser_state` blocks carry none of those
+  and still pass; images are skipped as a known binary type. Each of these is content the guard never saw and the upstream would
+  have;
 - the body parsed as JSON but is not an object — a bare string or array is not a
   request any endpoint here accepts, and reads as "no `messages` field" without
   this rule;
 - on `/v1/chat/completions` only, `messages` is absent or not an array, or a
   `user`/`tool` message's content is in a shape translation would flatten (a
   non-string `tool` content, a content part with no string `type`, a `text` that
-  is not a string, an `image_url` that is not an object with a string `url`).
+  is not a string, a `tool` content part carrying `content`, `source`, `title`,
+  `context`, `refusal` or `thinking` — translation keeps only its `text` — or an `image_url` that is not an object
+  with a string `url`).
   That endpoint is a single API which requires `messages`, and an
   `openai`-protocol endpoint forwards the client's original bytes, so what
   translation drops still ships;
@@ -837,6 +940,16 @@ models sharing their first 64 characters share one label.
 header-asserted under legacy auth (bounded at 256 + 1 distinct (client,
 model) pairs).
 
+`anthropic_overage_token_usage_total{client,model,type}` counts the tokens of
+each request whose own upstream response carried
+`anthropic-ratelimit-unified-overage-in-use: true`, i.e. usage billed as paid
+extra usage. It reads the serving response's headers, not the account's last
+known state, so concurrent responses on one account cannot mislabel each
+other; the `proxied` log line carries the same flag as `served_overage`, beside
+the account-level `overage`. It shares the per-model family's labels and bound, and also counts
+anonymous (`client="-"`) traffic. Join it to a `(model, type)` price series to
+estimate extra-usage spend.
+
 ### Per-claim rate-limit visibility
 
 The API reports model-specific sub-budgets ("claims") alongside the general
@@ -852,6 +965,9 @@ Status is **not** derivable from utilization in either direction, so read it
 rather than thresholding the percentage: an account can sit at 0.98 and still
 be `allowed_warning` — the router keeps routing to it — while another reads
 1.0 and is `rejected`, which makes the router hard-skip it for that claim.
+Whatever its status, an account not in overage whose weekly claim reads 1.0
+before its reset gets routing weight 0 until the reset; the periodic probe
+re-checks it.
 
 Across replicas these are gauges mirroring the same upstream claim, so
 aggregate with `max by (account, claim)`; `sum` multiplies the reading by the
@@ -891,6 +1007,56 @@ signal that a caller was actually turned away because of it. Both label values
 are emitted from process start, so a flat zero is a measurement rather than an
 absence of data. These are independent per-replica event counts — aggregate
 with `sum by (kind)`, where `max` would undercount.
+
+### Session affinity
+
+Under `sticky-weighted-v2`, a request with an affinity key goes to the account
+that wins the key's rendezvous hash, weighted by the square root of waste risk,
+among the accounts in its tier that pass the overage rule. An account passes while its gate is below
+`soft_limit` and its unused weekly quota, where quota due to expire within
+6 h counts increasingly as unused, is at least `1 − soft_limit` (0.10 at the
+default). So a session stays on its account until that account nears its 5h
+or weekly limit, gets `throttled` or `rejected`, is rate-limited, cooling or
+circuit-broken, or is demoted for overage. The weekly `allowed_warning` floor
+alone does not move it, and neither does 5h load short of `soft_limit`: the
+hash ignores it, so a 5h window filling or resetting moves no session between
+passing accounts. An account without waste-risk data scores as its lowest
+peer. When no account in the tier passes, the hash runs over the whole tier on
+the full routing weight, which does count 5h load; such a pick is degraded
+routing, so it is neither counted as a move nor remembered.
+
+The hash is stateless, so replicas agree without sharing anything. Each
+account scores a key on its own, so a waste-risk change moves only the keys
+won by or lost from that account, and an account leaving the set moves only
+its own keys. An account whose waste risk falls (its weekly use climbs faster
+than its window runs out) loses part of its keys once, counted as `rehomed`;
+they do not flap back while the waste risk holds. The square root damps this:
+a waste-risk change of a small fraction d moves about d/2 of the account's
+keys, at the cost of flatter placement, since 4x the waste risk wins 2x the
+keys. Un-keyed requests still scatter over the full routing weight.
+
+`anthropic_affinity_migrations_total{reason}` counts real moves: a request
+whose account differs from the one this replica last picked for its key and
+model.
+A replica remembers at least the last 8,192 (key, model) pairs for this and
+nothing else;
+routing never reads it. Each move also logs one INFO line,
+`affinity migrated: session moved to another account`, with `reason`,
+`from_account` and `to_account`.
+
+| `reason` | The old account |
+|:---------|:----------------|
+| `loaded` | failed the overage rule on its 5h load |
+| `spent` | failed the overage rule on its weekly quota |
+| `floored` | failed the overage rule on a status floor (`throttled`, `rejected`) |
+| `unavailable` | is not a candidate in the request's tier: rate-limited, cooling, circuit-broken, excluded for the model or fast mode, outside the caller's pin, or demoted for overage; or the request was served from a different tier |
+| `rehomed` | still passes, but another account won the key: its waste risk rose, or it returned to the set |
+
+All five label values are emitted from process start. The count is per
+replica: when consecutive requests on one key land on different replicas, a
+move can be missed or counted once per replica. Under `dynamic-capacity-v1`
+the counter instead counts every request its two-account override moves, as
+`loaded`, `spent` or `floored`.
 
 ### Request latency, restarts and build identity
 
@@ -1115,14 +1281,14 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 6. Compute time-adjusted utilization per claim window (5h, 7d per model)
 7. Apply status floors (warning ≥ 0.80, throttled ≥ 0.98, rejected = 1.0)
 8. Exclude accounts above soft_limit utilization ceiling
-9. Pick account via headroom-proportional weighted bucket hashing (client affinity)
+9. Pick account: keyed requests by rendezvous hash weighted on the square root of waste risk among accounts passing the overage rule ([Session affinity](#session-affinity)), others by headroom-proportional weighted buckets
 10. Inject auth token + auto-cache header
 11. Forward request to upstream Anthropic API
 12. If 429 → mark rate-limited (propagate to Redis), add to skip list, retry with next account
 13. If 5xx/529 → add to skip list, retry with different account
 14. Parse rate-limit headers (utilization per claim, reset times, status)
 15. Extract token usage from response (streaming SSE or JSON body; streams from `openai` endpoints have no usage extraction)
-16. Record extracted usage per-account + per-client, update budget (local + Redis)
+16. Record extracted usage per-account + per-client, update budget (local + Redis). A stream from an `anthropic` endpoint that ends before its final `message_delta` (client disconnect, upstream error) is charged to the budget at the request's `max_tokens` for output, plus a request-body estimate (bytes / 4) for input when no `message_start` arrived either. An upstream error before the stream begins (no frame but `error` or `ping`) is charged nothing, since no generation began. The token counters keep only what the upstream reported
 17. Write shadow log entry (async, non-blocking)
 18. State persisted to disk (+ Redis if configured), restored on restart
 ```
@@ -1134,17 +1300,58 @@ The Anthropic↔OpenAI translation layer is not lossless. When an Anthropic-form
 
 ## Logging
 
-Structured `tracing` logs go to stderr at `info` level by default (one line
+Structured `tracing` logs go to stdout at `info` level by default (one line
 per request that reaches upstream, carrying routing context — client, model,
 account, status, utilization — and token usage together; on the native
 `/v1/messages` path the line also carries `fp`, the content fingerprint, `-`
-when the body was unparseable). Override the filter with `RUST_LOG` (e.g.
-`RUST_LOG=anthropic_lb=debug`), or set `debug_log = "/path/to/file.log"` in
-the config to additionally write a `debug`-level file log alongside the
-`info`-level stderr stream. At `debug`, the full per-request content
-fingerprinting detail (`fingerprint`: `fp`/`fps`/`bps`) becomes visible —
-useful for diagnosing routing-affinity stickiness, but too high-volume for
-the default filter.
+when the body was unparseable). When the upstream answers a 4xx with an
+Anthropic error envelope, the line (`proxied` or `proxied (openai-compat)`)
+names its reason: `err_type` is the upstream `error.type`, cut to 64
+characters plus `…` when longer, and `err` its `error.message`, at most 200
+characters, `…` included when cut; control characters in either are
+escaped. Both are `-` on every other line, 2xx included. Values the line
+takes from request headers (`ver`, `agent`, `session`, the `x-claude-code-*`
+hints, and `client_id` when no `[[clients]]` is configured) are cut to 64
+characters plus `…` when longer, so no header can push the line past the log
+sink's 32 KiB cut; routing and budgets still use the whole value. Override
+the filter with `RUST_LOG` (e.g. `RUST_LOG=anthropic_lb=debug`), or set
+`debug_log = "/path/to/file.log"` in the config to additionally write a
+`debug`-level file log alongside the `info`-level stdout stream. At `debug`,
+the full per-request content fingerprinting detail (`fingerprint`:
+`fp`/`fps`/`bps`) becomes visible — useful for diagnosing routing-affinity
+stickiness, but too high-volume for the default filter.
+
+### Log sink (`[log_sink]`)
+
+Where stdout is not shipped anywhere a log store can read it, the proxy can
+POST a copy of every stdout line to a collector itself:
+
+```toml
+[log_sink]
+url = "http://logs.example:9428/insert/jsonline"   # e.g. VictoriaLogs
+```
+
+With a sink configured, stdout is written without ANSI colour too, so the
+sink's copy is plain text that a log store can search; without one, colour
+is on unless `NO_COLOR` is set, as before. Lines are sent in batches, as
+one JSON object per line
+(`{"_time":"<RFC 3339>","_msg":"<the line as written to stdout>"}`) with
+`content-type: application/x-ndjson`. A batch leaves at 1000 lines, at about
+1 MiB, or one second after its first line, whichever comes first, so a lone
+line arrives within about a second. Delivery is best effort and never slows a
+request: lines wait in a bounded in-memory queue (10,000 lines and 16 MiB), a
+line that finds it full is dropped, a line longer than 32 KiB is cut after its
+last whole field and marked with its full length (comfortably under
+VictoriaLogs' default 256 KiB line limit), and a batch that fails, times out
+(5 s) or gets a non-2xx answer is dropped, not retried.
+`anthropic_log_sink_lines_sent_total` and `anthropic_log_sink_lines_dropped_total` on `/metrics` count both
+outcomes; they are absent when no sink is configured. The proxy logs one
+warning when delivery starts failing and one line when it recovers, with the
+number of lines dropped meanwhile. At shutdown it waits up to 2 s for the
+queue to empty. Redirects are not followed, and the URL is never logged
+(only its host and port). Only `tracing` output goes to the sink: a panic
+message and anything else written straight to stderr stay where the platform
+keeps stderr.
 
 ---
 
@@ -1185,7 +1392,7 @@ redis_url = "redis://redis.example.com:6379"
 |:--------------|:----------|:------------|
 | **Budget counters** | Atomic `INCRBY` per request | Immediate |
 | **Hard limits (429)** | `SETEX` on mark + background sync | Immediate local, ~5s cross-replica |
-| **Rate info** | JSON blob per account | ~5s (background sync) |
+| **Rate info** | JSON blob per account | Immediate local, ~30s cross-replica |
 | **Replica heartbeats** | `SET EX 30` per instance | ~5s |
 
 **Fail-open**: All Redis *operations* degrade gracefully. If a syntactically valid `redis_url` is unreachable, each replica falls back to local-only state and reconnects in the background. No request is ever blocked by a Redis error. A `redis_url` that fails to *parse* (e.g. a rotated password containing an unescaped `/`, `?`, or `#`) is a config error, not a connectivity one — it fails startup outright rather than silently running without the shared state an operator asked for.
@@ -1265,8 +1472,33 @@ not replayed — they described the original exchange.
 
 **Fail-open:** a slow, dead, or misconfigured cache backend never blocks a
 request. Every cache operation is bounded by `op_timeout_ms`; on any error the
-request proceeds upstream exactly as if the cache did not exist. Hit / miss /
-store / error counters are exposed on `/metrics`, one series per endpoint
+request proceeds upstream exactly as if the cache did not exist. With
+`backend = "redis"`:
+
+- If Redis is unreachable when the process starts, the cache is disabled
+  (logged at error level, and no `anthropic_response_cache_*` series appear)
+  until the next restart.
+- A connection dropped mid-run reconnects on its own, with backoff up to 30 s.
+  The Redis driver keeps each operation that timed out or was cancelled
+  queued in memory, value included, and replays it once Redis is back. So a
+  write is sent only while writes in flight plus abandoned operations not yet
+  known to be drained number 16 or fewer: an outage holds at most 16 written
+  entries. On a healthy Redis this also means a 17th concurrent write is
+  skipped. Reads carry no entry and are sent until 16 operations have been
+  abandoned. Then the cache pauses: no operation is sent, L1 hits included.
+  A PING checks Redis at once, inside the paused request's `op_timeout_ms`,
+  and its reply resumes the cache. If operations abandoned while it was in
+  flight keep the cache paused, the next PING is sent at once too. Only a
+  PING that times out or is refused pushes the next one 5 s out; a request
+  that disconnects mid-PING leaves the PING running until Redis answers or
+  that request's `op_timeout_ms` runs out. Operations
+  the cache skips count as errors. The Redis user needs the `PING` command
+  (`+ping` under an ACL), or a pause never ends. `redis_url` must start with
+  `redis://` or `rediss://`; a cluster URL is refused.
+- A connection with a reply pending for more than 5 s is closed and
+  re-established.
+
+Hit / miss / store / error counters are exposed on `/metrics`, one series per endpoint
 (`anthropic_response_cache_*_total{surface="messages"}` and
 `{surface="count_tokens"}`).
 

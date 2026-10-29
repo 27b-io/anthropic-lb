@@ -77,7 +77,7 @@ async fn cluster_info_returns_none_without_redis() {
 async fn sync_from_redis_noop_without_redis() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
     // Should not panic or error when redis is None
-    state.sync_from_redis().await;
+    state.sync_from_redis(SyncScope::Full).await;
     // Cluster cache should remain None
     assert!(state.cluster_info_cache.lock().unwrap().is_none());
 }
@@ -95,7 +95,7 @@ async fn sync_and_publish_handle_endpoint_pool_without_redis() {
         st.endpoints.push(make_endpoint("ep-oai", Protocol::OpenAI));
     }
     // Both paths must be no-ops (redis is None) and must not panic.
-    state.sync_from_redis().await;
+    state.sync_from_redis(SyncScope::Full).await;
     state.publish_routing_weights().await;
     assert!(state.cluster_info_cache.lock().unwrap().is_none());
 }
@@ -104,18 +104,21 @@ async fn sync_and_publish_handle_endpoint_pool_without_redis() {
 async fn budget_local_fallback_without_redis() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 100u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Budget check uses local path when redis is None
-    assert!(state.check_budget("client-a").await.is_ok());
-    state.record_budget_usage("client-a", 80).await;
-    assert!(state.check_budget("client-a").await.is_ok());
-    state.record_budget_usage("client-a", 30).await;
-    assert!(state.check_budget("client-a").await.is_err());
+    assert!(state.check_budget(&state.caller("client-a")).await.is_ok());
+    state
+        .record_budget_usage(&state.caller("client-a"), 80)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_ok());
+    state
+        .record_budget_usage(&state.caller("client-a"), 30)
+        .await;
+    assert!(state.check_budget(&state.caller("client-a")).await.is_err());
 }
 
 #[test]
@@ -208,7 +211,7 @@ async fn hard_limit_unchanged_by_sync_without_redis() {
     }
 
     // sync_from_redis should not touch it when redis is None
-    state.sync_from_redis().await;
+    state.sync_from_redis(SyncScope::Full).await;
 
     let info = state.endpoints[0].rate_info.read().await;
     assert!(info.hard_limited_until.is_some());
@@ -218,14 +221,15 @@ async fn hard_limit_unchanged_by_sync_without_redis() {
 async fn record_budget_usage_skips_zero_tokens() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 100u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
+    }));
 
     // Recording 0 tokens should be a no-op
-    state.record_budget_usage("client-a", 0).await;
+    state
+        .record_budget_usage(&state.caller("client-a"), 0)
+        .await;
     let map = state.budget_usage.lock().unwrap();
     assert!(map.get("client-a").is_none());
 }
@@ -234,7 +238,9 @@ async fn record_budget_usage_skips_zero_tokens() {
 async fn record_budget_usage_skips_unknown_client() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
     // No budgets configured — recording should be a no-op
-    state.record_budget_usage("unknown-client", 500).await;
+    state
+        .record_budget_usage(&state.caller("unknown-client"), 500)
+        .await;
     let map = state.budget_usage.lock().unwrap();
     assert!(map.is_empty());
 }
@@ -506,6 +512,72 @@ async fn state_roundtrip_preserves_burst_backoff_and_leaves_no_tmp() {
         info.consecutive_burst_429s, 3,
         "burst-429 backoff stage must survive a restart (B3-07)"
     );
+}
+
+/// A passthrough endpoint's `rate_info` is never refreshed from its own
+/// traffic, so state restored from the file would pin it for good. Here the
+/// file marks both endpoints exhausted: the pooled one restores (proving the
+/// file is read), the passthrough one starts clean and still serves, and the
+/// next save writes no entry for it.
+#[tokio::test]
+async fn passthrough_endpoint_rate_state_is_never_restored_or_saved() {
+    use std::sync::atomic::Ordering;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let until = AppState::now_epoch() + 3600;
+    let exhausted = |name: &str| {
+        format!(
+            r#"{{"name":"{name}","requests_total":0,"remaining_tokens":0,"hard_limited_until_epoch":{until}}}"#
+        )
+    };
+    std::fs::write(
+        tmp.path(),
+        format!(
+            r#"{{"endpoints":[{},{}],"saved_at":0}}"#,
+            exhausted("pt"),
+            exhausted("pooled")
+        ),
+    )
+    .unwrap();
+    let (pt_url, pt_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let (pooled_url, _) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut pooled = mk_endpoint_at("pooled", "sk-ant-api-pooled", &pooled_url);
+    pooled.priority = 1;
+    let mut state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), pooled]);
+    Arc::get_mut(&mut state).unwrap().state_path = tmp.path().to_path_buf();
+
+    state.load_state().await;
+
+    let pooled_info = state.endpoints[1].rate_info.read().await;
+    assert!(pooled_info.hard_limited_until.is_some());
+    assert_eq!(pooled_info.remaining_tokens, Some(0));
+    drop(pooled_info);
+    let info = state.endpoints[0].rate_info.read().await;
+    assert!(info.hard_limited_until.is_none());
+    assert_eq!(info.remaining_tokens, None);
+    assert!(info.last_updated.is_none());
+    drop(info);
+
+    let addr = serve(build_router(state.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-api-caller")
+        .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        pt_hits.load(Ordering::SeqCst),
+        1,
+        "the passthrough endpoint must still serve"
+    );
+
+    state.save_state().await;
+    let saved: PersistedState =
+        serde_json::from_str(&tokio::fs::read_to_string(tmp.path()).await.unwrap()).unwrap();
+    let names: Vec<&str> = saved.endpoints.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["pooled"]);
 }
 
 /// Concurrent save_state calls must serialize cleanly: a valid, parseable

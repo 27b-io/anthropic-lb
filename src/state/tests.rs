@@ -280,6 +280,76 @@ async fn openai_handler_body_budget_sheds_with_503() {
     assert!(resp.headers().get("retry-after").is_some());
 }
 
+/// POST `body` chunked on a raw socket with `Content-Length: 1` placed BEFORE
+/// `Transfer-Encoding: chunked` (a header order reqwest cannot produce), and
+/// return the raw response.
+async fn post_cl_before_chunked_te(addr: SocketAddr, path: &str, body: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: 1\r\n\
+         Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    // A reset at close (body bytes left unread) still leaves the response in `raw`.
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+        .await
+        .expect("server must respond, not hang");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// hyper keeps a `Content-Length` that arrives BEFORE `Transfer-Encoding:
+/// chunked` in the handler's header map (it drops CL only when CL follows TE)
+/// yet decodes the body as chunked, so that CL says nothing about the bytes
+/// `read_body_bounded` buffers. The reservation must ignore it and take the
+/// full cap, as for a request with no CL: under a budget between the CL value
+/// and the cap both handlers shed, and under a budget that fits the cap the
+/// request is still served — processed by TE alone, not refused.
+#[tokio::test]
+async fn body_budget_ignores_content_length_before_chunked_transfer_encoding() {
+    let (url, _h) = spawn_mock_upstream().await;
+    let state_with_budget = |max_inflight_body_bytes| {
+        Arc::new(AppState {
+            endpoints: vec![mk_endpoint_at("a", "sk-ant-api-aaa", &url)],
+            max_inflight_body_bytes,
+            ..test_state_base()
+        })
+    };
+    let requests = [
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#,
+        ),
+    ];
+    for (path, body) in requests {
+        // Above the declared 1 byte and the real body, below the 25 MiB cap.
+        let tight = state_with_budget(1024 * 1024);
+        let addr = serve(build_router(tight.clone())).await;
+        let resp = post_cl_before_chunked_te(addr, path, body).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "{path}: a chunked body must reserve the full cap whatever its CL says, got: {resp}"
+        );
+        assert_eq!(tight.body_shed_total.load(Ordering::Relaxed), 1, "{path}");
+
+        let roomy = state_with_budget(MAX_REQUEST_BODY_BYTES as u64);
+        let addr = serve(build_router(roomy)).await;
+        let resp = post_cl_before_chunked_te(addr, path, body).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "{path}: CL+TE must be processed by TE alone, not refused, got: {resp}"
+        );
+    }
+}
+
 /// The body-memory backstop must be observable so the budget can be tuned
 /// from measured peak rather than guessed: a gauge for current in-flight body
 /// bytes, a gauge for the configured limit, and a counter that increments on
@@ -643,82 +713,138 @@ fn burn_rate_decay() {
 #[test]
 fn pressure_status_healthy() {
     let state = test_state_with(vec![]);
-    assert_eq!(compute_pressure_status(0.0, "client1", &state), "healthy");
-    assert_eq!(compute_pressure_status(0.50, "client1", &state), "healthy");
-    assert_eq!(compute_pressure_status(0.69, "client1", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.0, &state.caller("client1")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(0.50, &state.caller("client1")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(0.69, &state.caller("client1")),
+        "healthy"
+    );
 }
 
 #[test]
 fn pressure_status_elevated() {
     let state = test_state_with(vec![]);
-    assert_eq!(compute_pressure_status(0.70, "client1", &state), "elevated");
-    assert_eq!(compute_pressure_status(0.80, "client1", &state), "elevated");
-    assert_eq!(compute_pressure_status(0.84, "client1", &state), "elevated");
+    assert_eq!(
+        compute_pressure_status(0.70, &state.caller("client1")),
+        "elevated"
+    );
+    assert_eq!(
+        compute_pressure_status(0.80, &state.caller("client1")),
+        "elevated"
+    );
+    assert_eq!(
+        compute_pressure_status(0.84, &state.caller("client1")),
+        "elevated"
+    );
 }
 
 #[test]
 fn pressure_status_critical() {
     let state = test_state_with(vec![]);
-    assert_eq!(compute_pressure_status(0.85, "client1", &state), "critical");
-    assert_eq!(compute_pressure_status(0.90, "client1", &state), "critical");
-    assert_eq!(compute_pressure_status(0.94, "client1", &state), "critical");
+    assert_eq!(
+        compute_pressure_status(0.85, &state.caller("client1")),
+        "critical"
+    );
+    assert_eq!(
+        compute_pressure_status(0.90, &state.caller("client1")),
+        "critical"
+    );
+    assert_eq!(
+        compute_pressure_status(0.94, &state.caller("client1")),
+        "critical"
+    );
 }
 
 #[test]
 fn pressure_status_emergency() {
     let state = test_state_with(vec![]);
     assert_eq!(
-        compute_pressure_status(0.95, "client1", &state),
+        compute_pressure_status(0.95, &state.caller("client1")),
         "emergency"
     );
-    assert_eq!(compute_pressure_status(1.0, "client1", &state), "emergency");
+    assert_eq!(
+        compute_pressure_status(1.0, &state.caller("client1")),
+        "emergency"
+    );
 }
 
 #[test]
 fn pressure_status_operator_always_healthy() {
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().operators(&["ray"]).install(AppState {
         state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["ray".to_string()],
         ..test_state_base()
-    });
+    }));
     // Operator always gets "healthy" regardless of utilization
-    assert_eq!(compute_pressure_status(0.99, "ray", &state), "healthy");
-    assert_eq!(compute_pressure_status(1.0, "ray", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.99, &state.caller("ray")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(1.0, &state.caller("ray")),
+        "healthy"
+    );
     // Non-operator at same utilization gets emergency
-    assert_eq!(compute_pressure_status(0.99, "other", &state), "emergency");
+    assert_eq!(
+        compute_pressure_status(0.99, &state.caller("other")),
+        "emergency"
+    );
 }
 
 #[test]
 fn pressure_status_upgrade_near_client_limit() {
     let mut limits = HashMap::new();
     limits.insert("gastown".to_string(), 0.85);
-    let state = Arc::new(AppState {
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     // gastown has limit 0.85, 80% of that = 0.68
     // At 0.60, below 0.68 → no upgrade → "healthy"
-    assert_eq!(compute_pressure_status(0.60, "gastown", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.60, &state.caller("gastown")),
+        "healthy"
+    );
     // At 0.69, above 0.68 → upgrade healthy→elevated
-    assert_eq!(compute_pressure_status(0.69, "gastown", &state), "elevated");
+    assert_eq!(
+        compute_pressure_status(0.69, &state.caller("gastown")),
+        "elevated"
+    );
     // At 0.70, already elevated, above 0.68 → upgrade elevated→critical
-    assert_eq!(compute_pressure_status(0.70, "gastown", &state), "critical");
+    assert_eq!(
+        compute_pressure_status(0.70, &state.caller("gastown")),
+        "critical"
+    );
     // Client without limits: no upgrade
-    assert_eq!(compute_pressure_status(0.69, "other", &state), "healthy");
+    assert_eq!(
+        compute_pressure_status(0.69, &state.caller("other")),
+        "healthy"
+    );
 }
 
 #[test]
 fn compute_pressure_status_operator_always_healthy() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["operator-id".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["operator-id"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
-    let status = compute_pressure_status(0.99, "operator-id", &state);
+    let status = compute_pressure_status(0.99, &state.caller("operator-id"));
     assert_eq!(
         status, "healthy",
         "operator should always see healthy status"
@@ -729,26 +855,41 @@ fn compute_pressure_status_operator_always_healthy() {
 fn compute_pressure_status_thresholds() {
     let state = test_state_with(vec![]);
 
-    assert_eq!(compute_pressure_status(0.50, "client", &state), "healthy");
-    assert_eq!(compute_pressure_status(0.75, "client", &state), "elevated");
-    assert_eq!(compute_pressure_status(0.90, "client", &state), "critical");
-    assert_eq!(compute_pressure_status(0.99, "client", &state), "emergency");
+    assert_eq!(
+        compute_pressure_status(0.50, &state.caller("client")),
+        "healthy"
+    );
+    assert_eq!(
+        compute_pressure_status(0.75, &state.caller("client")),
+        "elevated"
+    );
+    assert_eq!(
+        compute_pressure_status(0.90, &state.caller("client")),
+        "critical"
+    );
+    assert_eq!(
+        compute_pressure_status(0.99, &state.caller("client")),
+        "emergency"
+    );
 }
 
 #[test]
 fn compute_pressure_status_limit_proximity_upgrade() {
     let mut limits = HashMap::new();
     limits.insert("client".to_string(), 0.80);
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
     // 0.65 is > 80% of 0.80 limit (80% * 0.80 = 0.64), so should upgrade from healthy to elevated
-    let status = compute_pressure_status(0.65, "client", &state);
+    let status = compute_pressure_status(0.65, &state.caller("client"));
     assert_eq!(
         status, "elevated",
         "proximity to limit should upgrade status"
@@ -1182,5 +1323,76 @@ async fn read_body_bounded_logs_read_error_with_req_id() {
             && mine[0].contains("error=lab5313 client reset"),
         "body read failure must log the error as a field, got: {}",
         mine[0]
+    );
+}
+
+/// `GoQuoted` output reads back through Go's unquoting to the original string,
+/// and printable ASCII prints the same bytes as Debug. Each character's escape
+/// is checked alone by `go_quoted_escapes_what_debug_escapes`; these check
+/// escapes amid other text.
+#[test]
+fn go_quoted_round_trips_through_go_unquote() {
+    for s in [
+        "claude-sonnet-4-6",
+        "q\"b\\s'",
+        "tab\tnl\nret\r",
+        "claude-x\u{1} client_id=forged ",
+    ] {
+        let quoted = GoQuoted(s).to_string();
+        assert_eq!(
+            go_quoted_prefix(&quoted),
+            Some((s.to_owned(), quoted.len())),
+            "{quoted}"
+        );
+    }
+    assert_eq!(
+        GoQuoted("claude-sonnet-4-6").to_string(),
+        format!("{:?}", "claude-sonnet-4-6")
+    );
+    assert_eq!(
+        GoQuoted("\u{0}\u{7f}\u{85}\u{ad}\u{202e}\u{e0049}").to_string(),
+        r#""\u0000\u007f\u0085\u00ad\u202e\U000e0049""#
+    );
+}
+
+/// Over every scalar value, `GoQuoted` escapes a character exactly when Debug
+/// does, and every escape reads back through Go's unquoting.
+#[test]
+fn go_quoted_escapes_what_debug_escapes() {
+    for c in (0..=0x10ffff).filter_map(char::from_u32) {
+        let s = c.to_string();
+        let raw = format!("\"{s}\"");
+        let quoted = GoQuoted(&s).to_string();
+        assert_eq!(
+            quoted == raw,
+            format!("{s:?}") == raw,
+            "U+{:04X}",
+            u32::from(c)
+        );
+        assert_eq!(
+            go_quoted_prefix(&quoted),
+            Some((s, quoted.len())),
+            "U+{:04X}",
+            u32::from(c)
+        );
+    }
+}
+
+/// A value longer than `MAX_LOGGED_VALUE_CHARS` is cut there and marked, so
+/// the escaped field stays within 10 bytes a character, plus its quotes and
+/// `…`, however long the input is.
+#[test]
+fn go_quoted_cuts_a_long_value() {
+    let fits = "x".repeat(MAX_LOGGED_VALUE_CHARS);
+    assert_eq!(GoQuoted(&fits).to_string(), format!("\"{fits}\""));
+
+    let long = "\u{e0001}".repeat(40 << 10);
+    let quoted = GoQuoted(&long).to_string();
+    let kept = format!("{}…", "\u{e0001}".repeat(MAX_LOGGED_VALUE_CHARS));
+    assert_eq!(go_quoted_prefix(&quoted), Some((kept, quoted.len())));
+    assert!(
+        quoted.len() <= 10 * MAX_LOGGED_VALUE_CHARS + 5,
+        "{}",
+        quoted.len()
     );
 }

@@ -358,7 +358,7 @@ async fn oauth_forwards_per_turn_betas_header_and_system_entry_body_together() {
     .await;
 }
 
-/// Panel follow-up (LAB-1191): a client flag that IS one of the required
+/// LAB-1191: a client flag that IS one of the required
 /// OAUTH_BETA_FLAGS is always forwarded (the merge re-adds it), so it must
 /// never be reported as dropped — even under a custom allow-list that
 /// omits it. A false drop here would make the diagnostics lie.
@@ -382,7 +382,7 @@ fn oauth_beta_filter_never_reports_required_flags_as_dropped() {
     }
 }
 
-/// Panel follow-up (LAB-1191): dropped-flag keys are length-bounded before
+/// LAB-1191: dropped-flag keys are length-bounded before
 /// logging/counting — a multi-kilobyte client "flag" must not be pinned
 /// verbatim into every /metrics scrape.
 #[test]
@@ -397,6 +397,16 @@ fn dropped_beta_flag_keys_are_length_bounded() {
         "key must be truncated, got {} bytes",
         key.len()
     );
+}
+
+#[test]
+fn dropped_beta_flag_keys_truncate_on_char_boundary() {
+    // A 4-byte char straddling the limit is dropped whole, not split.
+    let state = test_state_with(vec![]);
+    let head = "x".repeat(MAX_DROPPED_BETA_FLAG_LEN - 1);
+    state.record_dropped_beta_flags("t", &[format!("{head}\u{1F980}tail")]);
+    let map = state.beta_flags_dropped.lock().unwrap();
+    assert_eq!(map.keys().collect::<Vec<_>>(), [&head]);
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +606,7 @@ async fn forward_with_betas_full(
         &state.endpoints[0],
         0,
         "req-1261",
-        "client-1",
+        &state.caller("client-1"),
         "-",
         &"127.0.0.1".parse().unwrap(),
         "-",
@@ -825,7 +835,7 @@ fn known_pairings_travel_together() {
     }
 }
 
-/// Helly R finding 1, and the invariant the whole keep-side rests on: a
+/// The invariant the whole keep-side rests on: a
 /// surviving flag protects its body field ONLY if a row claims it, so the
 /// table has to be total over the allow-list. A family with no row is not
 /// neutral — its field gets deleted out from under a caller who was entitled
@@ -844,7 +854,7 @@ fn beta_body_field_table_covers_the_allowlist() {
     }
 }
 
-/// Helly R finding 1, the concrete case. `fallback-credit-*` is allow-listed
+/// The concrete case. `fallback-credit-*` is allow-listed
 /// and Claude Code sends it; `fallback_credit_token` is a billing instrument
 /// redeemable once within five minutes of a refusal. One unrelated unknown
 /// flag alongside it used to delete the token while the credit flag itself
@@ -911,26 +921,43 @@ fn surviving_server_side_fallback_keeps_fallbacks_and_dropped_one_strips_it() {
     assert_eq!(parsed["fallbacks"], "default");
 }
 
-/// LAB-5970: `strip_fallbacks` removes every top-level `fallbacks` (a
-/// duplicate key must not keep one alive) and nothing else, retained values
-/// byte-identical.
+/// LAB-5970: `strip_top_level_fields` removes every top-level entry of a
+/// listed key (a duplicate key must not keep one alive) and nothing else,
+/// retained values byte-identical.
 #[test]
-fn strip_fallbacks_removes_only_fallbacks() {
+fn strip_top_level_fields_removes_only_listed_fields() {
     let body = bytes::Bytes::from_static(
         br#"{"model":"claude-opus-5","fallbacks":"default","max_tokens":18446744073709551617,"fallbacks":[{"model":"claude-opus-4-8"}],"messages":[]}"#,
     );
-    let out = strip_fallbacks(&body).expect("fallbacks must be stripped");
+    let out = strip_top_level_fields(&body, ANTHROPIC_FALLBACK_FIELDS)
+        .expect("fallbacks must be stripped");
     assert_eq!(
         std::str::from_utf8(&out).unwrap(),
         r#"{"model":"claude-opus-5","max_tokens":18446744073709551617,"messages":[]}"#
     );
     // Nothing to strip, or nothing we can read: body untouched.
-    assert!(strip_fallbacks(&bytes::Bytes::from_static(br#"{"model":"m"}"#)).is_none());
-    assert!(strip_fallbacks(&bytes::Bytes::from_static(b"not json")).is_none());
+    let fallbacks = ANTHROPIC_FALLBACK_FIELDS;
+    assert!(
+        strip_top_level_fields(&bytes::Bytes::from_static(br#"{"model":"m"}"#), fallbacks)
+            .is_none()
+    );
+    assert!(strip_top_level_fields(&bytes::Bytes::from_static(b"not json"), fallbacks).is_none());
+
+    // LAB-6794: every listed field goes, wherever it sits, and a nested
+    // `fallbacks` is a value of a kept key, not a top-level entry.
+    let body = bytes::Bytes::from_static(
+        br#"{"router_settings_override":{"fallbacks":[{"a":["b"]}]},"model":"m","context_window_fallbacks":[{"m":["big"]}],"metadata":{"fallbacks":["x"]},"content_policy_fallbacks":[],"fallbacks":["x"]}"#,
+    );
+    let out =
+        strip_top_level_fields(&body, OPENAI_FALLBACK_FIELDS).expect("all four must be stripped");
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        r#"{"model":"m","metadata":{"fallbacks":["x"]}}"#
+    );
 }
 
-/// What the upstream received for a `fallbacks` request, sent as `client_key`
-/// (`None` = no client table) to a single endpoint.
+/// What the upstream received for a `fallbacks` request, sent as
+/// `test_key(client_key)` (`None` = no client table) to a single endpoint.
 async fn fallbacks_body_seen_upstream(
     clients: Vec<ClientConfig>,
     client_key: Option<&str>,
@@ -941,12 +968,16 @@ async fn fallbacks_body_seen_upstream(
         spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
     let mut ep = mk_endpoint_at("acct-a", endpoint_token, &upstream_url);
     ep.models = endpoint_models.iter().map(|m| m.to_string()).collect();
-    let state = Arc::new(AppState {
+    let policy = if clients.is_empty() {
+        TestPolicy::open()
+    } else {
+        TestPolicy::clients(clients)
+    };
+    let state = Arc::new(policy.install(AppState {
         endpoints: vec![ep],
-        clients,
         auto_cache: false,
         ..test_state_base()
-    });
+    }));
     let addr = serve(build_router(state)).await;
     let mut req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
@@ -956,7 +987,7 @@ async fn fallbacks_body_seen_upstream(
             r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"fallbacks":"default"}"#,
         );
     if let Some(key) = client_key {
-        req = req.header("x-api-key", key);
+        req = req.header("x-api-key", test_key(key));
     }
     let resp = req.send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -977,7 +1008,11 @@ async fn fallbacks_body_seen_upstream(
 #[tokio::test]
 async fn restricted_client_loses_fallbacks_on_oauth_endpoint() {
     let body = fallbacks_body_seen_upstream(
-        vec![mk_client("limited", "key-limited", &["claude-opus-5*"])],
+        vec![mk_client(
+            "limited",
+            &test_key("key-limited"),
+            &["claude-opus-5*"],
+        )],
         Some("key-limited"),
         "sk-ant-oat01-test-aaa",
         &[],
@@ -1003,7 +1038,7 @@ async fn restricted_endpoint_loses_fallbacks_on_api_key_endpoint() {
 async fn unrestricted_client_and_endpoint_keep_fallbacks() {
     for token in ["sk-ant-oat01-test-aaa", "sk-ant-api-test-aaa"] {
         let body = fallbacks_body_seen_upstream(
-            vec![mk_client("open", "key-open", &[])],
+            vec![mk_client("open", &test_key("key-open"), &[])],
             Some("key-open"),
             token,
             &[],
@@ -1016,7 +1051,7 @@ async fn unrestricted_client_and_endpoint_keep_fallbacks() {
     }
 }
 
-/// Helly R finding 1, second half: a custom `allowed_client_betas` can pass a
+/// The invariant's second half: a custom `allowed_client_betas` can pass a
 /// family this proxy has no row for. It may own a top-level field, and the
 /// proxy cannot tell that field from an orphan — so it declines to strip at
 /// all. Losing the degrade costs a 400 the caller already gets today; deleting
@@ -1037,7 +1072,7 @@ fn unrecognised_surviving_flag_disables_the_strip() {
     );
 }
 
-/// Helly R finding 2: a `serde_json::Value` round-trip rewrote an integer too
+/// A `serde_json::Value` round-trip rewrote an integer too
 /// large for `u64` as a float, silently changing a value inside RETAINED tool
 /// history — data corruption on the part of the payload the design promises
 /// to preserve. Retained fields are spliced through as their original bytes.
@@ -1062,7 +1097,7 @@ fn rewrite_preserves_retained_values_exactly() {
     assert!(!text.contains("orphan_field"));
 }
 
-/// Panel finding (CRIT), and the sharpest edge on this change: `proxy_handler`
+/// The sharpest edge on this change: `proxy_handler`
 /// is the router's catch-all, so EVERY route reaches `forward_anthropic` —
 /// while `BASE_BODY_FIELDS` describes `/v1/messages` alone. Ungated, one
 /// unlisted beta flag on a `/v1/messages/batches` POST deleted the entire
@@ -1154,7 +1189,7 @@ fn one_request_cannot_exhaust_the_strip_counter() {
         "one request claimed {used} named slots; the per-request cap is \
          {MAX_STRIPPED_FIELDS_PER_REQUEST} plus the shared _other bucket"
     );
-    // Helly R finding 3: the removals past the cap still happened, so they are
+    // The removals past the cap still happened, so they are
     // still counted. Discarding them let an ordered payload hide the
     // actionable field behind junk and leave no trace anything else went.
     assert_eq!(
@@ -1302,7 +1337,7 @@ fn stripped_field_names_are_sanitized() {
     assert_eq!(sanitize_metric_key("café", 4), "caf");
 }
 
-/// Adversarial-review probe (Helly R, delta pass on `7e2ebb5`), adopted as a
+/// Probe against `7e2ebb5`, adopted as a
 /// permanent regression. `strip_orphaned_beta_body_fields` hand-writes its
 /// output object — keys re-escaped, values spliced as raw bytes — and manual
 /// JSON emission is exactly where a key containing a quote or a newline, or a
@@ -1378,7 +1413,7 @@ fn raw_object_reemission_survives_hostile_keys_and_values() {
     }
 }
 
-/// Adversarial-review probe (Helly R, delta pass), adopted. Positive controls
+/// Positive controls
 /// for the two policy rules, stated as behaviour rather than as the absence of
 /// the old defects: a known surviving family keeps its field while an orphan
 /// in the same body goes, an unrecognised surviving family disables the strip
@@ -1423,7 +1458,7 @@ fn surviving_families_and_strip_counter_positive_controls() {
     );
 }
 
-/// Adversarial-review probe (Helly R, delta pass), adopted. End-to-end through
+/// End-to-end through
 /// the router against a no-rewrite control, which is the part the unit tests
 /// cannot show: that the bytes reaching the upstream are the client's own.
 ///

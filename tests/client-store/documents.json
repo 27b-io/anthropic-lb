@@ -1,0 +1,737 @@
+{
+  "about": "Client store corpus. The format and every rule id are in docs/client-store.md.",
+  "cases": [
+    {
+      "id": "typical",
+      "why": "Two clients, three keys and a revoked digest: the common shape.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": "install"
+    },
+    {
+      "id": "empty",
+      "why": "No clients and no revoked digests: the first document a store holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "version-min",
+      "why": "1 is the lowest version a document can carry.",
+      "document": {"schema":1,"version":1,"updated_at":"2026-10-11T06:26:40.123Z","clients":[],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "version-max",
+      "why": "2^53-1 is the highest version a document can carry.",
+      "document": {"schema":1,"version":9007199254740991,"updated_at":"2026-10-11T06:26:40.123Z","clients":[],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "clients-64",
+      "why": "64 clients is the most a document holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"c00","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c01","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c02","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c03","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c04","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c05","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c06","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c07","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c08","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c09","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c10","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c11","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c12","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c13","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c14","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c15","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c16","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c17","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c18","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c19","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c20","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c21","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c22","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c23","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c24","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c25","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c26","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c27","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c28","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c29","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c30","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c31","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c32","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c33","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c34","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c35","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c36","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c37","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c38","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c39","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c40","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c41","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c42","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c43","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c44","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c45","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c46","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c47","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c48","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c49","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c50","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c51","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c52","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c53","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c54","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c55","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c56","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c57","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c58","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c59","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c60","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c61","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c62","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c63","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "client-upper-limits",
+      "why": "One client at every upper limit: a 63-character name, the largest budget, a ceiling of exactly 1, 64 model patterns (one of 128 characters), 16 pins (one of 63 characters) and 2 keys with 64-character labels.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn","daily_budget":9007199254740991,"utilization_limit":1,"models":["model-00-*","model-01-*","model-02-*","model-03-*","model-04-*","model-05-*","model-06-*","model-07-*","model-08-*","model-09-*","model-10-*","model-11-*","model-12-*","model-13-*","model-14-*","model-15-*","model-16-*","model-17-*","model-18-*","model-19-*","model-20-*","model-21-*","model-22-*","model-23-*","model-24-*","model-25-*","model-26-*","model-27-*","model-28-*","model-29-*","model-30-*","model-31-*","model-32-*","model-33-*","model-34-*","model-35-*","model-36-*","model-37-*","model-38-*","model-39-*","model-40-*","model-41-*","model-42-*","model-43-*","model-44-*","model-45-*","model-46-*","model-47-*","model-48-*","model-49-*","model-50-*","model-51-*","model-52-*","model-53-*","model-54-*","model-55-*","model-56-*","model-57-*","model-58-*","model-59-*","model-60-*","model-61-*","model-62-*","mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm*"],"preferred_endpoints":["endpoint-00","endpoint-01","endpoint-02","endpoint-03","endpoint-04","endpoint-05","endpoint-06","endpoint-07","endpoint-08","endpoint-09","endpoint-10","endpoint-11","endpoint-12","endpoint-13","endpoint-14","eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],"keys":[{"id":"kffffff0","label":"LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL","digest":"5555555555555555555555555555555555555555555555555555555555555555","created_at":"2026-10-01T09:30:00.000Z"},{"id":"kffffff1","label":"~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~","digest":"6666666666666666666666666666666666666666666666666666666666666666","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "client-lower-limits",
+      "why": "One client at the lower limits: a budget of 1, a ceiling just above 0, the pattern `*` and an empty label.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"a","daily_budget":1,"utilization_limit":0.001,"models":["*"],"preferred_endpoints":[],"keys":[{"id":"k0000000","label":"","digest":"7777777777777777777777777777777777777777777777777777777777777777","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "model-pattern-forms",
+      "why": "Real model names from several providers, a one-character pattern, and every punctuation character a pattern may hold, with and without the trailing `*`.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":null,"utilization_limit":null,"models":["claude-opus-4-8","claude-*","anthropic.claude-3-5-sonnet-20240620-v1:0","claude-3-5-sonnet@20240620","openai/gpt-4o:free","Qwen/Qwen2.5-72B-Instruct","x","!#$%&'()+-./:;<=>?@[]^_`{|}~","!#$%&'()+-./:;<=>?@[]^_`{|}~*"],"preferred_endpoints":[],"keys":[]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "names-of-digits",
+      "why": "Names may be all digits, and leading zeros matter: `007`, `10` and `9` are three names.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"007","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"10","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"9","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "operator-like-name",
+      "why": "The format does not know a deployment's operators or admin readers, so a client named `operator` is valid here. A store that reserves the name refuses it, and a reader that does drops the client after the envelope rules, outside the format.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"operator","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k1234567","label":"2026-10 rotation","digest":"8888888888888888888888888888888888888888888888888888888888888888","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "revoked-only",
+      "why": "Revoked digests with no clients.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[],"revoked_digests":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]},
+      "expect": "install"
+    },
+    {
+      "id": "client-without-keys",
+      "why": "A client may hold no keys.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "key-id-shared-across-clients",
+      "why": "Key ids need only be unique within their client.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k0000001","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k0000001","label":"2026-10 rotation","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "name-constructor",
+      "why": "`constructor` is a valid name, and the one every plain JavaScript object already holds: a store or reader that keeps clients in a plain object instead of a Map gets it wrong.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"constructor","daily_budget":1000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k0c0c0c0","label":"2026-10 rotation","digest":"9999999999999999999999999999999999999999999999999999999999999999","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":[]},
+      "expect": "install"
+    },
+    {
+      "id": "label-with-quote-and-backslash",
+      "why": "A label may hold `\"` and `\\`, which the document text escapes and the poll answer escapes again.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"ops \"blue\" \\ green","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": "install"
+    },
+    {
+      "id": "not-an-object",
+      "why": "A document is a JSON object.",
+      "document": [],
+      "expect": {"refuse":"document.object"}
+    },
+    {
+      "id": "document-null",
+      "why": "`null` is not an object, though JavaScript's `typeof` says it is.",
+      "document": null,
+      "expect": {"refuse":"document.object"}
+    },
+    {
+      "id": "schema-2",
+      "why": "A reader keeps its last good document when it meets a schema it does not read.",
+      "document": {"schema":2,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.schema"}
+    },
+    {
+      "id": "schema-2-with-new-member",
+      "why": "A newer schema reports as a schema fault, not as the unknown member it brings, because the schema is checked first.",
+      "document": {"schema":2,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"],"tenants":[]},
+      "expect": {"refuse":"document.schema"}
+    },
+    {
+      "id": "schema-missing",
+      "why": "A document without a schema has no schema a reader reads.",
+      "document": {"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.schema"}
+    },
+    {
+      "id": "schema-string",
+      "why": "The schema is the integer 1, not the string.",
+      "document": {"schema":"1","version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.schema"}
+    },
+    {
+      "id": "member-unknown",
+      "why": "A top-level member schema 1 does not define.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"],"comment":"x"},
+      "expect": {"refuse":"document.members"}
+    },
+    {
+      "id": "member-missing",
+      "why": "Every top-level member is required.",
+      "document": {"schema":1,"version":1791700000123,"clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.members"}
+    },
+    {
+      "id": "member-missing-revoked-digests",
+      "why": "`revoked_digests` is required even when empty.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}]},
+      "expect": {"refuse":"document.members"}
+    },
+    {
+      "id": "version-zero",
+      "why": "Version 0 means no document, so no document carries it.",
+      "document": {"schema":1,"version":0,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.version"}
+    },
+    {
+      "id": "version-negative",
+      "why": "Versions are not negative.",
+      "document": {"schema":1,"version":-1,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.version"}
+    },
+    {
+      "id": "version-above-max",
+      "why": "2^53 is past the largest version.",
+      "document": {"schema":1,"version":9007199254740992,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.version"}
+    },
+    {
+      "id": "version-fraction",
+      "why": "A version is an integer.",
+      "document": {"schema":1,"version":1791700000123.5,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.version"}
+    },
+    {
+      "id": "version-string",
+      "why": "A version is a number, not a string.",
+      "document": {"schema":1,"version":"1791700000123","updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.version"}
+    },
+    {
+      "id": "updated-at-without-millis",
+      "why": "The timestamp form always carries milliseconds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-12T05:00:00Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.updated_at"}
+    },
+    {
+      "id": "updated-at-with-offset",
+      "why": "The timestamp form is UTC with `Z`, not an offset.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-12T05:00:00.123+00:00","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.updated_at"}
+    },
+    {
+      "id": "updated-at-number",
+      "why": "A timestamp is a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":1791700000123,"clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.updated_at"}
+    },
+    {
+      "id": "updated-at-trailing-newline",
+      "why": "A pattern matches the whole value, so a trailing line feed breaks it.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z\n","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.updated_at"}
+    },
+    {
+      "id": "clients-not-an-array",
+      "why": "`clients` is an array.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":{},"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.clients"}
+    },
+    {
+      "id": "client-not-an-object",
+      "why": "Each client is an object.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]},"acme-2"],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.clients"}
+    },
+    {
+      "id": "client-null",
+      "why": "A client is an object, not `null`.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]},null],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.clients"}
+    },
+    {
+      "id": "clients-65",
+      "why": "65 clients is one more than a document holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"c00","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c01","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c02","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c03","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c04","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c05","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c06","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c07","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c08","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c09","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c10","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c11","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c12","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c13","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c14","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c15","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c16","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c17","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c18","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c19","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c20","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c21","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c22","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c23","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c24","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c25","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c26","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c27","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c28","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c29","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c30","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c31","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c32","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c33","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c34","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c35","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c36","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c37","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c38","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c39","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c40","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c41","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c42","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c43","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c44","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c45","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c46","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c47","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c48","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c49","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c50","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c51","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c52","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c53","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c54","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c55","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c56","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c57","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c58","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c59","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c60","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c61","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c62","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c63","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]},{"name":"c64","daily_budget":null,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[]}],"revoked_digests":[]},
+      "expect": {"refuse":"document.clients"}
+    },
+    {
+      "id": "name-missing",
+      "why": "A client without a name cannot be quarantined by name, so the document is refused.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-not-a-string",
+      "why": "A name is a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":7,"daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-empty",
+      "why": "A name has at least one character.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-uppercase",
+      "why": "Names are lowercase.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"Acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-leading-underscore",
+      "why": "A leading `_` is reserved.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"_acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-underscore-only",
+      "why": "`_` alone is reserved.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"_","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-leading-dash",
+      "why": "A name starts with a letter or a digit.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"-acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-64-characters",
+      "why": "64 characters is one more than a name holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-with-space",
+      "why": "A space is outside the name alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme corp","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-with-dot",
+      "why": "`.` is outside the name alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme.io","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-non-ascii",
+      "why": "A name is ASCII.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acm\u00e9","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-twice",
+      "why": "Two clients cannot share a name.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"acme","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-in-an-array",
+      "why": "A name is a string; JavaScript's `RegExp.test` would turn `[\"acme\"]` into one.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":["acme"],"daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "name-trailing-newline",
+      "why": "A pattern matches the whole value, so a trailing line feed breaks it.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme\n","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "keys-missing",
+      "why": "A client without `keys` leaves its digests unknown, so the document is refused.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.keys"}
+    },
+    {
+      "id": "keys-not-an-array",
+      "why": "`keys` is an array.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":{}},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.keys"}
+    },
+    {
+      "id": "key-not-an-object",
+      "why": "Each key is an object.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":["k7f3a2c1"]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.keys"}
+    },
+    {
+      "id": "key-digest-missing",
+      "why": "Every key has a digest.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.keys"}
+    },
+    {
+      "id": "key-null",
+      "why": "A key is an object, not `null`.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"},null]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.keys"}
+    },
+    {
+      "id": "revoked-digests-not-an-array",
+      "why": "`revoked_digests` is an array.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":"4444444444444444444444444444444444444444444444444444444444444444"},
+      "expect": {"refuse":"document.revoked_digests"}
+    },
+    {
+      "id": "key-digest-uppercase",
+      "why": "Digests are lowercase hex, so one value has one spelling.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "key-digest-63-characters",
+      "why": "A digest is 64 characters.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "key-digest-not-hex",
+      "why": "A digest is hex.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "key-digest-not-a-string",
+      "why": "A digest is a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":1,"created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "key-digest-null",
+      "why": "A `digest` member that is `null` is present but is not a digest.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":null,"created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "key-digest-in-an-array",
+      "why": "A digest is a string, not an array holding one.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":["1111111111111111111111111111111111111111111111111111111111111111"],"created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "key-digest-trailing-newline",
+      "why": "A pattern matches the whole value, so a trailing line feed breaks it.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111\n","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "revoked-digest-malformed",
+      "why": "Revoked digests follow the digest form too.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"]},
+      "expect": {"refuse":"document.digest"}
+    },
+    {
+      "id": "digest-in-two-clients",
+      "why": "One digest in two clients would map one key to two names.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest_once"}
+    },
+    {
+      "id": "digest-twice-in-one-client",
+      "why": "Two keys of one client cannot share a digest.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest_once"}
+    },
+    {
+      "id": "digest-of-a-revoked-key",
+      "why": "A key whose digest is revoked cannot stay in the document.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444","1111111111111111111111111111111111111111111111111111111111111111"]},
+      "expect": {"refuse":"document.digest_once"}
+    },
+    {
+      "id": "revoked-digest-twice",
+      "why": "A revoked digest is listed once.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444","4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.digest_once"}
+    },
+    {
+      "id": "envelope-fault-wins",
+      "why": "Breaks two rules on purpose: a client fault (a budget of 0) and an envelope fault (a repeated name). Any envelope fault refuses the whole document.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":0,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"acme","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"refuse":"document.name"}
+    },
+    {
+      "id": "client-member-unknown",
+      "why": "A per-client guard policy is not part of schema 1.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}],"guard":"block"},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.members"}}
+    },
+    {
+      "id": "client-member-missing",
+      "why": "Every client member is required, even when empty.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.members"}}
+    },
+    {
+      "id": "budget-zero",
+      "why": "A budget is at least 1; no budget is `null`.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":0,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.daily_budget"}}
+    },
+    {
+      "id": "budget-negative",
+      "why": "A budget is not negative.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":-1,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.daily_budget"}}
+    },
+    {
+      "id": "budget-above-max",
+      "why": "2^53 is past the largest budget.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":9007199254740992,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.daily_budget"}}
+    },
+    {
+      "id": "budget-fraction",
+      "why": "A budget is an integer.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":1.5,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.daily_budget"}}
+    },
+    {
+      "id": "budget-string",
+      "why": "A budget is a number, not a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":"600000000","utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.daily_budget"}}
+    },
+    {
+      "id": "utilization-zero",
+      "why": "A ceiling is above 0; no ceiling is `null`.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.utilization_limit"}}
+    },
+    {
+      "id": "utilization-above-one",
+      "why": "A ceiling is at most 1.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":1.01,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.utilization_limit"}}
+    },
+    {
+      "id": "utilization-negative",
+      "why": "A ceiling is not negative.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":-0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.utilization_limit"}}
+    },
+    {
+      "id": "utilization-string",
+      "why": "A ceiling is a number, not a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":"0.5","models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.utilization_limit"}}
+    },
+    {
+      "id": "models-not-an-array",
+      "why": "`models` is an array.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":"claude-*","preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "models-65",
+      "why": "65 patterns is one more than a client holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["model-00","model-01","model-02","model-03","model-04","model-05","model-06","model-07","model-08","model-09","model-10","model-11","model-12","model-13","model-14","model-15","model-16","model-17","model-18","model-19","model-20","model-21","model-22","model-23","model-24","model-25","model-26","model-27","model-28","model-29","model-30","model-31","model-32","model-33","model-34","model-35","model-36","model-37","model-38","model-39","model-40","model-41","model-42","model-43","model-44","model-45","model-46","model-47","model-48","model-49","model-50","model-51","model-52","model-53","model-54","model-55","model-56","model-57","model-58","model-59","model-60","model-61","model-62","model-63","model-64"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-empty",
+      "why": "A store client is denied by disabling its name, not by the empty pattern.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":[""],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-star-inside",
+      "why": "`*` only ends a pattern.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-*-opus"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-star-first",
+      "why": "`*` only ends a pattern, so it cannot start a longer one.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["*-haiku"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-two-stars",
+      "why": "`*` appears at most once.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-**"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-with-space",
+      "why": "A space is outside the pattern alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude opus"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-with-comma",
+      "why": "A pattern holding `,` could never match.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-opus-4-8,claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-with-quote",
+      "why": "`\"` is outside the pattern alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude\"opus"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-with-backslash",
+      "why": "`\\` is outside the pattern alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude\\opus"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-with-tab",
+      "why": "Control characters are outside the pattern alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude\topus"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-non-ascii",
+      "why": "A pattern is ASCII.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-\u00e9"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-129-characters",
+      "why": "129 characters is one more than a pattern holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-not-a-string",
+      "why": "A pattern is a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":[5],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-in-an-array",
+      "why": "A pattern is a string, not an array holding one.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":[["claude-*"]],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "model-with-del",
+      "why": "DEL (0x7F) is outside the pattern alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude\u007f"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.models"}}
+    },
+    {
+      "id": "pins-not-an-array",
+      "why": "`preferred_endpoints` is an array.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":"primary","keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "pins-17",
+      "why": "17 pins is one more than a client holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["endpoint-00","endpoint-01","endpoint-02","endpoint-03","endpoint-04","endpoint-05","endpoint-06","endpoint-07","endpoint-08","endpoint-09","endpoint-10","endpoint-11","endpoint-12","endpoint-13","endpoint-14","endpoint-15","endpoint-16"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "pin-uppercase",
+      "why": "Endpoint names follow the name rule.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["Primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "pin-empty",
+      "why": "An endpoint name has at least one character.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":[""],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "pin-64-characters",
+      "why": "64 characters is one more than a name holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "pin-not-a-string",
+      "why": "An endpoint name is a string; JavaScript's `RegExp.test` would turn 7 into one.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":[7],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "pin-in-an-array",
+      "why": "An endpoint name is a string, not an array holding one.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":[["primary"]],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.preferred_endpoints"}}
+    },
+    {
+      "id": "keys-3",
+      "why": "Three keys is one more than a client holds. Every digest is still mapped to its name, so all three are refused.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"},{"id":"k0a0b0c3","label":"2026-10 rotation","digest":"5555555555555555555555555555555555555555555555555555555555555555","created_at":"2026-10-01T09:30:00.000Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"client.keys"}}
+    },
+    {
+      "id": "key-member-unknown",
+      "why": "A key member schema 1 does not define.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z","expires_at":"2026-10-11T06:26:40.123Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.members"}}
+    },
+    {
+      "id": "key-member-missing",
+      "why": "Every key member is required.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.members"}}
+    },
+    {
+      "id": "key-id-uppercase",
+      "why": "Key ids are lowercase.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"K7F3A2C1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.id"}}
+    },
+    {
+      "id": "key-id-7-characters",
+      "why": "A key id is `k` and 7 hex digits.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.id"}}
+    },
+    {
+      "id": "key-id-9-characters",
+      "why": "A key id is `k` and 7 hex digits.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1d","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.id"}}
+    },
+    {
+      "id": "key-id-not-hex",
+      "why": "A key id's digits are hex.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2cz","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.id"}}
+    },
+    {
+      "id": "key-id-not-a-string",
+      "why": "A key id is a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":7,"label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.id"}}
+    },
+    {
+      "id": "key-id-trailing-newline",
+      "why": "A pattern matches the whole value, so a trailing line feed breaks it.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1\n","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.id"}}
+    },
+    {
+      "id": "key-id-twice-in-one-client",
+      "why": "Two keys of one client cannot share an id.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c1","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"batch-7":"key.id"}}
+    },
+    {
+      "id": "label-65-characters",
+      "why": "65 characters is one more than a label holds.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.label"}}
+    },
+    {
+      "id": "label-with-tab",
+      "why": "Control characters are outside the label alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10\trotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.label"}}
+    },
+    {
+      "id": "label-non-ascii",
+      "why": "A label is ASCII.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"rotaci\u00f3n","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.label"}}
+    },
+    {
+      "id": "label-null",
+      "why": "A label is a string; an empty label is `\"\"`.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":null,"digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.label"}}
+    },
+    {
+      "id": "label-with-del",
+      "why": "DEL (0x7F) is outside the label alphabet.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10\u007f","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.label"}}
+    },
+    {
+      "id": "created-at-date-only",
+      "why": "`created_at` is a full timestamp.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.created_at"}}
+    },
+    {
+      "id": "created-at-not-a-string",
+      "why": "A timestamp is a string.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":600000000,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":1791700000123}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-haiku-*","claude-sonnet-5"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"key.created_at"}}
+    },
+    {
+      "id": "two-clients-quarantined",
+      "why": "Each client fault quarantines only its own client.",
+      "document": {"schema":1,"version":1791700000123,"updated_at":"2026-10-11T06:26:40.123Z","clients":[{"name":"acme","daily_budget":0,"utilization_limit":null,"models":[],"preferred_endpoints":[],"keys":[{"id":"k7f3a2c1","label":"2026-10 rotation","digest":"1111111111111111111111111111111111111111111111111111111111111111","created_at":"2026-10-01T09:30:00.000Z"}]},{"name":"batch-7","daily_budget":null,"utilization_limit":0.5,"models":["claude-*-opus"],"preferred_endpoints":["primary"],"keys":[{"id":"k0a0b0c1","label":"2026-09 key","digest":"2222222222222222222222222222222222222222222222222222222222222222","created_at":"2026-10-01T09:30:00.000Z"},{"id":"k0a0b0c2","label":"2026-10 key","digest":"3333333333333333333333333333333333333333333333333333333333333333","created_at":"2026-10-11T05:15:04.512Z"}]}],"revoked_digests":["4444444444444444444444444444444444444444444444444444444444444444"]},
+      "expect": {"quarantine":{"acme":"client.daily_budget","batch-7":"client.models"}}
+    }
+  ]
+}

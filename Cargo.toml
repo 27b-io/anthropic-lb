@@ -1,7 +1,12 @@
 [package]
 name = "anthropic-lb"
-version = "0.2.5"
-edition = "2021"
+version = "0.4.2"
+edition = "2024"
+# Edition 2024 defaults to resolver 3, which holds dependencies back to versions
+# whose `rust-version` the declared MSRV satisfies. This crate raises its
+# toolchain floor rather than pinning old dependencies, so keep resolver 2's
+# newest-compatible selection on purpose.
+resolver = "2"
 description = "Load-balancing reverse proxy for multiple Anthropic API accounts with dynamic capacity routing"
 license = "MIT"
 repository = "https://github.com/27b-io/anthropic-lb"
@@ -45,15 +50,14 @@ fred = { version = "9.4", features = ["i-scripts", "enable-rustls-ring"] }
 # LAB-933 response cache. NOTE: the crate is `cachekit-rs` (lib name `cachekit`,
 # github.com/cachekit-io/cachekit-rs) — the crate published as plain `cachekit`
 # on crates.io is an UNRELATED eviction-primitives library. Do not "fix" this.
-# Default features (cachekitio SaaS backend, encryption, L1) + the fred-backed
-# redis backend so both AC11 backends are selectable at runtime.
-cachekit-rs = { version = "0.5", features = ["redis"] }
+# Default features (cachekitio SaaS backend, encryption, L1, reliability) + the
+# fred-backed redis backend so both AC11 backends are selectable at runtime.
+# `reliability` is inert here: cachekit only wraps the backend in retries and a
+# circuit breaker when the builder's `.reliability()` is called, and we never call it.
+cachekit-rs = { version = "0.13", features = ["redis"] }
 # Same versions cachekit-rs already pins — zero marginal dependency weight.
 blake2 = "0.10"
 serde_bytes = "0.11"
-# Constant-time credential comparison (LAB-1083). Already in the tree via
-# cachekit-rs' AEAD stack — direct use costs no extra compile.
-subtle = "2.6"
 
 # LAB-3877: Tier 0 request-content guard. Both are pure Rust with no C/C++
 # build dependency (verified via `cargo tree`); `secrets_scanner` is pulled in
@@ -68,6 +72,14 @@ leakguard = { version = "0.9.1", optional = true }
 # without `guard` is unchanged.
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 moka = { version = "0.12", default-features = false, features = ["sync"], optional = true }
+# Client keys, client store documents, restrictions parts and restriction sets
+# are all identified by SHA-256 (docs/client-store.md). cachekit-rs already
+# compiles this version in (through cachekit-core), so the direct dep adds no
+# code.
+sha2 = "0.10.9"
+# The client store install and restrictions logs carry exact bytes as base64.
+# reqwest already compiles this version in, so the direct dep adds no code.
+base64 = "0.22.1"
 
 [features]
 # Off by default: with the feature disabled the guard module and both scanner

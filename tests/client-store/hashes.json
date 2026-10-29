@@ -1,0 +1,116 @@
+{
+  "about": "Client store corpus. The format and every rule id are in docs/client-store.md.",
+  "set_hashes": [
+    {
+      "id": "empty",
+      "why": "The empty set's text is empty.",
+      "records": [],
+      "revoked_digests": [],
+      "text": "",
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "one-disabled",
+      "why": "One disabled record.",
+      "records": [{"name":"acme","state":"disabled","version":1791700000123000}],
+      "revoked_digests": [],
+      "text": "r acme disabled 1791700000123000\n",
+      "hash": "8eb4006956365de6c3d0a5193c0602c459955358c99dbca6f0673df543b25212"
+    },
+    {
+      "id": "one-enabled",
+      "why": "One enabled record.",
+      "records": [{"name":"acme","state":"enabled","version":1791700000123000}],
+      "revoked_digests": [],
+      "text": "r acme enabled 1791700000123000\n",
+      "hash": "832994842966c91136af28cb54e55baf417ed28e55bcb946f97292599d8ab82a"
+    },
+    {
+      "id": "one-digest",
+      "why": "One revoked digest.",
+      "records": [],
+      "revoked_digests": ["1111111111111111111111111111111111111111111111111111111111111111"],
+      "text": "d 1111111111111111111111111111111111111111111111111111111111111111\n",
+      "hash": "82b3e7bad4af7483ddf73564d2bbb70fa05f108b837008c1fdfaa27114dfa4e7"
+    },
+    {
+      "id": "spec-example",
+      "why": "The example in the format description, given out of order.",
+      "records": [{"name":"batch-7","state":"enabled","version":1791700000456000},{"name":"acme","state":"disabled","version":1791700000123000}],
+      "revoked_digests": ["1111111111111111111111111111111111111111111111111111111111111111"],
+      "text": "r acme disabled 1791700000123000\nr batch-7 enabled 1791700000456000\nd 1111111111111111111111111111111111111111111111111111111111111111\n",
+      "hash": "5d3eb4669447223b4441b22f80712c129abe2ad435a6961d7f027287126c4951"
+    },
+    {
+      "id": "byte-order",
+      "why": "Names sort by bytes: digits before letters, `-` before digits, `_` after them.",
+      "records": [{"name":"aa","state":"disabled","version":1791699000000001},{"name":"a_b","state":"disabled","version":1791699000000001},{"name":"9","state":"disabled","version":1791699000000001},{"name":"a","state":"disabled","version":1791699000000001},{"name":"10","state":"disabled","version":1791699000000001},{"name":"a0","state":"disabled","version":1791699000000001},{"name":"a-b","state":"disabled","version":1791699000000001},{"name":"007","state":"disabled","version":1791699000000001}],
+      "revoked_digests": [],
+      "text": "r 007 disabled 1791699000000001\nr 10 disabled 1791699000000001\nr 9 disabled 1791699000000001\nr a disabled 1791699000000001\nr a-b disabled 1791699000000001\nr a0 disabled 1791699000000001\nr a_b disabled 1791699000000001\nr aa disabled 1791699000000001\n",
+      "hash": "a5f18b4b800f04cb0bbbeb04d42e10ad6ef3234c3eb819d77930dd1cf2ec7e84"
+    },
+    {
+      "id": "digest-order",
+      "why": "Digests sort ascending, digits before letters.",
+      "records": [],
+      "revoked_digests": ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","0000000000000000000000000000000000000000000000000000000000000000","0000000000000000000000000000000000000000000000000000000000000001","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","9999999999999999999999999999999999999999999999999999999999999999"],
+      "text": "d 0000000000000000000000000000000000000000000000000000000000000000\nd 0000000000000000000000000000000000000000000000000000000000000001\nd 9999999999999999999999999999999999999999999999999999999999999999\nd aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nd ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n",
+      "hash": "253a673a5745354f7236a4e5093a53ddb6139f757ca6d320d800a1196d021e5f"
+    },
+    {
+      "id": "version-forms",
+      "why": "Versions are decimal with no leading zeros, from 1 to 2^53-1.",
+      "records": [{"name":"low","state":"disabled","version":1},{"name":"high","state":"enabled","version":9007199254740991},{"name":"mid","state":"disabled","version":1000000}],
+      "revoked_digests": [],
+      "text": "r high enabled 9007199254740991\nr low disabled 1\nr mid disabled 1000000\n",
+      "hash": "0a432bcb4578d25fba27018f12bf13bf6e5582125ca99e57360cb578c0c39c2a"
+    },
+    {
+      "id": "name-63-characters",
+      "why": "The longest name.",
+      "records": [{"name":"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn","state":"disabled","version":1791699000000001}],
+      "revoked_digests": [],
+      "text": "r nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn disabled 1791699000000001\n",
+      "hash": "8f1d60258bb4c992cb1e57fb3c31fa535a70514cb62e9b1ad992b475b7dd141f"
+    },
+    {
+      "id": "name-constructor",
+      "why": "`constructor` is a name like any other.",
+      "records": [{"name":"constructor","state":"disabled","version":1791699000000001},{"name":"acme","state":"enabled","version":1791699000000002}],
+      "revoked_digests": [],
+      "text": "r acme enabled 1791699000000002\nr constructor disabled 1791699000000001\n",
+      "hash": "d88b056018907aade5ef2958d21047e0c3baf04bbf581fc7316a057ef74a1e41"
+    },
+    {
+      "id": "mixed",
+      "why": "Records of both states and several digests, out of order.",
+      "records": [{"name":"zeta","state":"enabled","version":1791699000000003},{"name":"alpha","state":"disabled","version":1791699000000001},{"name":"mu","state":"enabled","version":1791699000000002},{"name":"beta-2","state":"disabled","version":1791699000000002},{"name":"beta_1","state":"disabled","version":1791699000000003},{"name":"0day","state":"enabled","version":1791699000000001}],
+      "revoked_digests": ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","2222222222222222222222222222222222222222222222222222222222222222","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      "text": "r 0day enabled 1791699000000001\nr alpha disabled 1791699000000001\nr beta-2 disabled 1791699000000002\nr beta_1 disabled 1791699000000003\nr mu enabled 1791699000000002\nr zeta enabled 1791699000000003\nd 2222222222222222222222222222222222222222222222222222222222222222\nd bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nd eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n",
+      "hash": "f4a7ce93b9c58bea868d0aa3c7fa9437262a71a523eeb67f972100892a6169bd"
+    }
+  ],
+  "key_digests": [
+    {
+      "id": "bytes-0-to-31",
+      "why": "Bytes 0x00 to 0x1f.",
+      "bytes_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "base64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "digest": "ea866a757e4c38babfa8127cbe9a409d3e1f93a00ff1488ff735fcf917afffd0"
+    },
+    {
+      "id": "all-ff",
+      "why": "Every bit set: exercises `_` in the base64url alphabet.",
+      "bytes_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "base64url": "__________________________________________8",
+      "digest": "225f7e75329dd45aa354975d73987319309393af3a4c6733bc13601a4f1b8796"
+    },
+    {
+      "id": "all-fb-ef-be",
+      "why": "Exercises `-` in the base64url alphabet.",
+      "bytes_hex": "fbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbef",
+      "base64url": "------------------------------------------8",
+      "digest": "4b7f9ad2655a8d1a9417846b837e7d2681ac9e18d290bc350230ff615e565077"
+    }
+  ]
+}
