@@ -2,8 +2,10 @@ use super::*;
 
 // ── LAB-3295: status-floor-bound migrations log at INFO with reason="floored" ──
 
-/// Pin ONE sticky key that hashes to `sticky_idx` (via `keys_hashing_to`, the
-/// same idiom the GH#156 counter tests use), route it once, and return the
+/// DynamicCapacityV1 only: StickyWeightedV2 counts moves, not overridden
+/// requests. Pin ONE sticky key that hashes to `sticky_idx` (via
+/// `keys_hashing_to`, the same idiom the GH#156 counter tests use), route it
+/// once, and return the
 /// per-reason affinity-migration counter (`[loaded, spent, floored]`) plus the
 /// capture buffer's log lines mentioning `marker`. Deterministic: the key lands
 /// on the sticky account, so the override fires exactly once. The counter is
@@ -27,18 +29,27 @@ async fn migrate_one_sticky(
         picked, sticky_idx,
         "the override must migrate the session off the sticky account"
     );
-    let counts = [
-        state.affinity_migrations[AffinityBind::Loaded as usize].load(Ordering::Relaxed),
-        state.affinity_migrations[AffinityBind::Spent as usize].load(Ordering::Relaxed),
-        state.affinity_migrations[AffinityBind::Floored as usize].load(Ordering::Relaxed),
-    ];
+    let [loaded, spent, floored, ..] = migrations(state);
+    let counts = [loaded, spent, floored];
+    drop(buf);
+    (counts, log_lines(marker))
+}
+
+/// `anthropic_affinity_migrations_total`, indexed by `MigrationReason`.
+fn migrations(state: &AppState) -> [u64; 5] {
+    std::array::from_fn(|i| state.affinity_migrations[i].load(Ordering::Relaxed))
+}
+
+/// The captured log lines carrying `marker`. The buffer is process-global, so
+/// each test filters by a marker its own affinity keys carry verbatim.
+fn log_lines(marker: &str) -> Vec<String> {
+    let buf = log_capture_buf();
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    let lines = output
+    output
         .lines()
         .filter(|l| l.contains(marker))
         .map(str::to_string)
-        .collect();
-    (counts, lines)
+        .collect()
 }
 
 /// Set a status floor on account `idx`'s general `seven_day` claim (the claim
@@ -50,54 +61,6 @@ async fn set_7d_status(state: &AppState, idx: usize, status: &str) {
         .get_mut("seven_day")
         .expect("set_account_utilization populates seven_day")
         .status = Some(status.to_string());
-}
-
-/// AC-5(a), StickyWeightedV2: the sticky account is fresh on raw utilisation
-/// (5h/7d both 0.10) but Anthropic has flagged its weekly window
-/// (`allowed_warning` → 0.80 gate floor). The override still fires — routing is
-/// unchanged — but the migration is a routine status-floor move, so it logs at
-/// INFO with `reason="floored"` and increments only the floored counter. No
-/// `affinity broken` WARN is emitted.
-#[tokio::test]
-async fn affinity_floor_bound_migration_logs_info_v2() {
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("sticky", "sk-ant-api-a"),
-            mk_endpoint("fresh", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
-    let now = AppState::now_epoch();
-    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
-    set_7d_status(&state, 0, "allowed_warning").await;
-
-    let marker = "lab3295-floored-v2";
-    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
-
-    assert_eq!(
-        counts,
-        [0, 0, 1],
-        "a status-floor migration counts only as floored, got [loaded,spent,floored]={counts:?}"
-    );
-    assert!(
-        !lines.is_empty(),
-        "expected at least one override log line for marker {marker}"
-    );
-    for l in &lines {
-        assert!(
-            l.contains(" INFO ") && !l.contains(" WARN "),
-            "floor-bound migration must log at INFO, not WARN: {l}"
-        );
-        assert!(
-            l.contains("reason=\"floored\"") && l.contains("affinity migrated"),
-            "line must carry reason=\"floored\" and the routine message: {l}"
-        );
-        assert!(
-            !l.contains("affinity broken"),
-            "the `affinity broken` WARN text must not appear for a floor-bound migration: {l}"
-        );
-    }
 }
 
 /// AC-5(a), legacy DynamicCapacityV1: same floor-bound scenario at the other
@@ -138,45 +101,6 @@ async fn affinity_floor_bound_migration_logs_info_legacy() {
     }
 }
 
-/// AC-5(b): the sticky account is genuinely load-bound — raw 5h utilisation
-/// 0.80, status `allowed` (no floor). The migration stays a WARN with
-/// `reason="loaded"` and the unchanged `affinity broken` message.
-#[tokio::test]
-async fn affinity_raw_load_migration_stays_warn() {
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("sticky", "sk-ant-api-a"),
-            mk_endpoint("fresh", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
-    let now = AppState::now_epoch();
-    // Raw 5h load of 0.80 → gate 0.80 with no status floor involved.
-    set_account_utilization(&state, 0, 0.80, 0.10, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.10, 0.10, now + 10000, now + 300000).await;
-
-    let marker = "lab3295-loaded";
-    let (counts, lines) = migrate_one_sticky(&state, 0, marker).await;
-
-    assert_eq!(
-        counts,
-        [1, 0, 0],
-        "raw-load migration counts only as loaded, never floored, got {counts:?}"
-    );
-    assert!(
-        !lines.is_empty(),
-        "expected override log lines for {marker}"
-    );
-    for l in &lines {
-        assert!(
-            l.contains(" WARN ")
-                && l.contains("reason=\"loaded\"")
-                && l.contains("affinity broken"),
-            "raw-load migration must stay a WARN with the unchanged message: {l}"
-        );
-    }
-}
-
 #[tokio::test]
 async fn affinity_override_both_rough() {
     // Scenario: both accounts in bad shape — affinity preserved
@@ -203,22 +127,20 @@ async fn affinity_override_both_rough() {
 
 #[tokio::test]
 async fn affinity_override_preserves_stickiness_with_moderate_disparity() {
-    // With 3 candidates whose weights are moderately different (none below
-    // 0.25 ratio to the best), the override does NOT fire — all three
-    // accounts receive sticky traffic via proportional bucket hashing.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("primary", "sk-ant-api-a"),
-            mk_endpoint("steve", "sk-ant-api-b"),
-            mk_endpoint("jeff", "sk-ant-api-c"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    // Three accounts whose weekly headroom differs widely, all above
+    // `1 - soft_limit`: every one passes the overage rule, so each keeps the
+    // keyed sessions its rendezvous score wins, however small jeff's 0.15
+    // left looks beside primary's 0.59.
+    let state = sticky_v2_state(vec![
+        mk_endpoint("primary", "sk-ant-api-a"),
+        mk_endpoint("steve", "sk-ant-api-b"),
+        mk_endpoint("jeff", "sk-ant-api-c"),
+    ]);
     let now = AppState::now_epoch();
     // primary is clearly best, steve middling, jeff worst
     set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
     set_account_utilization(&state, 1, 0.15, 0.55, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 2, 0.12, 0.79, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 2, 0.12, 0.85, now + 10000, now + 300000).await;
 
     let mut saw = [false; 3];
     for i in 0..1000 {
@@ -238,75 +160,11 @@ async fn affinity_override_preserves_stickiness_with_moderate_disparity() {
     );
 }
 
-#[tokio::test]
-async fn affinity_override_fires_with_three_candidates_egregious_disparity() {
-    // When one account is near-exhausted (85% util) and others have plenty
-    // of headroom, sessions that hash into the exhausted account's tiny
-    // bucket should be overridden to the best account.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("primary", "sk-ant-api-a"),
-            mk_endpoint("jeff", "sk-ant-api-b"),
-            mk_endpoint("insight", "sk-ant-api-c"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
-    let now = AppState::now_epoch();
-    set_account_utilization(&state, 0, 0.09, 0.09, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.20, 0.31, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 2, 0.85, 0.85, now + 10000, now + 300000).await;
-
-    // Find a key that would naturally hash into insight's bucket.
-    // Candidates/weights are static, so compute boundaries once.
-    let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
-    let total_weight: f64 = candidates.iter().map(|c| c.weight).sum();
-    let mut boundaries: Vec<(usize, f64)> = Vec::new();
-    let mut cumulative = 0.0;
-    for c in &candidates {
-        cumulative += c.weight;
-        boundaries.push((c.endpoint, cumulative));
-    }
-
-    let mut insight_key = None;
-    for i in 0..10000 {
-        let key = format!("find-insight-{}", i);
-        let target = (stable_affinity_hash(&key) as f64 / u64::MAX as f64) * total_weight;
-        for &(idx, boundary) in &boundaries {
-            if target < boundary {
-                if idx == 2 {
-                    insight_key = Some(key);
-                }
-                break;
-            }
-        }
-        if insight_key.is_some() {
-            break;
-        }
-    }
-    let key = insight_key.expect("should find a key that hashes to insight's bucket");
-
-    // With the override, pick_account should redirect away from insight
-    let idx = state
-        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
-        .await
-        .unwrap();
-    // New contract: the override migrates to a session-stable replacement
-    // re-picked from the healthy remainder (deterministic per session, NOT the
-    // global argmax). It must be one of the healthy accounts, never the loaded
-    // one — but which healthy account is the session's stable hash, not "best".
-    assert_ne!(
-        idx, 2,
-        "insight (85% util) should be overridden despite affinity hash landing there"
-    );
-    assert!(
-        idx == 0 || idx == 1,
-        "override must land on a healthy account (primary or jeff), got {idx}"
-    );
-}
-
-/// Helper: under StickyWeightedV2, find affinity keys whose *sticky* bucket is
-/// `target_idx` (i.e. the sessions that get overridden when that account is the
-/// loaded one). Boundaries are static given fixed utilizations.
+/// Helper: find affinity keys whose *sticky* account is `target_idx` (i.e. the
+/// sessions that move when that account is the loaded one): the account the
+/// state's strategy hashes the key to over every candidate, before any
+/// affinity rule. StickyWeightedV2 hashes by rendezvous score, DynamicCapacityV1
+/// by walking the weighted buckets. Static given fixed utilizations.
 async fn keys_hashing_to(
     state: &AppState,
     target_idx: usize,
@@ -315,6 +173,14 @@ async fn keys_hashing_to(
     prefix: &str,
 ) -> Vec<String> {
     let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+    if state.routing_strategy == RoutingStrategy::StickyWeightedV2 {
+        let all: Vec<&RoutingCandidate> = candidates.iter().collect();
+        return (0..scan)
+            .map(|i| format!("{prefix}-{i}"))
+            .filter(|key| state.pick_keyed(&all, key).unwrap().endpoint == target_idx)
+            .take(want)
+            .collect();
+    }
     let total_weight: f64 = candidates.iter().map(|c| c.weight).sum();
     let mut boundaries: Vec<(usize, f64)> = Vec::new();
     let mut cumulative = 0.0;
@@ -343,24 +209,21 @@ async fn keys_hashing_to(
 
 #[tokio::test]
 async fn affinity_override_spreads_across_pool_not_single_best() {
-    // Regression: when a session's sticky account is too loaded, the override
+    // Regression: when a session's sticky account is too loaded, the move
     // must NOT funnel every such session onto the single global argmax (`best`).
     // That target rotates as utilizations drift, sweeping sessions across the
     // pool and paying a cold-cache `cache_creation` charge on every hop
     // (measured: a swept client ran a 1.18 create:read ratio vs ~0.05 for sticky
     // clients). Overridden sessions must spread across the healthy remainder.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("loaded", "sk-ant-api-a"),
-            mk_endpoint("h1", "sk-ant-api-b"),
-            mk_endpoint("h2", "sk-ant-api-c"),
-            mk_endpoint("h3", "sk-ant-api-d"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    let state = sticky_v2_state(vec![
+        mk_endpoint("loaded", "sk-ant-api-a"),
+        mk_endpoint("h1", "sk-ant-api-b"),
+        mk_endpoint("h2", "sk-ant-api-c"),
+        mk_endpoint("h3", "sk-ant-api-d"),
+    ]);
     let now = AppState::now_epoch();
-    // idx0 is loaded enough to trigger the override (weight << best * 0.25).
-    set_account_utilization(&state, 0, 0.80, 0.80, now + 10000, now + 300000).await;
+    // idx0's 5h gate is past soft_limit, so it fails the overage rule.
+    set_account_utilization(&state, 0, 0.95, 0.30, now + 10000, now + 300000).await;
     // Three healthy accounts with a clear single best (h1): under the old
     // `picked = best` code every overridden session would herd onto h1.
     set_account_utilization(&state, 1, 0.08, 0.15, now + 10000, now + 300000).await;
@@ -384,82 +247,11 @@ async fn affinity_override_spreads_across_pool_not_single_best() {
         destinations.insert(idx);
     }
     assert!(
-            destinations.len() >= 2,
-            "overridden sessions herded onto {} account(s) {:?}; expected spread across the healthy pool",
-            destinations.len(),
-            destinations,
-        );
-}
-
-#[tokio::test]
-async fn affinity_override_destination_independent_of_argmax() {
-    // Regression for the cascade: the override must not chase the global argmax.
-    // When the healthy argmax flips (utilizations drift), a session that was
-    // already overridden must NOT migrate with it. The old behavior (picked =
-    // best) moved EVERY overridden session to whichever account was momentarily
-    // best, so a single argmax flip migrated ~100% of them — the cache-burning
-    // sweep. A session-stable replacement keeps migration low.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("loaded", "sk-ant-api-a"),
-            mk_endpoint("h1", "sk-ant-api-b"),
-            mk_endpoint("h2", "sk-ant-api-c"),
-            mk_endpoint("h3", "sk-ant-api-d"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
+        destinations.len() >= 2,
+        "overridden sessions herded onto {} account(s) {:?}; expected spread across the healthy pool",
+        destinations.len(),
+        destinations,
     );
-    let now = AppState::now_epoch();
-    set_account_utilization(&state, 0, 0.80, 0.80, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 3, 0.15, 0.30, now + 10000, now + 300000).await;
-    // Config A: h1 is best.
-    set_account_utilization(&state, 1, 0.08, 0.18, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 2, 0.22, 0.42, now + 10000, now + 300000).await;
-
-    // The override set (sessions whose sticky bucket is the loaded account) is
-    // fixed by idx0's weight, which the later h1/h2 swap leaves untouched.
-    let sessions = keys_hashing_to(&state, 0, 60, 40000, "flip-session").await;
-    assert!(
-        sessions.len() >= 30,
-        "need override sessions, got {}",
-        sessions.len()
-    );
-    let mut dest_a = Vec::with_capacity(sessions.len());
-    for s in &sessions {
-        let idx = state
-            .pick_endpoint(Some(s), "claude-opus-4-6", &[])
-            .await
-            .unwrap();
-        assert_ne!(
-            idx, 0,
-            "override must fire for a session hashed to the loaded account"
-        );
-        dest_a.push(idx);
-    }
-
-    // Config B: swap h1 and h2 utilizations so h2 becomes best. The healthy
-    // weight *set* is unchanged (symmetric swap) — only the argmax label moves.
-    set_account_utilization(&state, 1, 0.22, 0.42, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 2, 0.08, 0.18, now + 10000, now + 300000).await;
-
-    let mut migrated = 0usize;
-    for (k, s) in sessions.iter().enumerate() {
-        let idx = state
-            .pick_endpoint(Some(s), "claude-opus-4-6", &[])
-            .await
-            .unwrap();
-        assert_ne!(idx, 0, "override must still fire after the argmax flip");
-        if idx != dest_a[k] {
-            migrated += 1;
-        }
-    }
-    let rate = migrated as f64 / sessions.len() as f64;
-    assert!(
-            rate < 0.40,
-            "argmax flip migrated {}/{} ({:.0}%) overridden sessions; destination must not chase the argmax",
-            migrated,
-            sessions.len(),
-            rate * 100.0,
-        );
 }
 
 /// Regression (GH#156 / LAB-2684): two accounts under IDENTICAL load whose
@@ -471,13 +263,14 @@ async fn affinity_override_destination_independent_of_argmax() {
 /// pool (25% of prod requests WARNed on accounts at ≤17% utilisation).
 /// Reset-time skew alone must never break affinity.
 async fn assert_reset_time_skew_keeps_affinity(strategy: RoutingStrategy) {
-    let state = test_state_with_strategy(
+    let mut state = test_state_with_strategy(
         vec![
             mk_endpoint("fresh", "sk-ant-api-a"),
             mk_endpoint("expiring", "sk-ant-api-b"),
         ],
         strategy,
     );
+    Arc::get_mut(&mut state).unwrap().soft_limit = PROD_SOFT_LIMIT;
     let now = AppState::now_epoch();
     let in_6_5_days = now + 6 * 86400 + 43200;
     let in_20_hours = now + 20 * 3600;
@@ -511,97 +304,6 @@ async fn affinity_override_ignores_reset_time_skew_legacy() {
     assert_reset_time_skew_keeps_affinity(RoutingStrategy::DynamicCapacityV1).await;
 }
 
-#[tokio::test]
-async fn affinity_override_spent_discounts_near_weekly_reset() {
-    // Panel finding on GH#156: an account at 90% weekly with 3h to reset gets
-    // the LARGEST bucket share (waste_risk ≈ 5.6 — burn expiring quota first),
-    // so a naive unused-7d comparison would migrate every session the buckets
-    // just placed there, on every request. Near the weekly reset, remaining
-    // quota is headroom, not "spent": the override must stay quiet.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("fresh", "sk-ant-api-a"),
-            mk_endpoint("expiring", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
-    let now = AppState::now_epoch();
-    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.10, 0.90, now + 10000, now + 3 * 3600).await;
-
-    let key = keys_hashing_to(&state, 1, 1, 20000, "expiring-session")
-        .await
-        .pop()
-        .expect("a key hashing to the expiring account");
-    let idx = state
-        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
-        .await
-        .unwrap();
-    assert_eq!(
-        idx, 1,
-        "session must stay on the expiring account it hashed to"
-    );
-    let [loaded, spent, floored] = &state.affinity_migrations;
-    assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
-    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
-    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
-}
-
-#[tokio::test]
-async fn affinity_migration_counter_names_the_binding_window() {
-    // `anthropic_affinity_migrations_total{reason}` must attribute each override
-    // to the window that actually bound the sticky account (GH#156 AC-5).
-    let now = AppState::now_epoch();
-
-    // reason="spent": identical 5h, the sticky account's WEEK is nearly gone.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("fresh", "sk-ant-api-a"),
-            mk_endpoint("spent", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
-    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.10, 0.95, now + 10000, now + 300000).await;
-    let key = keys_hashing_to(&state, 1, 1, 20000, "spent-session")
-        .await
-        .pop()
-        .expect("a key hashing to the spent account");
-    let idx = state
-        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
-        .await
-        .unwrap();
-    assert_eq!(idx, 0, "session must leave the spent account");
-    let [loaded, spent, floored] = &state.affinity_migrations;
-    assert_eq!(spent.load(Ordering::Relaxed), 1, "spent counter");
-    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
-    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
-
-    // reason="loaded": identical 7d, the sticky account's 5h gate is the limit.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("idle", "sk-ant-api-a"),
-            mk_endpoint("busy", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
-    set_account_utilization(&state, 0, 0.10, 0.10, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.85, 0.10, now + 10000, now + 300000).await;
-    let key = keys_hashing_to(&state, 1, 1, 20000, "loaded-session")
-        .await
-        .pop()
-        .expect("a key hashing to the busy account");
-    let idx = state
-        .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
-        .await
-        .unwrap();
-    assert_eq!(idx, 0, "session must leave the busy account");
-    let [loaded, spent, floored] = &state.affinity_migrations;
-    assert_eq!(loaded.load(Ordering::Relaxed), 1, "loaded counter");
-    assert_eq!(spent.load(Ordering::Relaxed), 0, "spent counter");
-    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
-}
-
 /// Regression (LAB-4719): a `reason="spent"` migration fled an account at
 /// headroom 0.040 and landed on its equally spent twin (headroom 0.040,
 /// util_7d 0.96), which answered with Anthropic's entitlement 400, while the
@@ -612,14 +314,11 @@ async fn affinity_migration_counter_names_the_binding_window() {
 /// never be chosen.
 #[tokio::test]
 async fn affinity_spent_migration_skips_equally_spent_replacement() {
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("spent", "sk-ant-api-a"),
-            mk_endpoint("spent-twin", "sk-ant-api-b"),
-            mk_endpoint("healthy", "sk-ant-api-c"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    let state = sticky_v2_state(vec![
+        mk_endpoint("spent", "sk-ant-api-a"),
+        mk_endpoint("spent-twin", "sk-ant-api-b"),
+        mk_endpoint("healthy", "sk-ant-api-c"),
+    ]);
     let now = AppState::now_epoch();
     // Both spent accounts reset in 20h: outside the near-reset ramp (so the 4%
     // left reads as spent) yet close enough for a sizeable bucket.
@@ -662,10 +361,6 @@ async fn affinity_spent_migration_skips_equally_spent_replacement() {
             "session {s} sticky on the spent account must migrate to the healthy one, not its equally spent twin"
         );
     }
-    let [loaded, spent, floored] = &state.affinity_migrations;
-    assert_eq!(spent.load(Ordering::Relaxed), 40, "spent counter");
-    assert_eq!(loaded.load(Ordering::Relaxed), 0, "loaded counter");
-    assert_eq!(floored.load(Ordering::Relaxed), 0, "floored counter");
 }
 
 #[tokio::test]
@@ -759,17 +454,13 @@ async fn sticky_weighted_v2_preserves_hash_distribution_under_skewed_history() {
 #[tokio::test]
 async fn pick_unsticky_on_overload() {
     // When a preferred account gets overloaded, sessions should migrate.
-    // Hash-based pick assigns ~50% of sessions to each account initially.
-    // After overload: primary weight=0.01, backup weight=0.5.
-    // Ratio 0.01/0.5 = 0.02 < 0.25 threshold → override fires for all
-    // sessions that hashed to primary.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("primary", "sk-ant-api-a"),
-            mk_endpoint("backup", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    // Hash-based pick assigns ~60% of sessions to primary initially. After
+    // overload primary's gate is 0.99, past soft_limit, so it fails the
+    // overage rule and every session that hashed to it moves.
+    let state = sticky_v2_state(vec![
+        mk_endpoint("primary", "sk-ant-api-a"),
+        mk_endpoint("backup", "sk-ant-api-b"),
+    ]);
 
     // Start with primary having lots of headroom
     {
@@ -800,21 +491,17 @@ async fn pick_unsticky_on_overload() {
         info.utilization = Some(0.99);
     }
 
-    // All sessions that hashed to primary should migrate (egregious disparity)
+    // All sessions that hashed to primary should migrate.
     let mut migrated = 0usize;
     for key in &primary_keys {
         if state.pick_endpoint(Some(key), "", &[]).await.unwrap() == 1 {
             migrated += 1;
         }
     }
-
-    let migration_pct = migrated as f64 / primary_keys.len() as f64;
-    assert!(
-        migration_pct > 0.95,
-        "at least 95% of clients should migrate, got {:.1}% ({}/{})",
-        migration_pct * 100.0,
+    assert_eq!(
         migrated,
-        primary_keys.len()
+        primary_keys.len(),
+        "every client on the overloaded account should migrate"
     );
 }
 
@@ -987,19 +674,16 @@ async fn affinity_breaks_on_egregious_disparity() {
 
 #[tokio::test]
 async fn affinity_moderate_disparity_stays_sticky() {
-    // Game theory: moderate 7d difference (0.73 vs 0.41) should NOT
-    // break stickiness. The cache-creation cost outweighs the routing
-    // benefit at this disparity level.
-    let state = test_state_with_strategy(
-        vec![
-            mk_endpoint("primary", "sk-ant-api-a"),
-            mk_endpoint("jeff", "sk-ant-api-b"),
-        ],
-        RoutingStrategy::StickyWeightedV2,
-    );
+    // A wide weekly difference (0.15 left vs 0.59) does not move keyed
+    // sessions while both accounts pass the overage rule: jeff keeps the keys
+    // it wins.
+    let state = sticky_v2_state(vec![
+        mk_endpoint("primary", "sk-ant-api-a"),
+        mk_endpoint("jeff", "sk-ant-api-b"),
+    ]);
     let now = AppState::now_epoch();
     set_account_utilization(&state, 0, 0.13, 0.41, now + 10000, now + 300000).await;
-    set_account_utilization(&state, 1, 0.12, 0.79, now + 10000, now + 300000).await;
+    set_account_utilization(&state, 1, 0.12, 0.85, now + 10000, now + 300000).await;
 
     // Both accounts should retain their hashed sessions
     let mut primary_picks = 0u32;
@@ -1072,4 +756,900 @@ async fn pick_proportional_distribution() {
         "account c should get ~13% traffic, got {:.1}%",
         pcts[2] * 100.0
     );
+}
+
+// ── LAB-9360: a keyed session leaves its account only under the overage rule ──
+//
+// StickyWeightedV2 keeps a keyed session on the account that wins its
+// rendezvous hash among the candidates passing the overage rule: affinity
+// headroom of at least `1 - soft_limit`, and a candidate in the request's
+// tier. The fixtures run at the production `soft_limit`, since the test base's
+// open ceiling of 1.0 makes the rule pass everything.
+
+const PROD_SOFT_LIMIT: f64 = 0.90;
+/// Every test here that reads the clock freezes it here first, so reset
+/// windows and waste risk do not drift between the fixture and the router.
+const FIXED_EPOCH: u64 = 1_790_000_000;
+const POOL: usize = 40;
+const OPUS: &str = "claude-opus-4-6";
+/// The account the AC tests' sessions start on.
+const HOME: usize = 7;
+
+/// A StickyWeightedV2 state at the production `soft_limit`.
+fn sticky_v2_state(endpoints: Vec<Endpoint>) -> Arc<AppState> {
+    let mut state = test_state_with_strategy(endpoints, RoutingStrategy::StickyWeightedV2);
+    Arc::get_mut(&mut state).unwrap().soft_limit = PROD_SOFT_LIMIT;
+    state
+}
+
+/// `n` neutral accounts, all priority 0.
+fn pool_endpoints(n: usize) -> Vec<Endpoint> {
+    (0..n)
+        .map(|i| mk_endpoint(&format!("acct-{i:02}"), &format!("sk-ant-api-{i:02}")))
+        .collect()
+}
+
+/// A production-shaped pool: StickyWeightedV2, `soft_limit` 0.90, every
+/// Anthropic account healthy, with weekly use spread from 0.10 to 0.60 so the
+/// weights differ.
+async fn prod_pool_of(endpoints: Vec<Endpoint>) -> Arc<AppState> {
+    let n = endpoints.len();
+    let state = sticky_v2_state(endpoints);
+    heal_pool(&state, n).await;
+    state
+}
+
+/// Spend the week of accounts `0..n` past `1 - soft_limit`, outside the
+/// near-reset ramp, so no account passes the overage rule.
+async fn spend_pool(state: &AppState, n: usize) {
+    let now = AppState::now_epoch();
+    for i in 0..n {
+        set_account_utilization(state, i, 0.10, 0.95, now + 10_000, now + 4 * 86_400).await;
+    }
+}
+
+/// Give accounts `0..n` the production pool's healthy utilisations.
+async fn heal_pool(state: &AppState, n: usize) {
+    let now = AppState::now_epoch();
+    for i in 0..n {
+        let util_7d = 0.10 + 0.50 * i as f64 / n as f64;
+        set_account_utilization(state, i, 0.10, util_7d, now + 10_000, now + 4 * 86_400).await;
+    }
+}
+
+async fn prod_pool() -> Arc<AppState> {
+    prod_pool_of(pool_endpoints(POOL)).await
+}
+
+/// A key whose session starts on `HOME`, routed there once as a request's
+/// first pick, so this replica remembers it there. The key carries `marker`.
+async fn seed_session(state: &AppState, marker: &str) -> String {
+    // Install the capture subscriber before any line this test asserts on.
+    log_capture_buf();
+    let key = keys_hashing_to(state, HOME, 1, 50_000, marker)
+        .await
+        .pop()
+        .expect("a key hashing to the home account");
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+    key
+}
+
+/// The session keeps `HOME` for 100 consecutive picks, and nothing counts or
+/// logs a move.
+async fn assert_session_stays(state: &AppState, key: &str, marker: &str) {
+    for i in 0..100 {
+        assert_eq!(
+            state.pick_endpoint(Some(key), OPUS, &[]).await,
+            Some(HOME),
+            "pick {i} left the home account"
+        );
+    }
+    assert_eq!(migrations(state), [0; 5], "no move, no count");
+    assert_eq!(log_lines(marker), Vec::<String>::new(), "no move, no line");
+}
+
+/// The session leaves `HOME` for one account that fails no part of the
+/// overage rule, and stays there for 50 picks; the move counts once under
+/// `reason` and logs one line naming the reason and both accounts.
+async fn assert_session_leaves(state: &AppState, key: &str, marker: &str, reason: MigrationReason) {
+    let mut served = std::collections::BTreeSet::new();
+    for _ in 0..50 {
+        served.insert(state.pick_endpoint(Some(key), OPUS, &[]).await.unwrap());
+    }
+    let served: Vec<usize> = served.into_iter().collect();
+    let [new] = served[..] else {
+        panic!("the session flapped across {served:?}");
+    };
+    assert_ne!(new, HOME, "the session must leave its account");
+
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let c = candidates
+        .iter()
+        .find(|c| c.endpoint == new)
+        .expect("the new account is a candidate: not hard-limited or cooling");
+    assert_eq!(c.priority, 0, "the new account is not overage-demoted");
+    assert!(
+        c.gate < state.soft_limit,
+        "the new account's gate is under soft_limit"
+    );
+    assert!(
+        affinity_headroom(c).0 >= 1.0 - state.soft_limit,
+        "the new account is not near its 5h or weekly limit"
+    );
+
+    let mut want = [0; 5];
+    want[reason as usize] = 1;
+    assert_eq!(
+        migrations(state),
+        want,
+        "one move, counted once as {}",
+        reason.as_str()
+    );
+    let lines = log_lines(marker);
+    let [line] = &lines[..] else {
+        panic!("one move must log exactly one line, got {lines:?}");
+    };
+    let from = format!("from_account=\"acct-{HOME:02}\"");
+    let to = format!("to_account=\"acct-{new:02}\"");
+    let why = format!("reason=\"{}\"", reason.as_str());
+    assert!(
+        line.contains(" INFO ")
+            && line.contains(&from)
+            && line.contains(&to)
+            && line.contains(&why),
+        "the line must name the reason and both accounts: {line}"
+    );
+}
+
+/// Weekly status on `HOME`'s general claim, as Anthropic reports it.
+async fn set_home_weekly(
+    state: &AppState,
+    util_5h: f64,
+    util_7d: f64,
+    reset_in: u64,
+    status: &str,
+) {
+    let now = AppState::now_epoch();
+    set_account_utilization(state, HOME, util_5h, util_7d, now + 10_000, now + reset_in).await;
+    set_7d_status(state, HOME, status).await;
+}
+
+const HOUR: u64 = 3600;
+
+/// AC1: the weekly `allowed_warning` floor (gate 0.80) leaves headroom 0.20,
+/// which the deleted relative override read as too little beside a best
+/// account at 0.80, moving the session on every request. It now keeps the
+/// session. The weekly use is set before the session is placed: it cuts the
+/// account's waste risk, and a stateless hash re-homes part of an account's
+/// keys once when its waste risk falls.
+#[tokio::test]
+async fn affinity_warning_floor_keeps_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac1";
+    set_home_weekly(&state, 0.10, 0.80, 4 * 24 * HOUR, "allowed_warning").await;
+    let key = seed_session(&state, marker).await;
+
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let headroom = |i: usize| affinity_headroom(&candidates[i]).0;
+    assert!(
+        (headroom(HOME) - 0.20).abs() < 1e-9,
+        "home sits on the warning floor"
+    );
+    assert!(
+        headroom(0) >= 0.80,
+        "the best account has headroom of at least 0.80"
+    );
+
+    assert_session_stays(&state, &key, marker).await;
+}
+
+/// AC2: a partly spent week (0.88, reset days away) keeps the session.
+#[tokio::test]
+async fn affinity_partly_spent_week_keeps_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac2";
+    set_home_weekly(&state, 0.20, 0.88, 4 * 24 * HOUR, "allowed_warning").await;
+    let key = seed_session(&state, marker).await;
+    assert_session_stays(&state, &key, marker).await;
+}
+
+/// AC3: a 5h gate past `soft_limit` moves the session.
+#[tokio::test]
+async fn affinity_session_leaves_a_loaded_5h_window() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac3-5h";
+    let key = seed_session(&state, marker).await;
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, HOME, 0.92, 0.30, now + 10_000, now + 4 * 86_400).await;
+    assert_session_leaves(&state, &key, marker, MigrationReason::Loaded).await;
+}
+
+/// AC3: weekly use past `soft_limit`, outside the near-reset ramp, moves the
+/// session, though the gate never carries weekly use.
+#[tokio::test]
+async fn affinity_session_leaves_a_spent_week() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac3-7d";
+    let key = seed_session(&state, marker).await;
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, HOME, 0.10, 0.92, now + 10_000, now + 4 * 86_400).await;
+    assert_session_leaves(&state, &key, marker, MigrationReason::Spent).await;
+}
+
+/// AC3: the `throttled` status floor (0.98) moves the session.
+#[tokio::test]
+async fn affinity_session_leaves_a_throttled_account() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac3-throttled";
+    let key = seed_session(&state, marker).await;
+    set_7d_status(&state, HOME, "throttled").await;
+    assert_session_leaves(&state, &key, marker, MigrationReason::Floored).await;
+}
+
+/// AC3: an account serving via overage is demoted out of the tier, which
+/// moves the session.
+#[tokio::test]
+async fn affinity_session_leaves_an_overage_account() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac3-overage";
+    let key = seed_session(&state, marker).await;
+    {
+        let mut info = state.endpoints[HOME].rate_info.write().await;
+        info.overage_in_use = true;
+        info.overage_utilization = Some(0.10);
+        info.overage_reset = Some(AppState::now_epoch() + 86_400);
+    }
+    assert_session_leaves(&state, &key, marker, MigrationReason::Unavailable).await;
+}
+
+/// AC3: an account cooling after a 429 is not a candidate, which moves the
+/// session.
+#[tokio::test]
+async fn affinity_session_leaves_a_hard_limited_account() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac3-429";
+    let key = seed_session(&state, marker).await;
+    state.endpoints[HOME]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+    assert_session_leaves(&state, &key, marker, MigrationReason::Unavailable).await;
+}
+
+/// AC4: weekly quota expiring within the near-reset ramp is headroom, so an
+/// account at 0.95 with its week resetting in 3h keeps its sessions.
+#[tokio::test]
+async fn affinity_quota_near_reset_keeps_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac4-stays";
+    set_home_weekly(&state, 0.10, 0.95, 3 * HOUR, "allowed_warning").await;
+    let key = seed_session(&state, marker).await;
+    assert_session_stays(&state, &key, marker).await;
+}
+
+/// AC4: the same account with its week resetting in 30h is spent, and its
+/// session leaves.
+#[tokio::test]
+async fn affinity_quota_far_from_reset_moves_the_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-ac4-moves";
+    set_home_weekly(&state, 0.10, 0.95, 3 * HOUR, "allowed_warning").await;
+    let key = seed_session(&state, marker).await;
+    set_home_weekly(&state, 0.10, 0.95, 30 * HOUR, "allowed_warning").await;
+    assert_session_leaves(&state, &key, marker, MigrationReason::Spent).await;
+}
+
+/// A session that left an unavailable account goes back when it returns,
+/// and the return counts as `rehomed`: its replacement still passes.
+#[tokio::test]
+async fn affinity_return_to_a_recovered_account_counts_as_rehomed() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-rehomed";
+    let key = seed_session(&state, marker).await;
+    state.endpoints[HOME]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+    assert_ne!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+    state.endpoints[HOME]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = None;
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+
+    let mut want = [0; 5];
+    want[MigrationReason::Unavailable as usize] = 1;
+    want[MigrationReason::Rehomed as usize] = 1;
+    assert_eq!(migrations(&state), want);
+    assert_eq!(log_lines(marker).len(), 2, "one line per move");
+}
+
+/// A retry's re-pick never feeds the signal: the session's next first pick
+/// is compared with its last first pick.
+#[tokio::test]
+async fn affinity_retry_repick_is_not_a_move() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9360-retry";
+    let key = seed_session(&state, marker).await;
+    let retry = state.pick_endpoint(Some(&key), OPUS, &[HOME]).await;
+    assert!(retry.is_some_and(|i| i != HOME), "the retry goes elsewhere");
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+    assert_eq!(migrations(&state), [0; 5]);
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// AC8: when no account in the tier passes the overage rule, keyed requests
+/// are still served by the hash over the whole tier: no `None`, no jump to
+/// the next tier, and no counted move.
+#[tokio::test]
+async fn affinity_nothing_passes_hashes_over_the_tier() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let mut endpoints = pool_endpoints(POOL + 1);
+    endpoints[POOL].priority = 1;
+    let state = prod_pool_of(endpoints).await;
+    let marker = "lab9360-ac8";
+    let (key, want) = home_key_spent_pool_moves(&state, POOL + 1, marker).await;
+    assert_ne!(want, HOME, "a degraded pick that stays home cannot count");
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+
+    spend_pool(&state, POOL).await;
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    assert!(
+        candidates
+            .iter()
+            .filter(|c| c.priority == 0)
+            .all(|c| !state.keeps_affinity(c) && c.gate < state.soft_limit),
+        "every tier-0 account is healthy by gate yet fails the overage rule"
+    );
+    for i in 0..50 {
+        assert_eq!(
+            state.pick_endpoint(Some(&key), OPUS, &[]).await,
+            Some(want),
+            "pick {i} must hash over the whole tier"
+        );
+    }
+    assert_eq!(migrations(&state), [0; 5], "a degraded pick is not a move");
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// A key whose session starts on `HOME` but that the tier-0 hash sends
+/// elsewhere once `spend_pool` fails every tier-0 account, and that account.
+/// Leaves accounts `0..n` healed and the key not yet routed.
+async fn home_key_spent_pool_moves(state: &AppState, n: usize, marker: &str) -> (String, usize) {
+    log_capture_buf();
+    let homed = keys_hashing_to(state, HOME, 20, 50_000, marker).await;
+    spend_pool(state, POOL).await;
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let tier: Vec<&RoutingCandidate> = candidates.iter().filter(|c| c.priority == 0).collect();
+    let found = homed.into_iter().find_map(|k| {
+        let away = state
+            .pick_rendezvous(&tier, &k, |c| c.weight)
+            .unwrap()
+            .endpoint;
+        (away != HOME).then_some((k, away))
+    });
+    heal_pool(state, n).await;
+    found.expect("a home key that the spent tier hashes elsewhere")
+}
+
+/// LAB-9404: picks made while nothing in the tier passes are not remembered,
+/// so leaving a degraded stretch is not a move. A session on `HOME` is
+/// hashed elsewhere while every account fails the overage rule, and returns
+/// to `HOME` when the tier recovers: that is no move, and nothing counts.
+#[tokio::test]
+async fn affinity_degraded_stretch_is_not_a_move() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9404-degraded-exit";
+    let (key, away) = home_key_spent_pool_moves(&state, POOL, marker).await;
+
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+    spend_pool(&state, POOL).await;
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(away));
+    heal_pool(&state, POOL).await;
+    assert_eq!(state.pick_endpoint(Some(&key), OPUS, &[]).await, Some(HOME));
+
+    assert_eq!(
+        migrations(&state),
+        [0; 5],
+        "a degraded stretch is not a move"
+    );
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// LAB-9404: an account whose gate sits exactly at `soft_limit` fails the
+/// overage rule, as it fails the healthy filter, so its session leaves under
+/// the window that binds it: `loaded` for a 5h gate.
+#[tokio::test]
+async fn affinity_gate_at_soft_limit_leaves_as_loaded() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9404-boundary-label";
+    let key = seed_session(&state, marker).await;
+    let now = AppState::now_epoch();
+    set_account_utilization(
+        &state,
+        HOME,
+        PROD_SOFT_LIMIT,
+        0.30,
+        now + 10_000,
+        now + 4 * 86_400,
+    )
+    .await;
+
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let home = &candidates[HOME];
+    assert_eq!(
+        home.gate, state.soft_limit,
+        "home's gate is exactly soft_limit"
+    );
+    assert!(
+        !state.keeps_affinity(home),
+        "the rule agrees with the healthy filter"
+    );
+    assert_session_leaves(&state, &key, marker, MigrationReason::Loaded).await;
+}
+
+/// A degraded tier with one account exactly at `soft_limit` and the rest
+/// above it: no account passes, so keyed picks hash over the whole tier
+/// rather than all landing on the account at the boundary, and none counts.
+#[tokio::test]
+async fn affinity_gate_at_soft_limit_does_not_take_a_degraded_tier() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9404-boundary-pile-on";
+    log_capture_buf();
+    let now = AppState::now_epoch();
+    for i in 0..POOL {
+        let util_5h = if i == HOME { PROD_SOFT_LIMIT } else { 0.95 };
+        set_account_utilization(&state, i, util_5h, 0.30, now + 10_000, now + 4 * 86_400).await;
+    }
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let tier: Vec<&RoutingCandidate> = candidates.iter().collect();
+    assert!(
+        tier.iter().all(|c| c.gate >= state.soft_limit),
+        "no account is healthy: the tier is degraded"
+    );
+
+    let keys = 200;
+    let mut home = 0;
+    for i in 0..keys {
+        let key = format!("{marker}-{i}");
+        let picked = state.pick_endpoint(Some(&key), OPUS, &[]).await.unwrap();
+        assert_eq!(
+            picked,
+            state
+                .pick_rendezvous(&tier, &key, |c| c.weight)
+                .unwrap()
+                .endpoint,
+            "key {i} must hash over the whole tier"
+        );
+        home += usize::from(picked == HOME);
+    }
+    assert!(
+        home < keys / 4,
+        "{home} of {keys} keys piled onto the boundary account"
+    );
+    assert_eq!(migrations(&state), [0; 5], "a degraded pick is not a move");
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// Synthetic candidates for the pure picker tests: every account passes the
+/// overage rule, and waste risks, so weights, spread 1:10 across the pool.
+fn spread_candidates(n: usize) -> Vec<RoutingCandidate> {
+    (0..n)
+        .map(|i| {
+            let wr = 1.0 + 9.0 * i as f64 / (n - 1) as f64;
+            RoutingCandidate {
+                endpoint: i,
+                priority: 0,
+                gate_5h: 0.10,
+                gate_7d: 0.0,
+                gate: 0.10,
+                wr,
+                unused_7d: 0.90,
+                weight: wr * 0.90,
+                gate_floor_bound: false,
+                source: "waste_risk",
+            }
+        })
+        .collect()
+}
+
+/// The score `pick_keyed` gives a passing account with waste risk `wr`.
+fn keyed_score(wr: f64) -> f64 {
+    wr.powf(KEYED_WR_EXPONENT)
+}
+
+/// The StickyWeightedV2 keyed pick for `key` over `pool`.
+fn keyed_pick(state: &AppState, pool: &[RoutingCandidate], key: &str) -> usize {
+    let refs: Vec<&RoutingCandidate> = pool.iter().collect();
+    let total: f64 = pool.iter().map(|c| c.weight).sum();
+    state
+        .pick_sticky_weighted_v2(&refs, total, Some(key))
+        .endpoint
+}
+
+/// AC5: a waste-risk change moves keys only onto the account whose waste
+/// risk rose, and at most twice its gain in share; removing an account moves
+/// only its own keys. The range walk this replaces shifted every boundary
+/// after the changed account, re-homing keys all over the pool.
+#[tokio::test]
+async fn affinity_waste_risk_change_moves_keys_only_onto_or_off_that_account() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let pool = spread_candidates(POOL);
+    let keys: Vec<String> = (0..10_000).map(|i| format!("lab9360-ac5-{i}")).collect();
+    let before: Vec<usize> = keys.iter().map(|k| keyed_pick(&state, &pool, k)).collect();
+
+    let changed = 13;
+    let mut reset = pool.clone();
+    reset[changed].wr *= 2.5;
+    reset[changed].weight *= 2.5;
+    let share = |p: &[RoutingCandidate]| {
+        keyed_score(p[changed].wr) / p.iter().map(|c| keyed_score(c.wr)).sum::<f64>()
+    };
+    let gain = share(&reset) - share(&pool);
+    let mut moved = 0;
+    for (k, &was) in keys.iter().zip(&before) {
+        let now = keyed_pick(&state, &reset, k);
+        if now != was {
+            assert_eq!(
+                now, changed,
+                "key {k} moved to an account whose waste risk did not change"
+            );
+            moved += 1;
+        }
+    }
+    let moved_share = moved as f64 / keys.len() as f64;
+    assert!(moved > 0, "a 2.5x waste risk must win some keys");
+    assert!(
+        moved_share <= 2.0 * gain,
+        "moved {moved_share:.4} of keys for a share gain of {gain:.4}"
+    );
+
+    let removed = 21;
+    let without: Vec<RoutingCandidate> = pool
+        .iter()
+        .copied()
+        .filter(|c| c.endpoint != removed)
+        .collect();
+    for (k, &was) in keys.iter().zip(&before) {
+        let now = keyed_pick(&state, &without, k);
+        if now != was {
+            assert_eq!(was, removed, "key {k} moved though its account stayed");
+        }
+    }
+}
+
+/// AC6: over 100,000 keys, every account's key count is within 4 sigma of its
+/// share of the damped waste risk (`keyed_score`).
+#[tokio::test]
+async fn affinity_placement_is_proportional_to_waste_risk() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let pool = spread_candidates(POOL);
+    let n = 100_000;
+    let mut counts = [0usize; POOL];
+    for i in 0..n {
+        counts[keyed_pick(&state, &pool, &format!("lab9360-ac6-{i}"))] += 1;
+    }
+    let total: f64 = pool.iter().map(|c| keyed_score(c.wr)).sum();
+    for c in &pool {
+        let s = keyed_score(c.wr) / total;
+        let expected = n as f64 * s;
+        let sigma = (n as f64 * s * (1.0 - s)).sqrt();
+        let got = counts[c.endpoint] as f64;
+        assert!(
+            (got - expected).abs() <= 4.0 * sigma,
+            "account {} got {got} keys, expected {expected:.0} ± {:.0}",
+            c.endpoint,
+            4.0 * sigma
+        );
+    }
+}
+
+/// LAB-9985: the keyed score is damped. When an account's waste risk falls
+/// by a factor f, the share of its keys that leave is one minus its share
+/// after over its share before, close to `1 - f^a`: a 20% drop moves about
+/// 10.6% of its keys at a = 0.5, where the undamped score moved 20%.
+#[tokio::test]
+async fn affinity_waste_risk_drop_moves_damped_share_of_its_keys() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let pool = spread_candidates(POOL);
+    let home = 25;
+    let mut dropped = pool.clone();
+    dropped[home].wr *= 0.8;
+    dropped[home].weight *= 0.8;
+
+    let (mut stayed, mut held) = (0usize, 0usize);
+    for i in 0..200_000 {
+        let k = format!("lab9985-damp-{i}");
+        if keyed_pick(&state, &pool, &k) != home {
+            continue;
+        }
+        held += 1;
+        stayed += usize::from(keyed_pick(&state, &dropped, &k) == home);
+    }
+    let share = |p: &[RoutingCandidate]| {
+        keyed_score(p[home].wr) / p.iter().map(|c| keyed_score(c.wr)).sum::<f64>()
+    };
+    // Lowering one score only loses keys, so P(stay | held) = share after / share before.
+    let p_leave = 1.0 - share(&dropped) / share(&pool);
+    let leave = (held - stayed) as f64 / held as f64;
+    let sigma = (p_leave * (1.0 - p_leave) / held as f64).sqrt();
+    assert!(
+        (leave - p_leave).abs() <= 4.0 * sigma,
+        "{leave:.4} of {held} keys left for an expected {p_leave:.4} ± {:.4}",
+        4.0 * sigma
+    );
+    assert!(
+        leave < 0.15,
+        "a 20% waste-risk drop moved {leave:.3} of the account's keys; undamped it moves ~0.2"
+    );
+}
+
+/// AC7: the move signal's memory stays bounded, and remembers a key across
+/// a generation's turnover.
+#[test]
+fn affinity_last_pick_is_bounded() {
+    let mut map = AffinityLastPick::default();
+    let generation = AffinityLastPick::GENERATION as u64;
+    assert_eq!(map.swap(0, 1), None, "a first sight has no last pick");
+    for k in 1..generation - 1 {
+        map.swap(k, 0);
+    }
+    assert_eq!(
+        map.swap(0, 2),
+        Some(1),
+        "a key seen in this generation is remembered"
+    );
+    for k in generation..3 * generation {
+        map.swap(k, 0);
+        assert!(
+            map.len() <= 2 * AffinityLastPick::GENERATION,
+            "the map must stay bounded"
+        );
+    }
+    assert_eq!(
+        map.swap(0, 3),
+        None,
+        "a key two generations old is forgotten"
+    );
+}
+
+/// Where `key` goes for `model` right now, without feeding the move signal.
+async fn peek(state: &AppState, key: &str, model: &str) -> usize {
+    let anonymous = state.caller("");
+    state
+        .pick_endpoint_for_client(
+            Some(key),
+            model,
+            &[],
+            &anonymous,
+            FastRequest::STANDARD,
+            false,
+        )
+        .await
+        .unwrap()
+}
+
+/// The move signal is per model: a key whose models sit on different
+/// accounts, because each model's weekly claims weigh the accounts
+/// differently, is not moving when it alternates between them.
+#[tokio::test]
+async fn affinity_alternating_models_is_not_a_move() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let sonnet = "claude-sonnet-4-5";
+    let now = AppState::now_epoch();
+    for i in 0..POOL {
+        // The reverse of the opus spread, so the two models rank accounts apart.
+        let util = 0.60 - 0.50 * i as f64 / POOL as f64;
+        set_model_utilization(&state, i, sonnet, util, now + 4 * 86_400).await;
+    }
+    let marker = "lab9360-models";
+    log_capture_buf();
+    let mut key = None;
+    for i in 0..1000 {
+        let k = format!("{marker}-{i}");
+        if peek(&state, &k, OPUS).await != peek(&state, &k, sonnet).await {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.expect("a key whose models sit on different accounts");
+    for _ in 0..10 {
+        state.pick_endpoint(Some(&key), OPUS, &[]).await.unwrap();
+        state.pick_endpoint(Some(&key), sonnet, &[]).await.unwrap();
+    }
+    assert_eq!(migrations(&state), [0; 5]);
+    assert_eq!(log_lines(marker), Vec::<String>::new());
+}
+
+/// The stateless trade-off, pinned down: when an account's own waste risk
+/// falls (here its weekly use rises from 0.19 to 0.60, halving it) while it
+/// still passes the overage rule, it loses part of its sessions once, each
+/// counted as `rehomed`. They do not flap back while the waste risk holds.
+#[tokio::test]
+async fn affinity_own_waste_risk_drop_rehomes_part_of_its_sessions_once() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9405-wr-drop";
+    log_capture_buf();
+    let keys = keys_hashing_to(&state, HOME, 200, 200_000, marker).await;
+    assert_eq!(keys.len(), 200);
+    for k in &keys {
+        assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(HOME));
+    }
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, HOME, 0.10, 0.60, now + 10_000, now + 4 * 86_400).await;
+
+    let mut first = Vec::with_capacity(keys.len());
+    for k in &keys {
+        first.push(state.pick_endpoint(Some(k), OPUS, &[]).await.unwrap());
+    }
+    let moved = first.iter().filter(|&&i| i != HOME).count() as u64;
+    assert!(
+        moved > 0 && moved < keys.len() as u64,
+        "part of the sessions move, not none or all: {moved}"
+    );
+    let mut want = [0; 5];
+    want[MigrationReason::Rehomed as usize] = moved;
+    assert_eq!(
+        migrations(&state),
+        want,
+        "each move counts once, as rehomed"
+    );
+
+    for _ in 0..10 {
+        for (k, &was) in keys.iter().zip(&first) {
+            assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(was));
+        }
+    }
+    assert_eq!(
+        migrations(&state),
+        want,
+        "no further moves while the waste risk holds"
+    );
+}
+
+/// Set `HOME`'s 5h utilisation alone, leaving its weekly claim and so its
+/// waste risk as `heal_pool` left them.
+async fn set_home_5h(state: &AppState, util_5h: f64) {
+    state.endpoints[HOME].rate_info.write().await.utilization_5h = Some(util_5h);
+}
+
+/// Keyed sessions are placed on waste risk, so a 5h window filling on a
+/// passing account moves none of its sessions: here `HOME`'s gate rises from
+/// 0.20 to 0.85, under `soft_limit`, with every waste risk unchanged.
+#[tokio::test]
+async fn affinity_5h_gate_rise_under_soft_limit_moves_no_session() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9405-5h-rise";
+    log_capture_buf();
+    set_home_5h(&state, 0.20).await;
+    let keys = keys_hashing_to(&state, HOME, 200, 200_000, marker).await;
+    assert_eq!(keys.len(), 200);
+    for k in &keys {
+        assert_eq!(state.pick_endpoint(Some(k), OPUS, &[]).await, Some(HOME));
+    }
+    let wr_before = state.routing_candidates(OPUS, &[]).await[HOME].wr;
+
+    set_home_5h(&state, 0.85).await;
+    let candidates = state.routing_candidates(OPUS, &[]).await;
+    let home = &candidates[HOME];
+    assert!((home.gate - 0.85).abs() < 1e-9, "home's gate is 0.85");
+    assert_eq!(home.wr, wr_before, "home's waste risk is unchanged");
+    assert!(state.keeps_affinity(home), "home still passes the rule");
+
+    for k in &keys {
+        assert_eq!(
+            state.pick_endpoint(Some(k), OPUS, &[]).await,
+            Some(HOME),
+            "key {k} left home on a 5h gate under soft_limit"
+        );
+    }
+    assert_eq!(migrations(&state), [0; 5], "no move, no count");
+    assert_eq!(log_lines(marker), Vec::<String>::new(), "no move, no line");
+}
+
+/// The 5h half of the overage rule still holds: the same account at gate
+/// 0.92, past `soft_limit`, sheds its session as `loaded`.
+#[tokio::test]
+async fn affinity_5h_gate_past_soft_limit_still_sheds() {
+    let _clock = FrozenClock::at(FIXED_EPOCH);
+    let state = prod_pool().await;
+    let marker = "lab9405-5h-past";
+    set_home_5h(&state, 0.20).await;
+    let key = seed_session(&state, marker).await;
+    set_home_5h(&state, 0.92).await;
+    assert_session_leaves(&state, &key, marker, MigrationReason::Loaded).await;
+}
+
+/// Synthetic candidates with one waste risk and weights spread 1:10 by gate.
+fn gate_spread_candidates(n: usize) -> Vec<RoutingCandidate> {
+    (0..n)
+        .map(|i| {
+            let gate = 0.89 * i as f64 / (n - 1) as f64;
+            RoutingCandidate {
+                gate_5h: gate,
+                gate,
+                wr: 1.0,
+                weight: 1.0 - gate,
+                ..spread_candidates(n)[i]
+            }
+        })
+        .collect()
+}
+
+/// Over 100,000 keys, each account's count is within 4 sigma of `share`.
+fn assert_counts_match(counts: &[usize], share: impl Fn(usize) -> f64, what: &str) {
+    let n: usize = counts.iter().sum();
+    for (i, &got) in counts.iter().enumerate() {
+        let s = share(i);
+        let expected = n as f64 * s;
+        let sigma = (n as f64 * s * (1.0 - s)).sqrt();
+        assert!(
+            (got as f64 - expected).abs() <= 4.0 * sigma,
+            "{what}: account {i} got {got}, expected {expected:.0} ± {:.0}",
+            4.0 * sigma
+        );
+    }
+}
+
+/// Un-keyed picks still walk the full weight, so they follow the 5h gate;
+/// keyed picks follow waste risk alone, which here is equal everywhere.
+#[tokio::test]
+async fn unkeyed_picks_walk_full_weight_keyed_picks_waste_risk() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let pool = gate_spread_candidates(POOL);
+    let refs: Vec<&RoutingCandidate> = pool.iter().collect();
+    let total: f64 = pool.iter().map(|c| c.weight).sum();
+    let n = 100_000;
+
+    let mut unkeyed = [0usize; POOL];
+    let mut keyed = [0usize; POOL];
+    for i in 0..n {
+        unkeyed[state.pick_sticky_weighted_v2(&refs, total, None).endpoint] += 1;
+        keyed[keyed_pick(&state, &pool, &format!("lab9405-split-{i}"))] += 1;
+    }
+    assert_counts_match(&unkeyed, |i| pool[i].weight / total, "un-keyed");
+    assert_counts_match(&keyed, |_| 1.0 / POOL as f64, "keyed");
+}
+
+/// A passing account with no waste risk (missing reset data) is scored as
+/// its lowest-scoring peer, so it holds no more keys than that peer would.
+#[tokio::test]
+async fn affinity_zero_waste_risk_scores_as_lowest_peer() {
+    let state = sticky_v2_state(pool_endpoints(POOL));
+    let mut pool = spread_candidates(POOL);
+    let blind = 30;
+    pool[blind].wr = 0.0;
+    let floor = pool
+        .iter()
+        .filter(|c| c.wr > 0.0)
+        .map(|c| c.wr)
+        .fold(f64::INFINITY, f64::min);
+    let score = |i: usize| keyed_score(if pool[i].wr > 0.0 { pool[i].wr } else { floor });
+    let total: f64 = (0..POOL).map(score).sum();
+
+    let mut counts = [0usize; POOL];
+    for i in 0..100_000 {
+        counts[keyed_pick(&state, &pool, &format!("lab9405-blind-{i}"))] += 1;
+    }
+    assert_counts_match(&counts, |i| score(i) / total, "keyed");
 }

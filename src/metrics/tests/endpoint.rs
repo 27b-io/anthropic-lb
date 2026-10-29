@@ -380,7 +380,7 @@ async fn metrics_transport_errors_scope_without_redis_aggregate() {
 #[tokio::test]
 async fn metrics_endpoint_auth() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("secret-key".into()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("secret-key")));
 
     let addr = serve(app).await;
     let client = Client::new();
@@ -396,7 +396,7 @@ async fn metrics_endpoint_auth() {
     // Wrong key → 401
     let resp = client
         .get(format!("http://{}/metrics", addr))
-        .header("x-api-key", "wrong-key")
+        .header("x-api-key", test_key("wrong-key"))
         .send()
         .await
         .unwrap();
@@ -405,7 +405,7 @@ async fn metrics_endpoint_auth() {
     // Correct key → 200
     let resp = client
         .get(format!("http://{}/metrics", addr))
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .send()
         .await
         .unwrap();
@@ -452,11 +452,14 @@ async fn metrics_omits_null_utilization() {
 async fn metrics_operator_hiding() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let accounts = vec![mk_endpoint_at("acct-a", "sk-ant-api-test-aaa", &mock_url)];
-    let state = Arc::new(AppState {
-        endpoints: accounts,
-        operators: vec!["op-alice".to_string(), "op-bob".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["op-alice", "op-bob"])
+            .install(AppState {
+                endpoints: accounts,
+                ..test_state_base()
+            }),
+    );
 
     // Seed two operator clients and one regular client with token usage
     {
@@ -478,6 +481,21 @@ async fn metrics_operator_hiding() {
         usage.insert(
             ("user-charlie".to_string(), "claude-haiku-4-5".to_string()),
             [10, 20, 0, 0],
+        );
+    }
+    {
+        let mut usage = state.overage_usage.lock().unwrap();
+        usage.insert(
+            ("op-alice".to_string(), "claude-sonnet-5".to_string()),
+            [40, 0, 0, 0],
+        );
+        usage.insert(
+            ("op-bob".to_string(), "claude-sonnet-5".to_string()),
+            [2, 0, 0, 0],
+        );
+        usage.insert(
+            ("user-charlie".to_string(), "claude-haiku-4-5".to_string()),
+            [0, 9, 0, 0],
         );
     }
     {
@@ -569,11 +587,48 @@ async fn metrics_operator_hiding() {
         "regular client per-model tokens should be emitted:\n{body}"
     );
 
+    // LAB-8496: the overage family shares labels and operator rollup.
+    assert!(
+        body.contains(
+            "anthropic_overage_token_usage_total{client=\"_operator\",model=\"claude-sonnet-5\",type=\"input\"} 42"
+        ),
+        "operator overage tokens should sum to 42:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_overage_token_usage_total{client=\"user-charlie\",model=\"claude-haiku-4-5\",type=\"output\"} 9"
+        ),
+        "regular client overage tokens should be emitted:\n{body}"
+    );
+
     // Regular client should appear normally
     assert!(
         body.contains("client=\"user-charlie\""),
         "non-operator should appear:\n{body}"
     );
+}
+
+/// The log sink's counters exist only while a sink is configured (their
+/// presence with one is `log_sink::tests::requests_are_unaffected_by_a_hung_sink`):
+/// an absent family says the sink is off, where a zero would say it is idle.
+#[tokio::test]
+async fn metrics_omit_log_sink_counters_without_a_sink() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("anthropic_shadow_log_dropped_total"),
+        "not a full scrape:\n{body}"
+    );
+    assert!(!body.contains("anthropic_log_sink_"), "{body}");
 }
 
 #[tokio::test]
@@ -701,13 +756,16 @@ async fn metrics_client_budgets_and_rpm() {
     ewma.value = 3.5;
     client_rates_map.insert("claude-code".to_string(), (50, ewma));
 
-    let state = Arc::new(AppState {
-        endpoints: accounts,
-        client_budgets,
-        budget_usage: Mutex::new(budget_usage_map),
-        client_request_rates: Mutex::new(client_rates_map),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .budgets(client_budgets)
+            .install(AppState {
+                endpoints: accounts,
+                budget_usage: Mutex::new(budget_usage_map),
+                client_request_rates: Mutex::new(client_rates_map),
+                ..test_state_base()
+            }),
+    );
 
     let app = build_router(state);
     let addr = serve(app).await;
@@ -1355,6 +1413,312 @@ async fn refresh_metrics_weights_soft_limit_graceful_degradation() {
     }
 }
 
+// ── routing_share mirrors the picker's priority tiers ───────────
+
+/// An Anthropic endpoint at `priority`.
+fn mk_tiered(name: &str, priority: u32) -> Endpoint {
+    let mut ep = mk_endpoint(name, &format!("sk-ant-api-{name}"));
+    ep.priority = priority;
+    ep
+}
+
+/// Give endpoint `i` 5h-only data at `util`: its gate tracks `util`, its
+/// weight the headroom left.
+async fn set_util(state: &AppState, i: usize, util: f64) {
+    let mut info = state.endpoints[i].rate_info.write().await;
+    info.utilization_5h = Some(util);
+    info.reset_5h = Some(AppState::now_epoch() + 10_000);
+    info.utilization = Some(util);
+    info.claims_7d.clear();
+}
+
+/// Put endpoint `i` in overage: its subscription windows are rejected and
+/// the overage window (30% used) governs, as in production.
+async fn set_overage(state: &AppState, i: usize) {
+    let now = AppState::now_epoch();
+    let mut info = state.endpoints[i].rate_info.write().await;
+    info.utilization_5h = Some(1.0);
+    info.reset_5h = Some(now + 7200);
+    info.status_5h = Some("rejected".to_string());
+    info.claims_7d.clear();
+    info.claims_7d.insert(
+        "seven_day".to_string(),
+        ClaimWindowData {
+            utilization: Some(1.0),
+            reset: Some(now + 302_400),
+            status: Some("rejected".to_string()),
+            ..Default::default()
+        },
+    );
+    info.overage_in_use = true;
+    info.overage_status = Some("allowed".to_string());
+    info.overage_utilization = Some(0.30);
+    info.overage_reset = Some(now + 86_400);
+}
+
+async fn set_hard_limited(state: &AppState, i: usize) {
+    state.endpoints[i]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(600));
+}
+
+fn shares(state: &AppState) -> Vec<f64> {
+    state
+        .endpoints
+        .iter()
+        .map(|ep| f64::from_bits(ep.last_routing_share.load(Ordering::Relaxed)))
+        .collect()
+}
+
+fn weights(state: &AppState) -> Vec<f64> {
+    state
+        .endpoints
+        .iter()
+        .map(|ep| f64::from_bits(ep.last_routing_weight.load(Ordering::Relaxed)))
+        .collect()
+}
+
+fn assert_shares(state: &AppState, want: &[f64]) {
+    let got = shares(state);
+    assert!(
+        got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-9),
+        "shares: got {got:?}, want {want:?}"
+    );
+}
+
+/// The picker serves only from the account the gauge gives the whole share.
+async fn assert_picker_serves(state: &AppState, idx: usize) {
+    for _ in 0..20 {
+        assert_eq!(
+            state.pick_endpoint(None, "claude-sonnet-4-5", &[]).await,
+            Some(idx),
+            "picker must serve the account whose share is 1.0"
+        );
+    }
+}
+
+/// AC1: a priority-2 account reads 0 while priority 1 has weight; the
+/// weight gauge still reports it as it did before.
+#[tokio::test]
+async fn routing_share_zero_for_lower_priority_tier() {
+    let state = test_state_with(vec![
+        mk_tiered("a", 1),
+        mk_tiered("b", 1),
+        mk_tiered("c", 2),
+    ]);
+    for i in 0..3 {
+        set_util(&state, i, 0.20).await;
+    }
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.5, 0.5, 0.0]);
+    assert!(
+        weights(&state).iter().all(|&w| w > 0.0),
+        "weight gauge is tier-blind"
+    );
+}
+
+/// AC2: an account serving via overage is demoted by `overage_penalty`,
+/// exactly as `routing_candidates` demotes it.
+#[tokio::test]
+async fn routing_share_zero_for_overage_demoted_account() {
+    // Beside a healthy same-tier account: the overage account reads 0
+    // although it carries weight.
+    let state = test_state_with(vec![mk_tiered("a", 1), mk_tiered("b", 1)]);
+    set_overage(&state, 0).await;
+    set_util(&state, 1, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.0, 1.0]);
+    assert!(weights(&state)[0] > 0.0, "overage account keeps its weight");
+    assert_picker_serves(&state, 1).await;
+
+    // The demotion is `overage_penalty` (10 in tests), not "last": with
+    // tier 1 hard-limited, the overage account (1 + 10 = 11) outranks a
+    // healthy priority-12 account.
+    let state = test_state_with(vec![
+        mk_tiered("a", 1),
+        mk_tiered("b", 1),
+        mk_tiered("c", 12),
+    ]);
+    assert_eq!(state.overage_penalty, 10);
+    set_overage(&state, 0).await;
+    set_hard_limited(&state, 1).await;
+    set_util(&state, 2, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[1.0, 0.0, 0.0]);
+    assert_picker_serves(&state, 0).await;
+}
+
+/// AC3 + AC6: a tier with no weight passes the share to the next tier, by
+/// weight; with no weight anywhere every share reads 0.
+#[tokio::test]
+async fn routing_share_falls_through_exhausted_tier() {
+    let state = test_state_with(vec![
+        mk_tiered("a", 1),
+        mk_tiered("b", 1),
+        mk_tiered("c", 2),
+        mk_tiered("d", 2),
+    ]);
+    set_hard_limited(&state, 0).await;
+    // b: rejected 5h → gate 1.0 → zero weight.
+    set_util(&state, 1, 0.10).await;
+    state.endpoints[1].rate_info.write().await.status_5h = Some("rejected".to_string());
+    set_util(&state, 2, 0.20).await;
+    set_util(&state, 3, 0.60).await;
+
+    state.refresh_metrics_weights().await;
+
+    let w = weights(&state);
+    let total = w[2] + w[3];
+    assert_shares(&state, &[0.0, 0.0, w[2] / total, w[3] / total]);
+    assert!(
+        shares(&state)[2] > shares(&state)[3],
+        "more headroom, more share"
+    );
+
+    // Nothing has weight → all zero.
+    for i in 2..4 {
+        set_hard_limited(&state, i).await;
+    }
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[0.0; 4]);
+}
+
+/// AC4: soft limit sheds load within a tier and never moves the share to
+/// the next one.
+#[tokio::test]
+async fn routing_share_soft_limit_degrades_within_tier() {
+    // Serving tier has a healthy account: the soft-limited one reads 0.
+    let state = test_state_with_soft_limit(
+        vec![mk_tiered("a", 1), mk_tiered("b", 1), mk_tiered("c", 2)],
+        0.90,
+    );
+    set_util(&state, 0, 0.20).await;
+    set_util(&state, 1, 0.95).await;
+    set_util(&state, 2, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[1.0, 0.0, 0.0]);
+
+    // Every serving-tier account soft-limited: they share by weight, and
+    // the healthy priority-2 account still reads 0.
+    set_util(&state, 0, 0.95).await;
+    set_util(&state, 1, 0.92).await;
+
+    state.refresh_metrics_weights().await;
+
+    let s = shares(&state);
+    assert!(
+        s[0] > 0.0 && s[1] > 0.0,
+        "degraded tier keeps serving: {s:?}"
+    );
+    assert!(s[1] > s[0], "more headroom, more share: {s:?}");
+    assert!((s[0] + s[1] - 1.0).abs() < 1e-9, "shares sum to 1: {s:?}");
+    assert_eq!(s[2], 0.0, "soft limit never jumps a tier");
+}
+
+/// A spent week weighs 0 though its 5h gate is healthy, so it is not the
+/// tier's healthy capacity: the soft-limited account in the same tier takes
+/// the whole share, as the picker serves it.
+#[tokio::test]
+async fn routing_share_spent_week_never_hides_degraded_capacity() {
+    let state = test_state_with_soft_limit(
+        vec![mk_tiered("a", 1), mk_tiered("b", 1), mk_tiered("c", 2)],
+        0.90,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+    set_util(&state, 1, 0.95).await;
+    set_util(&state, 2, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[0.0, 1.0, 0.0]);
+    assert_picker_serves(&state, 1).await;
+}
+
+/// The tier-blind weight gauge reads the same healthy filter: with no other
+/// account in the pool, a spent week does not zero the soft-limited account
+/// the picker serves.
+#[tokio::test]
+async fn routing_weight_spent_week_never_hides_degraded_capacity() {
+    let state = test_state_with_soft_limit(vec![mk_tiered("a", 1), mk_tiered("b", 1)], 0.90);
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+    set_util(&state, 1, 0.95).await;
+
+    state.refresh_metrics_weights().await;
+    let w = weights(&state);
+    assert_eq!(w[0], 0.0, "a spent week weighs 0: {w:?}");
+    assert!(w[1] > 0.0, "the served account keeps its weight: {w:?}");
+    assert_picker_serves(&state, 1).await;
+}
+
+/// AC5: an OpenAI endpoint sits in its configured tier with its fixed
+/// weight.
+#[tokio::test]
+async fn routing_share_openai_endpoint_in_configured_tier() {
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.endpoints.push(mk_tiered("ep-a", 0));
+        let mut oai = make_endpoint("oai", Protocol::OpenAI);
+        oai.priority = 100;
+        st.endpoints.push(oai);
+    }
+    set_util(&state, 0, 0.20).await;
+
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[1.0, 0.0]);
+    assert_eq!(weights(&state)[1], 1.0, "fixed weight unchanged");
+
+    set_hard_limited(&state, 0).await;
+    state.refresh_metrics_weights().await;
+    assert_shares(&state, &[0.0, 1.0]);
+}
+
+/// Accounts `routing_candidates` skips take no share: an Anthropic endpoint
+/// with an open transport breaker, and a hard-limited OpenAI endpoint. Their
+/// weight and gate gauges still read as before.
+#[tokio::test]
+async fn routing_share_skips_unroutable_endpoints() {
+    let mut state = test_state_with(vec![]);
+    {
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.endpoints.push(mk_tiered("a", 1));
+        let mut oai = make_endpoint("oai", Protocol::OpenAI);
+        oai.priority = 1;
+        st.endpoints.push(oai);
+        st.endpoints.push(mk_tiered("c", 2));
+    }
+    set_util(&state, 0, 0.20).await;
+    set_util(&state, 2, 0.20).await;
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .transport
+        .open_until = Some(Instant::now() + Duration::from_secs(600));
+    set_hard_limited(&state, 1).await;
+
+    state.refresh_metrics_weights().await;
+
+    assert_shares(&state, &[0.0, 0.0, 1.0]);
+    assert_picker_serves(&state, 2).await;
+    let w = weights(&state);
+    assert!(
+        w[0] > 0.0,
+        "transport breaker leaves the weight gauge as it was"
+    );
+    assert_eq!(w[1], 1.0, "OpenAI fixed weight unchanged");
+}
+
 #[tokio::test]
 async fn metrics_routing_weight_and_share_present() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
@@ -1751,6 +2115,27 @@ async fn metrics_omits_claim_reset_already_in_the_past() {
     );
 }
 
+/// LAB-9360: every `anthropic_affinity_migrations_total` reason is exported
+/// at zero from startup, so a rate() panel has a baseline per reason.
+#[tokio::test]
+async fn metrics_exports_every_affinity_migration_reason_at_zero() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, _state) = test_app(&mock_url, None);
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for reason in ["loaded", "spent", "floored", "unavailable", "rehomed"] {
+        let line = format!("anthropic_affinity_migrations_total{{reason=\"{reason}\"}} 0");
+        assert!(body.contains(&line), "missing `{line}`:\n{body}");
+    }
+}
+
 /// AC-3: both `exhaustion_response` arms increment, under their own `kind`, and
 /// both series exist at zero before any exhaustion so a rate() panel has a
 /// baseline instead of "No data". Both arms answer in the JSON error envelope
@@ -1779,7 +2164,14 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     );
 
     // The incident shape: every endpoint gated, nothing transient → 429.
-    let resp = exhaustion_response(&state, false, false);
+    let resp = exhaustion_response(
+        &state,
+        false,
+        false,
+        "metrics-test",
+        "",
+        FastRequest::STANDARD,
+    );
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(
         resp.headers().get("retry-after").is_none(),
@@ -1790,9 +2182,23 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     assert_eq!(json["error"]["type"], "rate_limit_error");
     assert_eq!(json["error"]["message"], "exhausted all endpoints");
     // A 529 round counts as rate-limited too — same 429 to the caller.
-    let _ = exhaustion_response(&state, true, true);
+    let _ = exhaustion_response(
+        &state,
+        true,
+        true,
+        "metrics-test",
+        "",
+        FastRequest::STANDARD,
+    );
     // Transport-only exhaustion is the other arm → retryable 503.
-    let resp = exhaustion_response(&state, true, false);
+    let resp = exhaustion_response(
+        &state,
+        true,
+        false,
+        "metrics-test",
+        "",
+        FastRequest::STANDARD,
+    );
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         resp.headers().get("retry-after").map(|v| v.as_bytes()),
@@ -1811,5 +2217,147 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
     assert!(
         after.contains("anthropic_pool_exhausted_total{kind=\"transient\"} 1"),
         "transient exhaustion should count 1:\n{after}"
+    );
+}
+
+// ── Account waste risk bounded by the weekly pool ────────────────────
+//
+// The Fable band is a carve-out of the general `seven_day` pool, so band quota
+// the pool cannot fund is not urgency the account can act on. The account-level
+// roll-up applies the router's bound; the per-claim gauge stays raw.
+
+fn claim_snap(key: &str, util: f64, reset: u64, status: &str, now: u64) -> ClaimMetricsSnap {
+    ClaimMetricsSnap {
+        key: key.to_string(),
+        utilization: Some(util),
+        waste_risk: waste_risk(Some(util), Some(reset), now),
+        reset: Some(reset),
+        status: Some(status.to_string()),
+    }
+}
+
+/// A spent pool zeroes the account, and the band's raw score is still
+/// published per claim.
+#[tokio::test]
+async fn metrics_account_waste_risk_zero_when_pool_spent() {
+    let (mock_url, _handle) = spawn_mock_upstream().await;
+    let (app, state) = test_app(&mock_url, None);
+
+    let now_epoch = AppState::now_epoch();
+    {
+        let mut info = state.endpoints[0].rate_info.write().await;
+        info.claims_7d.insert(
+            "seven_day".to_string(),
+            ClaimWindowData {
+                utilization: Some(1.0),
+                reset: Some(now_epoch + 5400),
+                status: Some("rejected".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+        // Raw band score: 0.23 / (5400 / 604800) ≈ 25.8, capped at 10.
+        info.claims_7d.insert(
+            FABLE_BAND_CLAIM.to_string(),
+            ClaimWindowData {
+                utilization: Some(0.77),
+                reset: Some(now_epoch + 5400),
+                status: Some("allowed".to_string()),
+                last_seen: now_epoch,
+            },
+        );
+    }
+
+    let addr = serve(app).await;
+    let body = Client::new()
+        .get(format!("http://{}/metrics", addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("anthropic_account_waste_risk{account=\"acct-a\"} 0\n"),
+        "spent pool should zero the account waste risk:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "anthropic_claim_waste_risk{account=\"acct-a\",claim=\"seven_day_fable\"} 10\n"
+        ),
+        "per-claim band waste risk should stay raw:\n{body}"
+    );
+}
+
+#[test]
+fn account_waste_risk_zero_when_pool_spent_without_status() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 1.0, now + 5400, "allowed", now),
+        claim_snap(FABLE_BAND_CLAIM, 0.77, now + 5400, "allowed", now),
+    ];
+    assert_eq!(account_waste_risk(&claims, now), 0.0);
+}
+
+/// Status is not derivable from utilization: a pool rejected below 1.0 is spent.
+#[test]
+fn account_waste_risk_zero_when_pool_rejected_below_full() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 0.97, now + 5400, "rejected", now),
+        claim_snap(FABLE_BAND_CLAIM, 0.77, now + 5400, "allowed", now),
+    ];
+    assert_eq!(account_waste_risk(&claims, now), 0.0);
+}
+
+/// The band never reads more urgent than the pool it draws from.
+#[test]
+fn account_waste_risk_band_bounded_by_unspent_pool() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 0.90, now + 86_400, "allowed", now),
+        claim_snap(FABLE_BAND_CLAIM, 0.50, now + 86_400, "allowed", now),
+    ];
+    // Pool: 0.10 / (86400 / 604800) = 0.7. Band alone would be 3.5.
+    let wr = account_waste_risk(&claims, now);
+    assert!((wr - 0.7).abs() < 1e-9, "expected pool's 0.7, got {wr}");
+}
+
+/// With no pool claim there is nothing to bound by: the band reads raw.
+#[test]
+fn account_waste_risk_band_uncapped_without_pool() {
+    let now = 1_000_000;
+    let band = claim_snap(FABLE_BAND_CLAIM, 0.50, now + 86_400, "allowed", now);
+    let raw = band.waste_risk;
+    assert!((raw - 3.5).abs() < 1e-9);
+    assert_eq!(account_waste_risk(&[band], now), raw);
+}
+
+/// A pool whose reset has passed is stale: it neither zeroes nor bounds the
+/// band, even when its last reading was spent and rejected.
+#[test]
+fn account_waste_risk_band_uncapped_with_stale_pool() {
+    let now = 1_000_000;
+    let band = claim_snap(FABLE_BAND_CLAIM, 0.50, now + 86_400, "allowed", now);
+    let raw = band.waste_risk;
+    let claims = [
+        claim_snap("seven_day", 1.0, now - 60, "rejected", now),
+        band,
+    ];
+    assert_eq!(account_waste_risk(&claims, now), raw);
+}
+
+/// Claims other than the band are not bounded by an unspent pool.
+#[test]
+fn account_waste_risk_other_claims_uncapped_by_unspent_pool() {
+    let now = 1_000_000;
+    let claims = [
+        claim_snap("seven_day", 0.90, now + 86_400, "allowed", now),
+        claim_snap("seven_day_sonnet", 0.50, now + 86_400, "allowed", now),
+    ];
+    let wr = account_waste_risk(&claims, now);
+    assert!(
+        (wr - 3.5).abs() < 1e-9,
+        "sonnet sub-budget reads raw, got {wr}"
     );
 }

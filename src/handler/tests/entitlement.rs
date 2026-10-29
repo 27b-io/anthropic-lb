@@ -63,8 +63,6 @@ fn entitlement_400_predicate_is_anchored_exact_type_and_400_only() {
     }
 }
 
-type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
-
 /// `spent` (priority 0) always answers `body` as a 400; `healthy` at
 /// priority 1 is `healthy_url`. Priority, not affinity hashing, forces the
 /// first attempt onto `spent`, so hit counts are a clean "did we re-send?"
@@ -244,6 +242,139 @@ async fn entitlement_400_with_no_other_account_returns_upstream_400() {
     assert_eq!(&body[..], ENTITLEMENT_400_BODY);
 }
 
+/// The refusal is returned whenever no other account was attempted after it,
+/// whatever state the rest of the pool is in. A hard-limited account is never
+/// attempted, so it must not turn the refusal into a 429.
+#[tokio::test]
+async fn entitlement_400_beside_hard_limited_account_returns_upstream_400() {
+    use std::sync::atomic::Ordering;
+    let (spent_url, spent_hits) = spawn_400_upstream(ENTITLEMENT_400_BODY).await;
+    let (limited_url, limited_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![
+        mk_endpoint_at("spent", "sk-ant-api-s", &spent_url),
+        mk_endpoint_at("limited", "sk-ant-api-l", &limited_url),
+    ]);
+    state.endpoints[1]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+    let addr = serve(build_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(MESSAGES_BODY)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(&body[..], ENTITLEMENT_400_BODY);
+    assert_eq!(
+        (
+            spent_hits.load(Ordering::SeqCst),
+            limited_hits.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "the hard-limited account must not be attempted"
+    );
+}
+
+/// Marks an endpoint in the proxy's state, as a concurrent request would.
+type Mark = fn(&AppState);
+
+/// Upstream that answers every request with a 500 after running `mark` on the
+/// proxy's state: a concurrent request negative-caching this endpoint while
+/// this request is in flight. `slot` is filled once the state exists.
+async fn spawn_500_upstream_marking(
+    slot: Arc<std::sync::OnceLock<Arc<AppState>>>,
+    mark: Mark,
+) -> (String, Hits) {
+    let hits: Hits = Default::default();
+    let h = hits.clone();
+    let app = Router::new().fallback(any(move || {
+        let (slot, h) = (slot.clone(), h.clone());
+        async move {
+            h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            mark(slot.get().expect("state is set before any request"));
+            (StatusCode::INTERNAL_SERVER_ERROR, "server error").into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A refuser plus an account that answers a 500 while a concurrent request
+/// marks it. The 500 clears the stashed refusal, and the marks make the pool
+/// look unservable, but the refuser never said the model or fast mode was the
+/// problem. Each handler must answer with the retryable 429, not synthesize a
+/// model 404 or the fast-mode 400.
+#[tokio::test]
+async fn refuser_plus_concurrently_marked_pool_stays_retryable() {
+    use std::sync::atomic::Ordering;
+    let rows: [(&str, &str, &str, Mark); 3] = [
+        ("native, model mark", "/v1/messages", MESSAGES_BODY, |s| {
+            s.note_model_unsupported("racing", 1, "claude-opus-5")
+        }),
+        (
+            "native fast, fast-mode mark",
+            "/v1/messages",
+            r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#,
+            |s| s.note_fast_mode_disabled("racing", 1),
+        ),
+        (
+            "openai-compat, model mark",
+            "/v1/chat/completions",
+            r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#,
+            |s| s.note_model_unsupported("racing", 1, "claude-opus-5"),
+        ),
+    ];
+    for (kind, path, body, mark) in rows {
+        let slot: Arc<std::sync::OnceLock<Arc<AppState>>> = Default::default();
+        let (racing_url, racing_hits) = spawn_500_upstream_marking(slot.clone(), mark).await;
+        let (state, addr, spent_hits) = spent_then(ENTITLEMENT_400_BODY, &racing_url).await;
+        slot.set(state).ok();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{kind}: body {text}"
+        );
+        assert!(
+            !text.contains("not_found") && !text.contains(FAST_MODE_NOT_ENABLED_MSG),
+            "{kind}: must not name the model or fast mode as the cause: {text}"
+        );
+        assert_eq!(
+            (
+                spent_hits.load(Ordering::SeqCst),
+                racing_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "{kind}"
+        );
+    }
+}
+
 /// AC-3: every other 400 is the caller's own error — returned byte-for-byte
 /// (status, body, upstream `request-id`), not re-sent, nothing counted. The
 /// predicate's negatives are unit-tested; these two rows pin the forward path
@@ -386,7 +517,7 @@ async fn resend_outcome_supersedes_stashed_entitlement_400() {
 
 /// The 404 case above on the OpenAI-compat path. The refuser is never
 /// negative-cached, so the exhaustion gate must count it out by index
-/// (`pool_cannot_serve`'s `refused`) — otherwise the re-send target's model
+/// (`pool_cannot_serve`'s `extra_usage_refuser`) — otherwise the re-send target's model
 /// rejection turns into a synthetic 429 (LAB-2687 × LAB-4729).
 #[tokio::test]
 async fn resend_404_supersedes_entitlement_400_on_openai_compat_path() {

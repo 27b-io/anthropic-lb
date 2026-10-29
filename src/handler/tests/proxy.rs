@@ -28,7 +28,7 @@ async fn describe_reqwest_error_surfaces_cause_and_kind() {
 #[tokio::test]
 async fn proxy_rejects_missing_auth() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("secret-key".to_string()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -56,7 +56,7 @@ async fn proxy_rejects_missing_auth() {
 #[tokio::test]
 async fn proxy_accepts_valid_auth_and_forwards() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, state) = test_app(&mock_url, Some("secret-key".to_string()));
+    let (app, state) = test_app(&mock_url, Some(test_key("secret-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -73,7 +73,7 @@ async fn proxy_accepts_valid_auth_and_forwards() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -104,7 +104,7 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
                 let _ = sock.read(&mut buf).await; // best-effort drain request
-                                                   // Promise 4096 bytes, send a partial JSON prefix, then close.
+                // Promise 4096 bytes, send a partial JSON prefix, then close.
                 let _ = sock
                         .write_all(
                             b"HTTP/1.1 200 OK\r\n\
@@ -122,23 +122,24 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
 
     // Ratelimit reflection is opt-in since LAB-1191; this test asserts the
     // error-arm parity that the opt-in restores, so flip it on.
-    let mut state = test_state_with(vec![
-        mk_endpoint_at(
-            "acct-a",
-            "sk-ant-api-test-aaa",
-            &format!("http://{}", mock_addr),
-        ),
-        mk_endpoint_at(
-            "acct-b",
-            "sk-ant-api-test-bbb",
-            &format!("http://{}", mock_addr),
-        ),
-    ]);
-    {
-        let s = Arc::get_mut(&mut state).expect("test fixture should be uniquely owned");
-        s.proxy_key = Some("secret-key".to_string());
-        s.expose_upstream_ratelimit_headers = true;
-    }
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("secret-key")).install(AppState {
+            endpoints: vec![
+                mk_endpoint_at(
+                    "acct-a",
+                    "sk-ant-api-test-aaa",
+                    &format!("http://{}", mock_addr),
+                ),
+                mk_endpoint_at(
+                    "acct-b",
+                    "sk-ant-api-test-bbb",
+                    &format!("http://{}", mock_addr),
+                ),
+            ],
+            expose_upstream_ratelimit_headers: true,
+            ..test_state_base()
+        }),
+    );
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -155,7 +156,7 @@ async fn proxy_returns_502_when_upstream_body_read_fails() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -238,7 +239,7 @@ async fn proxy_preserves_raw_body_bytes_when_auto_cache_skips() {
 
     let (app, _state) = test_app(
         &format!("http://{}", mock_addr),
-        Some("secret-key".to_string()),
+        Some(test_key("secret-key")),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -258,7 +259,7 @@ async fn proxy_preserves_raw_body_bytes_when_auto_cache_skips() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(raw_body)
         .send()
         .await
@@ -328,7 +329,7 @@ async fn proxy_preserves_key_order_when_auto_cache_mutates() {
 
     let (app, _state) = test_app(
         &format!("http://{}", mock_addr),
-        Some("secret-key".to_string()),
+        Some(test_key("secret-key")),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -342,15 +343,14 @@ async fn proxy_preserves_key_order_when_auto_cache_mutates() {
         .unwrap();
     });
 
-    let input_body =
-            "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
+    let input_body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
     let expected_body = "{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"max_tokens\":1}";
 
     let client = Client::new();
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "secret-key")
+        .header("x-api-key", test_key("secret-key"))
         .body(input_body)
         .send()
         .await
@@ -538,7 +538,7 @@ async fn anthropic_streaming_records_usage() {
 #[tokio::test]
 async fn response_includes_budget_status_header() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("test-key".to_string()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("test-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -555,7 +555,7 @@ async fn response_includes_budget_status_header() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "test-key")
+        .header("x-api-key", test_key("test-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -573,7 +573,7 @@ async fn response_includes_budget_status_header() {
 #[tokio::test]
 async fn openai_response_includes_budget_status_header() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_openai_app(&mock_url, Some("test-key".to_string()));
+    let (app, _state) = test_openai_app(&mock_url, Some(test_key("test-key")));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -590,7 +590,7 @@ async fn openai_response_includes_budget_status_header() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "test-key")
+        .header("x-api-key", test_key("test-key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -634,17 +634,264 @@ fn request_wants_stream_true_only_for_explicit_stream_true() {
     );
 }
 
-#[test]
-fn upstream_client_builder_composes_with_and_without_read_timeout() {
-    // Structural guard: both clients build from the shared knob chain; only the
-    // streaming client layers read_timeout on top. reqwest doesn't expose its
-    // config, so all this can assert is that both builders construct — the
-    // load-bearing read_timeout split is pinned by the call sites in main().
-    let _streaming = upstream_client_builder()
-        .read_timeout(Duration::from_secs(180))
-        .build()
-        .expect("streaming client builds");
-    let _nonstreaming = upstream_client_builder()
-        .build()
-        .expect("non-streaming client builds");
+// ── Ingress: bodies the proxy cannot parse (LAB-6781) ───────────
+
+/// A body the proxy's parse refuses gets a 400 in Anthropic's error envelope,
+/// one warn naming its client and path, and no upstream request: the upstream's
+/// decoder could read a model from it that the proxy never routed or gated on.
+#[tokio::test]
+async fn proxy_rejects_unparseable_body_with_envelope_400() {
+    use std::sync::atomic::Ordering;
+    let buf = log_capture_buf();
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-test", &url)]);
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    let bodies = unparseable_json_bodies();
+    for (label, body) in &bodies {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-client-id", "unparseable-envelope")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{label}: no HTTP response: {e}"));
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{label}");
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["type"], "error", "{label}: {json}");
+        assert_eq!(
+            json["error"]["type"], "invalid_request_error",
+            "{label}: {json}"
+        );
+        assert_eq!(
+            json["error"]["message"], "request body could not be parsed as JSON",
+            "{label}: {json}"
+        );
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no unparseable body may reach the upstream"
+    );
+
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    let warns = log
+        .lines()
+        .filter(|l| l.contains(r#"client_id="unparseable-envelope""#))
+        .filter(|l| l.contains("rejected: request body could not be parsed as JSON"))
+        .filter(|l| l.contains(r#"path="/v1/messages""#))
+        .count();
+    assert_eq!(warns, bodies.len(), "one warn per rejected body:\n{log}");
+}
+
+/// The rule keys on the body bytes, not on the path or the declared type: the
+/// client controls both, and this handler serves every path.
+#[tokio::test]
+async fn proxy_rejects_unparseable_body_on_any_path_or_content_type() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-test", &url)]);
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    let cases = [
+        ("/v1/messages/", "application/json"),
+        ("/v1/messages/count_tokens", "application/json"),
+        ("/v1/no-such-route", "application/json"),
+        ("/v1/messages", "multipart/form-data; boundary=x"),
+        ("/v1/files", "multipart/form-data; boundary=x"),
+    ];
+    for (path, content_type) in cases {
+        for (label, body) in unparseable_json_bodies() {
+            let resp = client
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", content_type)
+                .body(body)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{label} on {path}: no HTTP response: {e}"));
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{label} on {path} as {content_type}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no unparseable body may reach the upstream"
+    );
+}
+
+/// What the rule lets through untouched: a bodiless request, and a multipart
+/// upload, which opens with its `--` boundary line.
+#[tokio::test]
+async fn proxy_forwards_bodiless_and_multipart_requests_unchanged() {
+    const UPLOAD: &[u8] = b"--b0undary\r\n\
+        Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\
+        Content-Type: text/plain\r\n\r\n\
+        hello\r\n\
+        --b0undary--\r\n";
+    let (url, mut received) = spawn_capturing_upstream(StatusCode::OK, ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-test", &url)]);
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (_, body) = received.recv().await.expect("the GET reached the upstream");
+    assert!(body.is_empty(), "a bodiless request stays bodiless");
+
+    let resp = client
+        .post(format!("http://{addr}/v1/files"))
+        .header("content-type", "multipart/form-data; boundary=b0undary")
+        .body(UPLOAD)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (_, body) = received
+        .recv()
+        .await
+        .expect("the upload reached the upstream");
+    assert_eq!(
+        body.as_ref(),
+        UPLOAD,
+        "the upload is forwarded byte-identical"
+    );
+}
+
+/// The proxy decodes no content coding, so a coded body is refused before the
+/// parse: its raw bytes could pass the `--` test, or even parse as JSON, while
+/// the upstream reads what they decode to. Bodies under no coding, `identity`
+/// or a single `chunked` framing pass.
+#[tokio::test]
+async fn proxy_rejects_body_under_a_coding_it_does_not_decode() {
+    use std::sync::atomic::Ordering;
+    const JSON: &str =
+        r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (url, hits) = spawn_status_then_ok_upstream(0, "", ANTHROPIC_OK_BODY).await;
+    let state = test_state_with(vec![mk_endpoint_at("acct", "sk-ant-api-test", &url)]);
+    let addr = serve(build_router(state)).await;
+    let client = Client::new();
+
+    let refused: [(&str, &[u8], &[u8], &str); 7] = [
+        (
+            "content-encoding",
+            b"br",
+            b"--\x8b\x7f",
+            "content-encoding 'br'",
+        ),
+        (
+            "content-encoding",
+            b"gzip",
+            JSON.as_bytes(),
+            "content-encoding 'gzip'",
+        ),
+        (
+            "content-encoding",
+            b"identity, deflate",
+            JSON.as_bytes(),
+            "content-encoding 'deflate'",
+        ),
+        (
+            "content-encoding",
+            b"",
+            JSON.as_bytes(),
+            "content-encoding ''",
+        ),
+        (
+            "transfer-encoding",
+            b"gzip, chunked",
+            JSON.as_bytes(),
+            "transfer-encoding 'gzip'",
+        ),
+        (
+            "transfer-encoding",
+            b"chunked, chunked",
+            JSON.as_bytes(),
+            "transfer-encoding 'chunked, chunked'",
+        ),
+        (
+            "content-encoding",
+            b"\xffgzip",
+            JSON.as_bytes(),
+            "content-encoding '(not visible ASCII)'",
+        ),
+    ];
+    for (header, value, body, message) in refused {
+        let value = HeaderValue::from_bytes(value).unwrap();
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header(header, value.clone())
+            .body(body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{header}: {value:?}: no HTTP response: {e}"));
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{header}: {value:?}"
+        );
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            json["error"]["type"], "invalid_request_error",
+            "{header}: {value:?}: {json}"
+        );
+        assert!(
+            json["error"]["message"].as_str().unwrap().contains(message),
+            "{header}: {value:?}: {json}"
+        );
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no coded body may reach the upstream"
+    );
+
+    for (header, value) in [
+        ("content-encoding", "identity"),
+        ("content-encoding", "IDENTITY"),
+        ("transfer-encoding", "chunked"),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .header(header, value)
+            .body(JSON)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{header}: {value}");
+    }
+    let resp = client
+        .get(format!("http://{addr}/v1/models"))
+        .header("content-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a bodiless request has nothing to decode"
+    );
+    // Only the three passing rows and the bodiless request reach the upstream.
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+    // A `chunked` repeated on a second header line counts the same.
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("transfer-encoding", HeaderValue::from_static("chunked"));
+    headers.append("transfer-encoding", HeaderValue::from_static("chunked"));
+    assert_eq!(
+        undecoded_body_coding(&headers),
+        Some(("transfer-encoding", "chunked, chunked".to_string()))
+    );
 }

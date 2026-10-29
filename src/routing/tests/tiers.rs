@@ -149,6 +149,90 @@ async fn pick_account_priority_zero_weight_tier_falls_through() {
     }
 }
 
+/// A tier whose every account has spent its week, none in overage, weighs 0
+/// and falls through to the next tier for keyed and un-keyed picks alike,
+/// though each gate is low. Before, a spent week kept its full headroom.
+#[tokio::test]
+async fn pick_account_spent_week_tier_falls_through() {
+    for strategy in [
+        RoutingStrategy::DynamicCapacityV1,
+        RoutingStrategy::StickyWeightedV2,
+    ] {
+        let mut primary_a = mk_endpoint("primary_a", "sk-ant-api-a");
+        primary_a.priority = 0;
+        let mut primary_b = mk_endpoint("primary_b", "sk-ant-api-b");
+        primary_b.priority = 0;
+        let mut fallback = mk_endpoint("fallback", "sk-ant-api-c");
+        fallback.priority = 1;
+        let state = test_state_with_strategy(vec![primary_a, primary_b, fallback], strategy);
+
+        let now = AppState::now_epoch();
+        for i in 0..2 {
+            set_account_utilization(&state, i, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+        }
+        set_account_utilization(&state, 2, 0.30, 0.30, now + 10_000, now + 4 * 86_400).await;
+
+        for i in 0..100 {
+            let key = format!("spent-tier-{i}");
+            for affinity in [None, Some(key.as_str())] {
+                assert_eq!(
+                    state.pick_endpoint(affinity, "claude-opus-4-6", &[]).await,
+                    Some(2),
+                    "{strategy:?}, key {affinity:?}: a spent tier must fall through"
+                );
+            }
+        }
+    }
+}
+
+/// A spent account weighs 0 though its 5h gate (0.30) is healthy. It must not
+/// count as the tier's healthy capacity: the same-tier account at gate 0.95
+/// with positive weight serves (degraded within the tier), rather than the
+/// pick returning `None` or dropping to a lower tier.
+#[tokio::test]
+async fn pick_account_spent_week_never_hides_degraded_capacity() {
+    for strategy in [
+        RoutingStrategy::DynamicCapacityV1,
+        RoutingStrategy::StickyWeightedV2,
+    ] {
+        for with_fallback in [false, true] {
+            let mut endpoints = vec![
+                mk_endpoint("spent", "sk-ant-api-a"),
+                mk_endpoint("usable", "sk-ant-api-b"),
+            ];
+            if with_fallback {
+                let mut fallback = mk_endpoint("fallback", "sk-ant-api-c");
+                fallback.priority = 1;
+                endpoints.push(fallback);
+            }
+            let mut state = test_state_with_strategy(endpoints, strategy);
+            Arc::get_mut(&mut state)
+                .expect("test fixture should be uniquely owned")
+                .soft_limit = 0.90;
+
+            let now = AppState::now_epoch();
+            set_account_utilization(&state, 0, 0.30, 1.0, now + 10_000, now + 3 * 3600).await;
+            set_account_utilization(&state, 1, 0.95, 0.30, now + 10_000, now + 4 * 86_400).await;
+            if with_fallback {
+                set_account_utilization(&state, 2, 0.30, 0.30, now + 10_000, now + 4 * 86_400)
+                    .await;
+            }
+
+            for i in 0..50 {
+                let key = format!("spent-healthy-{i}");
+                for affinity in [None, Some(key.as_str())] {
+                    assert_eq!(
+                        state.pick_endpoint(affinity, "claude-opus-4-6", &[]).await,
+                        Some(1),
+                        "{strategy:?}, fallback {with_fallback}, key {affinity:?}: \
+                         the positive-weight account must serve degraded"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn pick_account_multiple_tiers_cascade() {
     // Three tiers: 0, 1, 2. Tier 0 and 1 exhausted → tier 2 gets traffic.
@@ -398,40 +482,82 @@ async fn pick_endpoint_openai_is_last_resort() {
 
 #[test]
 fn is_operator_checks_configured_operator() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["special-operator".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["special-operator"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
 
-    assert!(state.is_operator("special-operator"));
-    assert!(!state.is_operator("regular-client"));
+    assert!(
+        state
+            .current_client_policy()
+            .is_operator("special-operator")
+    );
+    assert!(!state.current_client_policy().is_operator("regular-client"));
 }
 
 #[test]
 fn is_operator_returns_false_when_no_operator_configured() {
     let state = test_state_with(vec![]);
-    assert!(!state.is_operator("any-client"));
+    assert!(!state.current_client_policy().is_operator("any-client"));
 }
 
 #[test]
 fn is_operator_supports_multiple_operators() {
-    let state = Arc::new(AppState {
-        client: Client::new(),
-        client_nonstreaming: Client::new(),
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec![
-            "ray".to_string(),
-            "openclaw".to_string(),
-            "claude".to_string(),
+    let state = Arc::new(
+        TestPolicy::open()
+            .operators(&["ray", "openclaw", "claude"])
+            .install(AppState {
+                client: Client::new(),
+                client_nonstreaming: Client::new(),
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
+    assert!(state.current_client_policy().is_operator("ray"));
+    assert!(state.current_client_policy().is_operator("openclaw"));
+    assert!(state.current_client_policy().is_operator("claude"));
+    assert!(!state.current_client_policy().is_operator("gastown"));
+    assert!(!state.current_client_policy().is_operator("-"));
+}
+
+/// The legacy two-account override never moves a session onto an account
+/// that weighs 0. A spent week near its reset reads as weekly headroom
+/// (0.5 here) beside a loaded live account (0.2), which would trip the
+/// override; the spent account must still take no keyed pick.
+#[tokio::test]
+async fn legacy_override_skips_a_zero_weight_account() {
+    let state = test_state_with_strategy(
+        vec![
+            mk_endpoint("spent", "sk-ant-api-a"),
+            mk_endpoint("live", "sk-ant-api-b"),
         ],
-        ..test_state_base()
-    });
-    assert!(state.is_operator("ray"));
-    assert!(state.is_operator("openclaw"));
-    assert!(state.is_operator("claude"));
-    assert!(!state.is_operator("gastown"));
-    assert!(!state.is_operator("-"));
+        RoutingStrategy::DynamicCapacityV1,
+    );
+    let now = AppState::now_epoch();
+    set_account_utilization(&state, 0, 0.10, 1.0, now + 10_000, now + 3 * 3600).await;
+    set_account_utilization(&state, 1, 0.80, 0.30, now + 10_000, now + 4 * 86_400).await;
+    let candidates = state.routing_candidates("claude-opus-4-6", &[]).await;
+    assert_eq!(candidates[0].weight, 0.0, "the spent account weighs 0");
+    assert!(
+        affinity_headroom(&candidates[1]).0
+            < affinity_headroom(&candidates[0]).0 * LEGACY_AFFINITY_OVERRIDE_RATIO,
+        "the override's headroom test alone would move the session"
+    );
+
+    for i in 0..100 {
+        let key = format!("legacy-zero-weight-{i}");
+        assert_eq!(
+            state
+                .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
+                .await,
+            Some(1),
+            "key {key} reached the zero-weight account"
+        );
+    }
 }

@@ -16,9 +16,9 @@ pub(crate) const DEFAULT_SESSION_REGISTRY_TTL_SECS: u64 = 1800;
 /// Max sessions returned in the `/_stats` `sessions` array (highest
 /// context-window % first).
 const SESSIONS_STATS_TOP_N: usize = 50;
-/// Cap on distinct model labels in the prompt-too-long counter map (the model
+/// Cap on distinct model labels in each per-model counter map (the model
 /// string is client-controlled; overflow buckets into `_other`).
-const MAX_PROMPT_TOO_LONG_MODELS: usize = 32;
+const MAX_COUNTED_MODELS: usize = 32;
 
 /// `le` boundaries (tokens) for the live session-size distribution on
 /// `/metrics`. Dense around the 200k window edge — that's where sessions
@@ -83,8 +83,11 @@ pub(crate) fn context_window_for(model: &str, has_1m_beta: bool) -> u64 {
         let mut warned =
             lock_recovering(WARNED.get_or_init(Default::default), "unknown_model_warned");
         // Bounded like the client maps: model is client-controlled input.
-        if warned.len() < MAX_PROMPT_TOO_LONG_MODELS && warned.insert(model.to_string()) {
-            warn!(model, "unknown model family, assuming 200k context window");
+        if warned.len() < MAX_COUNTED_MODELS && warned.insert(model.to_string()) {
+            warn!(
+                model = %GoQuoted(model),
+                "unknown model family, assuming 200k context window"
+            );
         }
     }
     DEFAULT_CONTEXT_WINDOW
@@ -97,6 +100,20 @@ fn window_pct(tokens: u64, window: u64) -> f64 {
         return 0.0;
     }
     (tokens as f64 / window as f64 * 1000.0).round() / 10.0
+}
+
+/// Count one event for `model` in a per-model counter map. At most
+/// `MAX_COUNTED_MODELS` labels; later models count under `_other`, which
+/// `escape_sentinel` keeps any model's own label off.
+fn count_by_model(counts: &Mutex<HashMap<String, u64>>, name: &'static str, model: &str) {
+    let mut counts = lock_recovering(counts, name);
+    let model_label = escape_sentinel(model, &["other"]);
+    let label = if counts.len() < MAX_COUNTED_MODELS || counts.contains_key(&model_label) {
+        model_label
+    } else {
+        "_other".to_owned()
+    };
+    *counts.entry(label).or_insert(0) += 1;
 }
 
 /// If `body` is the Anthropic "prompt is too long" 400 shape, return its
@@ -188,27 +205,30 @@ impl AppState {
         affinity_key: Option<&str>,
         message: &str,
     ) {
-        {
-            let mut counts = lock_recovering(&self.prompt_too_long, "prompt_too_long");
-            let model_label = escape_sentinel(model, &["other"]);
-            let label =
-                if counts.len() < MAX_PROMPT_TOO_LONG_MODELS || counts.contains_key(&model_label) {
-                    model_label
-                } else {
-                    "_other".to_owned()
-                };
-            *counts.entry(label).or_insert(0) += 1;
-        }
+        count_by_model(&self.prompt_too_long, "prompt_too_long", model);
         let (observed, max) = parse_prompt_too_long(message)
             .map(|(o, m)| (Some(o), Some(m)))
             .unwrap_or((None, None));
         warn!(
             req_id,
-            model,
+            model = %GoQuoted(model),
             session = affinity_key.map(session_label).as_deref().unwrap_or("-"),
             observed_tokens = observed,
             max_tokens = max,
             "prompt too long"
+        );
+    }
+
+    /// Count + WARN a request re-sent without `speed` because its model
+    /// rejects the field (LAB-4190), keyed on the requested model. The
+    /// request is served; this is the trace that a caller still sends
+    /// `speed` to a model without speed support.
+    pub(crate) fn note_speed_unsupported(&self, req_id: &str, model: &str) {
+        count_by_model(&self.speed_unsupported, "speed_unsupported", model);
+        warn!(
+            req_id,
+            model = %GoQuoted(model),
+            "model does not support `speed`: re-sending without it to the same account"
         );
     }
 
@@ -260,14 +280,18 @@ impl AppState {
     /// context-window % desc, capped to `SESSIONS_STATS_TOP_N`. Raw IPs and
     /// session ids never leave the registry — the label is a hash of the
     /// affinity key and agent/session ids are truncated to 8 chars.
-    pub(crate) fn sessions_snapshot(&self, now: u64) -> Vec<serde_json::Value> {
+    pub(crate) fn sessions_snapshot(
+        &self,
+        policy: &ClientPolicy,
+        now: u64,
+    ) -> Vec<serde_json::Value> {
         let mut rows: Vec<(f64, serde_json::Value)> = {
             let map = self.lock_sessions();
             map.iter()
                 .filter(|(_, e)| now.saturating_sub(e.last_seen) <= self.session_registry_ttl_secs)
                 .map(|(key, e)| {
                     let pct = window_pct(e.last_prompt_tokens, e.context_window);
-                    let client_id = if self.is_operator(&e.client_id) {
+                    let client_id = if policy.is_operator(&e.client_id) {
                         "_operator"
                     } else {
                         &e.client_id
@@ -334,7 +358,7 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         account,
         input = usage.input_tokens,
         output = usage.output_tokens,
@@ -342,6 +366,41 @@ fn log_usage(req_id: &str, client_id: &str, model: &str, account: &str, usage: &
         cache_write = usage.cache_creation_input_tokens,
         "usage"
     );
+}
+
+/// Claude Code's gateway hint headers, sent when the client sets
+/// `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. They say what kind of call this is
+/// (main loop, subagent, compaction, ...), so a cache-write spike can be put
+/// down to compaction or subagent fan-out instead of routing scatter. Each is
+/// `"-"` when absent. They are caller-controlled header values, logged as
+/// plain `&str` fields under the rule on `GoQuoted`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientHints {
+    pub(crate) request_class: String,
+    pub(crate) agent_type: String,
+    pub(crate) compaction: String,
+    pub(crate) context_compacted: String,
+    pub(crate) prompt_id: String,
+}
+
+impl ClientHints {
+    pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        };
+        Self {
+            request_class: get("x-claude-code-request-class"),
+            agent_type: get("x-claude-code-agent-type"),
+            compaction: get("x-claude-code-compaction"),
+            context_compacted: get("x-claude-code-context-compacted"),
+            prompt_id: get("x-claude-code-prompt-id"),
+        }
+    }
 }
 
 /// Routing/utilization snapshot captured when upstream response headers
@@ -356,13 +415,17 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
+        /// The account's shared overage flag. Billing reads
+        /// `served_on_overage`, which the log line also carries.
         overage: bool,
+        served_on_overage: bool,
         pin: &'static str,
         total: u64,
         /// Content fingerprint (12 hex, `content_fingerprints`) joining this
         /// line to the DEBUG `fingerprint` line by req_id; `"-"` when the
         /// request body was unparseable.
         fp: String,
+        hints: ClientHints,
     },
     OpenaiCompat {
         client_ver: String,
@@ -370,16 +433,77 @@ pub(crate) enum ProxiedCtx {
         util_5h: String,
         util_7d: String,
         constraint: &'static str,
+        served_on_overage: bool,
         pin: &'static str,
         stream: bool,
     },
+}
+
+impl ProxiedCtx {
+    /// Whether THIS response carried `overage-in-use: true` (LAB-8496).
+    fn served_on_overage(&self) -> bool {
+        match self {
+            Self::Anthropic {
+                served_on_overage, ..
+            }
+            | Self::OpenaiCompat {
+                served_on_overage, ..
+            } => *served_on_overage,
+        }
+    }
+}
+
+/// Longest `err` on a `proxied` line, in characters, the cut's `…` included.
+const MAX_UPSTREAM_ERR_CHARS: usize = 200;
+
+/// The upstream's own reason for a 4xx, for the `proxied` line: without it
+/// the line says `status=400` and nothing about why, and a client whose
+/// request bodies the proxy never sees cannot be told what it got wrong.
+/// Both values are upstream text, so each is bounded.
+pub(crate) struct UpstreamError {
+    err_type: String,
+    message: String,
+}
+
+impl UpstreamError {
+    /// `error.type` and `error.message` of an Anthropic error envelope
+    /// (`{"type":"error","error":{"type":…,"message":…}}`) answering with a
+    /// 4xx; `None` for any other status or body. `err_type` is capped by
+    /// `truncate_label`, and a message longer than `MAX_UPSTREAM_ERR_CHARS`
+    /// keeps one character fewer plus a `…`. Both are logged with `GoQuoted`,
+    /// which escapes their control characters.
+    pub(crate) fn from_body(status: u16, body: &serde_json::Value) -> Option<Self> {
+        if !(400..500).contains(&status) || body.get("type")?.as_str()? != "error" {
+            return None;
+        }
+        let err_type = body.pointer("/error/type")?.as_str()?;
+        let message = body.pointer("/error/message")?.as_str()?;
+        let mut chars = message.chars();
+        let mut err: String = chars.by_ref().take(MAX_UPSTREAM_ERR_CHARS).collect();
+        if chars.next().is_some() {
+            err.pop();
+            err.push('…');
+        }
+        Some(Self {
+            err_type: truncate_label(err_type),
+            message: err,
+        })
+    }
 }
 
 /// Emit the single per-request INFO line merging routing context with token
 /// usage. Usage fields are simply zero when nothing was extracted (error
 /// response, client disconnect, upstream failure) — still exactly one line,
 /// still carrying req_id/account/status (AC4), so no separate branch is
-/// needed for the no-usage case.
+/// needed for the no-usage case. `err_type` / `err` are `"-"` unless the
+/// upstream named its reason for a 4xx. Every caller- or upstream-fed field
+/// follows the rule on `GoQuoted`: `model`, `err_type` and `err` are
+/// `%GoQuoted(..)`, and the header-fed `client_id`, `ver`, `agent`, `session`
+/// and hints are Debug. Those header-fed values are logged through
+/// `truncate_label`, so no header length can carry the line past the log
+/// sink's `MAX_LINE_BYTES` cut and drop the token counts that end it. Routing,
+/// the session registry and budgets key on the whole values; only the log
+/// clips them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn log_proxied(
     req_id: &str,
@@ -392,7 +516,11 @@ pub(crate) fn log_proxied(
     status_code: u16,
     ctx: &ProxiedCtx,
     usage: &TokenUsage,
+    upstream_err: Option<&UpstreamError>,
 ) {
+    let (err_type, err) =
+        upstream_err.map_or(("-", "-"), |e| (e.err_type.as_str(), e.message.as_str()));
+    let [client_id, agent, session] = [client_id, agent, session].map(truncate_label);
     match ctx {
         ProxiedCtx::Anthropic {
             client_ver,
@@ -401,28 +529,38 @@ pub(crate) fn log_proxied(
             util_7d,
             constraint,
             overage,
+            served_on_overage,
             pin,
             total,
             fp,
+            hints,
         } => {
             info!(
                 req_id,
                 client = %client_ip,
-                client_id,
-                ver = %client_ver,
-                agent,
-                session,
-                model,
+                client_id = client_id.as_str(),
+                ver = ?truncate_label(client_ver),
+                agent = agent.as_str(),
+                session = session.as_str(),
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
                 constraint = *constraint,
                 overage,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 total,
                 fp = %fp,
+                request_class = truncate_label(&hints.request_class).as_str(),
+                agent_type = truncate_label(&hints.agent_type).as_str(),
+                compaction = truncate_label(&hints.compaction).as_str(),
+                context_compacted = truncate_label(&hints.context_compacted).as_str(),
+                prompt_id = truncate_label(&hints.prompt_id).as_str(),
                 input = usage.input_tokens,
                 output = usage.output_tokens,
                 cached = usage.cache_read_input_tokens,
@@ -436,23 +574,27 @@ pub(crate) fn log_proxied(
             util_5h,
             util_7d,
             constraint,
+            served_on_overage,
             pin,
             stream,
         } => {
             info!(
                 req_id,
                 client = %client_ip,
-                client_id,
-                ver = %client_ver,
-                agent,
-                session,
-                model,
+                client_id = client_id.as_str(),
+                ver = ?truncate_label(client_ver),
+                agent = agent.as_str(),
+                session = session.as_str(),
+                model = %GoQuoted(model),
                 account,
                 status = status_code,
+                err_type = %GoQuoted(err_type),
+                err = %GoQuoted(err),
                 utilization = %utilization,
                 util_5h = %util_5h,
                 util_7d = %util_7d,
                 constraint = *constraint,
+                served_overage = *served_on_overage,
                 pin = *pin,
                 openai_compat = true,
                 stream,
@@ -468,12 +610,17 @@ pub(crate) fn log_proxied(
 
 /// Finalize a streaming response: extract usage, log, and shadow log.
 /// Shared by proxy_handler and openai_chat_handler.
+///
+/// Usage the upstream never reported is charged to the client's budget by
+/// `fallback` (LAB-7593), unless the upstream errored before the stream began.
+/// Only the budget: the token counters and log lines keep what the upstream
+/// reported.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_stream(
     state: &AppState,
     ep: &Endpoint,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     model: &str,
     acct_name: &str,
     client_ip: &str,
@@ -482,6 +629,7 @@ pub(crate) async fn finalize_stream(
     status_code: u16,
     ctx: ProxiedCtx,
     mut scanner: SseUsageScanner,
+    fallback: StreamFallbackCharge,
     request_start: std::time::Instant,
     client_disconnected: bool,
     upstream_error: bool,
@@ -489,13 +637,40 @@ pub(crate) async fn finalize_stream(
     session_key: Option<&str>,
     context_window: u64,
 ) {
+    let client_id = caller.name();
     scanner.finish();
     let usage = &scanner.usage;
     // Response-derived model (message_start) preferred; request model fallback.
     let usage_model = scanner.model.as_deref().unwrap_or(model);
     let elapsed_ms = request_start.elapsed().as_millis() as u64;
+    let reason = if upstream_error {
+        "upstream_error"
+    } else if client_disconnected {
+        "client_disconnect"
+    } else {
+        "no_usage_event"
+    };
+    // An upstream that errored before the stream began generated nothing (an
+    // in-band `overloaded_error` answering a 200 looks like this), so there
+    // is nothing to charge for. Keyed on the stream beginning, not on a
+    // readable input count: a `message_start` without one can still be
+    // followed by content.
+    let (charged_input, charged_output) = if upstream_error && !scanner.began {
+        (0, 0)
+    } else {
+        fallback.unreported(&scanner)
+    };
+    let charged = charged_input.saturating_add(charged_output);
+    // One budget write for reported usage and estimate together: two writes
+    // each key their own UTC day, so a request straddling midnight would
+    // book the estimate against the next day (LAB-7593 review).
+    state
+        .record_usage_charging(ep, caller, usage_model, usage, charged)
+        .await;
+    if ctx.served_on_overage() {
+        state.record_overage_usage(client_id, usage_model, usage);
+    }
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage_model, usage).await;
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -510,28 +685,36 @@ pub(crate) async fn finalize_stream(
             );
         }
     } else {
-        let reason = if upstream_error {
-            "upstream_error"
-        } else if client_disconnected {
-            "client_disconnect"
-        } else {
-            "no_usage_event"
-        };
         // Log structural metadata only — SSE payloads contain user content.
+        // The event names are upstream text, so they are joined into one
+        // `GoQuoted` value: Debug of the list opens with `[`, not a quote.
         let truncated = scanner.event_count > 5;
         warn!(
             req_id,
             client_id,
-            model,
+            model = %GoQuoted(model),
             account = acct_name,
             status = status_code,
             reason,
             elapsed_ms,
             sse_bytes = scanner.bytes_seen,
             sse_event_count = scanner.event_count,
-            sse_events = ?scanner.event_preview,
+            sse_events = %GoQuoted(&scanner.event_preview.join(",")),
             truncated,
             "stream_end_no_usage"
+        );
+    }
+    if charged > 0 {
+        warn!(
+            req_id,
+            client_id,
+            model = %GoQuoted(model),
+            account = acct_name,
+            status = status_code,
+            reason,
+            charged_input,
+            charged_output,
+            "stream_usage_estimated"
         );
     }
     // Single terminal line for this request (LAB-3214), routing context
@@ -550,6 +733,7 @@ pub(crate) async fn finalize_stream(
         status_code,
         &ctx,
         usage,
+        None,
     );
     let mut log = serde_json::json!({
         "ts": AppState::now_epoch(),
@@ -582,7 +766,7 @@ pub(crate) async fn finalize_non_stream(
     state: &AppState,
     ep: &Endpoint,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     model: &str,
     response_model: Option<&str>,
     acct_name: &str,
@@ -596,10 +780,15 @@ pub(crate) async fn finalize_non_stream(
     session_key: Option<&str>,
     context_window: u64,
     ctx: Option<ProxiedCtx>,
+    upstream_err: Option<&UpstreamError>,
 ) {
+    let client_id = caller.name();
     let usage_model = response_model.unwrap_or(model);
+    if ctx.as_ref().is_some_and(ProxiedCtx::served_on_overage) {
+        state.record_overage_usage(client_id, usage_model, usage);
+    }
     if !usage.is_empty() {
-        state.record_usage(ep, client_id, usage_model, usage).await;
+        state.record_usage(ep, caller, usage_model, usage).await;
         if let Some(key) = session_key {
             state.record_session(
                 key,
@@ -630,6 +819,7 @@ pub(crate) async fn finalize_non_stream(
             status_code,
             c,
             usage,
+            upstream_err,
         ),
         None => {
             if !usage.is_empty() {
@@ -659,14 +849,75 @@ pub(crate) async fn finalize_non_stream(
     state.shadow_log(log);
 }
 
+/// Add `usage` to a per-(client, model) map, bounding its label set: the
+/// model is truncated (empty → `unknown`), and once the map holds
+/// `MAX_CLIENT_MODEL_LABELS` pairs every new pair lumps into ONE global
+/// ("_other", "_other") bucket — a hard bound of the cap + 1. A per-client
+/// ("<client>", "_other") key would let x-client-id rotation (legacy auth
+/// modes) grow the map without bound (LAB-2330).
+fn add_client_model_usage(
+    map: &mut HashMap<(String, String), [u64; 4]>,
+    client_id: &str,
+    model: &str,
+    usage: &TokenUsage,
+) {
+    let model = if model.is_empty() {
+        "unknown".to_owned()
+    } else {
+        truncate_label(model)
+    };
+    let key = (client_id.to_owned(), model);
+    let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
+        key
+    } else {
+        ("_other".to_owned(), "_other".to_owned())
+    };
+    let entry = map.entry(key).or_insert([0; 4]);
+    entry[0] += usage.input_tokens;
+    entry[1] += usage.output_tokens;
+    entry[2] += usage.cache_creation_input_tokens;
+    entry[3] += usage.cache_read_input_tokens;
+}
+
 impl AppState {
+    /// Book usage served on paid extra usage (LAB-8496) into
+    /// `anthropic_overage_token_usage_total`. Callers pass the flag read from
+    /// the serving response's own headers, never the account's shared
+    /// `RateLimitInfo`, which a concurrent response on the same account may
+    /// have overwritten.
+    fn record_overage_usage(&self, client_id: &str, model: &str, usage: &TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        add_client_model_usage(&mut self.lock_overage_usage(), client_id, model, usage);
+    }
+
     /// Record token usage for an endpoint and client. `model` feeds the
     /// per-(client, model) counter (LAB-2330): callers pass the
     /// response-derived model where available, falling back to the request
     /// model — either way it is truncated and the pair-count is capped here,
     /// so callers cannot inflate the label set.
-    async fn record_usage(&self, ep: &Endpoint, client_id: &str, model: &str, usage: &TokenUsage) {
+    async fn record_usage(&self, ep: &Endpoint, caller: &Caller, model: &str, usage: &TokenUsage) {
+        self.record_usage_charging(ep, caller, model, usage, 0)
+            .await;
+    }
+
+    /// `record_usage`, plus `estimated` tokens charged to the client's budget
+    /// only (LAB-7593): usage a stream never reported. Booked in the same
+    /// budget write as the reported usage, so both land on one UTC day.
+    async fn record_usage_charging(
+        &self,
+        ep: &Endpoint,
+        caller: &Caller,
+        model: &str,
+        usage: &TokenUsage,
+        estimated: u64,
+    ) {
+        let client_id = caller.name();
         if usage.is_empty() {
+            if client_id != "-" {
+                self.record_budget_usage(caller, estimated).await;
+            }
             return;
         }
         ep.input_tokens
@@ -700,32 +951,10 @@ impl AppState {
             // exists when the upstream returned usage, so the model string was
             // accepted upstream; truncation + the pair cap bound the label set
             // regardless.
-            let model = if model.is_empty() {
-                "unknown".to_owned()
-            } else {
-                truncate_label(model)
-            };
-            {
-                let mut map = self.lock_client_model_usage();
-                let key = (client_id.to_owned(), model);
-                let key = if map.len() < MAX_CLIENT_MODEL_LABELS || map.contains_key(&key) {
-                    key
-                } else {
-                    // Map full and this pair is new: lump into ONE global
-                    // overflow bucket — hard bound of MAX_CLIENT_MODEL_LABELS
-                    // + 1 entries. A per-client ("<client>", "_other") key
-                    // would let x-client-id rotation (legacy auth modes) grow
-                    // the map without bound (LAB-2330).
-                    ("_other".to_owned(), "_other".to_owned())
-                };
-                let entry = map.entry(key).or_insert([0; 4]);
-                entry[0] += usage.input_tokens;
-                entry[1] += usage.output_tokens;
-                entry[2] += usage.cache_creation_input_tokens;
-                entry[3] += usage.cache_read_input_tokens;
-            }
+            add_client_model_usage(&mut self.lock_client_model_usage(), client_id, model, usage);
             // Budget accounting
-            self.record_budget_usage(client_id, total).await;
+            self.record_budget_usage(caller, total.saturating_add(estimated))
+                .await;
         }
     }
 
@@ -749,23 +978,22 @@ impl AppState {
 
     /// Write a shadow log entry (fire-and-forget).
     fn shadow_log(&self, entry: serde_json::Value) {
-        if let Some(ref tx) = self.shadow_log_tx {
-            if let Ok(line) = serde_json::to_string(&entry) {
-                if tx.try_send(line).is_err() {
-                    let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                    // Rate-limit warning: log at powers of 2 to avoid log spam
-                    if dropped.is_power_of_two() {
-                        warn!(
-                            total_dropped = dropped,
-                            "shadow log channel full, entries being dropped"
-                        );
-                    }
-                }
+        if let Some(ref tx) = self.shadow_log_tx
+            && let Ok(line) = serde_json::to_string(&entry)
+            && tx.try_send(line).is_err()
+        {
+            let dropped = self.shadow_log_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // Rate-limit warning: log at powers of 2 to avoid log spam
+            if dropped.is_power_of_two() {
+                warn!(
+                    total_dropped = dropped,
+                    "shadow log channel full, entries being dropped"
+                );
             }
         }
     }
 
-    /// Check if a client is within their daily token budget. Returns Ok(()), or Err with the
+    /// Check if the caller is within its daily token budget. Returns Ok(()), or Err with the
     /// seconds until the UTC day rolls over (1..=86400) — the budget's real reset time, derived
     /// from the same clock read that keys the day, so a denial can never carry the next day's hint.
     /// When Redis is available, a present counter is authoritative; an absent key or a read
@@ -773,11 +1001,11 @@ impl AppState {
     /// failed INCRBY, or a poisoned key record_budget_usage deliberately deleted (LAB-1962).
     /// The poison self-heal DEL is only safe because of this floor: relaxing the absent-key
     /// path back to an authoritative allow would reopen the enforcement bypass.
-    pub(crate) async fn check_budget(&self, client_id: &str) -> Result<(), u64> {
-        let limit = match self.client_budgets.get(client_id) {
-            Some(&limit) => limit,
-            None => return Ok(()), // no budget configured = unlimited
+    pub(crate) async fn check_budget(&self, caller: &Caller) -> Result<(), u64> {
+        let Some(limit) = caller.budget() else {
+            return Ok(()); // no budget configured = unlimited
         };
+        let client_id = caller.name();
         let now = Self::now_epoch();
         let today = now / 86400;
         let retry_after = 86400 - (now % 86400);
@@ -808,10 +1036,11 @@ impl AppState {
         }
 
         // Local fallback
-        if let Some(&(day, used)) = self.lock_budget_usage().get(client_id) {
-            if day == today && used >= limit {
-                return Err(retry_after);
-            }
+        if let Some(&(day, used)) = self.lock_budget_usage().get(client_id)
+            && day == today
+            && used >= limit
+        {
+            return Err(retry_after);
         }
         Ok(())
     }
@@ -860,7 +1089,8 @@ impl AppState {
         details.starts_with("WRONGTYPE") || details.contains("not an integer")
     }
 
-    /// Record tokens against a client's daily budget.
+    /// Record tokens against the caller's daily budget, if its snapshot gives
+    /// it one.
     /// Updates local state synchronously; awaits Redis INCRBY inline to prevent TOCTOU races.
     /// On a transport-level INCRBY failure the increment is lost from the shared counter —
     /// the key is left untouched so one replica's failed write never erases fleet-wide
@@ -868,10 +1098,11 @@ impl AppState {
     /// floor (LAB-1962). A server-reported poisoned value (WRONGTYPE / non-integer) is the
     /// one case that still deletes: the key is unreadable garbage for its full TTL and
     /// deleting it lets the shared counter rebuild.
-    pub(crate) async fn record_budget_usage(&self, client_id: &str, tokens: u64) {
-        if tokens == 0 || !self.client_budgets.contains_key(client_id) {
+    pub(crate) async fn record_budget_usage(&self, caller: &Caller, tokens: u64) {
+        if tokens == 0 || caller.budget().is_none() {
             return;
         }
+        let client_id = caller.name();
         let today = Self::now_epoch() / 86400;
 
         // Always update local state (for stats + fallback). Scoped so the
@@ -987,61 +1218,14 @@ impl AppState {
         }
     }
 
-    /// Check if client_id is an operator.
-    pub(crate) fn is_operator(&self, client_id: &str) -> bool {
-        self.operators.iter().any(|op| op == client_id)
-    }
-
-    /// Check if client_id is a read-only principal (LAB-4395): admitted to
-    /// `/_stats` and `/metrics`, refused on every proxied surface.
-    pub(crate) fn is_admin_reader(&self, client_id: &str) -> bool {
-        self.admin_readers.iter().any(|r| r == client_id)
-    }
-
-    /// Refuse a read-only principal on a proxied surface (LAB-4395).
-    ///
-    /// Split out of `pre_request_gate` so both proxied handlers can run it
-    /// BEFORE `reserve_request_body` and the body read, and called from the
-    /// gate as well so a handler that reaches the gate without the early call
-    /// still fails closed. One predicate, one response, three call sites — the
-    /// duplication that matters is of the DECISION, not of the call.
-    ///
-    /// The early placement is the point. Every other gate denial refuses a
-    /// request the caller had some reason to send, so it is refused after
-    /// admission like any other. This one is identity-only: it needs
-    /// `client_id` and nothing else, and the principal has no legitimate
-    /// reason to send a proxied body at all. Refusing it after admission let
-    /// six reader connections declaring large `content-length`s — one byte
-    /// sent each — pin the whole shared in-flight body budget and 503 every
-    /// other client, then do it again after each read timeout (GH #199,
-    /// reproduced by adversarial review 2026-09-21). A role whose premise is
-    /// "this credential cannot harm the pool" must not hold pool admission
-    /// capacity while being told it has no authority.
-    pub(crate) fn deny_admin_reader(&self, req_id: &str, client_id: &str) -> Option<Box<Response>> {
-        if !self.is_admin_reader(client_id) {
-            return None;
-        }
-        warn!(
-            req_id,
-            client_id = %client_id,
-            "rejected: read-only principal has no proxy authority"
-        );
-        Some(Box::new(proxy_error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            "forbidden: read-only principal — /_stats and /metrics only",
-        )))
-    }
-
-    /// Check if all model-compatible endpoints exceed this client's utilization limit.
+    /// Check if all model-compatible endpoints exceed the caller's utilization limit.
     /// Returns Ok(()) if no limit configured or at least one endpoint is below the limit.
     /// Returns Err(retry_after_secs) if all endpoints exceed the limit.
     /// OpenAI endpoints carry no rate-limit data and are skipped — they neither
     /// gate nor relieve the limit (mirrors `is_emergency_brake_active`).
-    async fn check_utilization_limit(&self, client_id: &str, model: &str) -> Result<(), u64> {
-        let limit = match self.client_utilization_limits.get(client_id) {
-            Some(&limit) => limit,
-            None => return Ok(()), // no limit configured
+    async fn check_utilization_limit(&self, caller: &Caller, model: &str) -> Result<(), u64> {
+        let Some(limit) = caller.utilization_limit() else {
+            return Ok(()); // no limit configured
         };
 
         let now_epoch = Self::now_epoch();
@@ -1077,11 +1261,11 @@ impl AppState {
                     .or(info.reset_7d),
                 _ => info.reset_5h.or(info.reset_7d), // unified best-effort
             };
-            if let Some(r) = reset_epoch {
-                if r > now_epoch {
-                    let secs = r - now_epoch;
-                    nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
-                }
+            if let Some(r) = reset_epoch
+                && r > now_epoch
+            {
+                let secs = r - now_epoch;
+                nearest_reset = Some(nearest_reset.map_or(secs, |cur: u64| cur.min(secs)));
             }
         }
 
@@ -1133,20 +1317,17 @@ impl AppState {
     pub(crate) async fn pre_request_gate(
         &self,
         req_id: &str,
-        client_id: &str,
+        caller: &Caller,
         model: &str,
     ) -> Result<(), Box<Response>> {
+        let client_id = caller.name();
         // Read-only principal (LAB-4395). Both proxied handlers already ran
         // this before admitting a body; repeating it here is the backstop for
-        // any future caller of the gate that does not. Checked BEFORE the
-        // operator bypass on purpose — the two roles are disjoint by boot
-        // validation, so the order cannot matter today, but if that check is
-        // ever weakened this arm makes the wider grant lose to the denial
-        // rather than win.
-        if let Some(resp) = self.deny_admin_reader(req_id, client_id) {
+        // any future caller of the gate that does not.
+        if let Some(resp) = deny_admin_reader(req_id, caller) {
             return Err(resp);
         }
-        if self.is_operator(client_id) {
+        if caller.principal.role == Role::Operator {
             return Ok(()); // operator bypasses everything
         }
 
@@ -1155,8 +1336,8 @@ impl AppState {
         //    must not be reported as 429 "try again later", which is what the
         //    three checks below all mean. Reached from both proxy_handler and
         //    openai_chat_handler, so one placement covers both surfaces.
-        if !self.client_allows_model(client_id, model) {
-            self.note_model_denied(client_id, model);
+        if !caller.allows_model(model) {
+            self.note_model_denied(caller, model);
             // `model` is caller-controlled and echoed back — truncate it here
             // too, so a 25 MB model field cannot become a 25 MB error body.
             let msg = if model.is_empty() {
@@ -1180,11 +1361,11 @@ impl AppState {
         let budget = if client_id == "-" {
             Ok(())
         } else {
-            self.check_budget(client_id).await
+            self.check_budget(caller).await
         };
         if let Err(retry_after) = budget {
             self.note_client_rejection(client_id, "budget");
-            warn!(client_id = %client_id, retry_after, "rejected: daily token budget exceeded");
+            warn!(client_id = ?client_id, retry_after, "rejected: daily token budget exceeded");
             let mut resp = proxy_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
@@ -1196,10 +1377,10 @@ impl AppState {
         }
 
         // 2. Utilization limit (new)
-        if let Err(retry_after) = self.check_utilization_limit(client_id, model).await {
+        if let Err(retry_after) = self.check_utilization_limit(caller, model).await {
             self.note_client_rejection(client_id, "utilization");
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 retry_after = retry_after,
                 "rejected: utilization limit exceeded"
             );
@@ -1217,7 +1398,7 @@ impl AppState {
         if self.is_emergency_brake_active().await {
             self.note_client_rejection(client_id, "brake");
             warn!(
-                client_id = %client_id,
+                client_id = ?client_id,
                 "rejected: emergency brake active"
             );
             // No `retry-after`: the brake is the same condition as
@@ -1233,6 +1414,42 @@ impl AppState {
 
         Ok(())
     }
+}
+
+/// Refuse a read-only principal on a proxied surface (LAB-4395): it is
+/// admitted to `/_stats` and `/metrics` and to nothing else.
+///
+/// Split out of `pre_request_gate` so both proxied handlers can run it
+/// BEFORE `reserve_request_body` and the body read, and called from the
+/// gate as well so a handler that reaches the gate without the early call
+/// still fails closed. One predicate, one response, three call sites — the
+/// duplication that matters is of the DECISION, not of the call.
+///
+/// The early placement is the point. Every other gate denial refuses a
+/// request the caller had some reason to send, so it is refused after
+/// admission like any other. This one is identity-only: it needs the
+/// caller's role and nothing else, and the principal has no legitimate
+/// reason to send a proxied body at all. Refusing it after admission let
+/// six reader connections declaring large `content-length`s — one byte
+/// sent each — pin the whole shared in-flight body budget and 503 every
+/// other client, then do it again after each read timeout (GH #199,
+/// reproduced by adversarial review 2026-09-21). A role whose premise is
+/// "this credential cannot harm the pool" must not hold pool admission
+/// capacity while being told it has no authority.
+pub(crate) fn deny_admin_reader(req_id: &str, caller: &Caller) -> Option<Box<Response>> {
+    if caller.principal.role != Role::Reader {
+        return None;
+    }
+    warn!(
+        req_id,
+        client_id = ?caller.name(),
+        "rejected: read-only principal has no proxy authority"
+    );
+    Some(Box::new(proxy_error_response(
+        StatusCode::FORBIDDEN,
+        "permission_error",
+        "forbidden: read-only principal — /_stats and /metrics only",
+    )))
 }
 
 #[cfg(test)]

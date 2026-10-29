@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{detector_cfg, spawn_mock_detector, MockDetectorMode, MOCK_INJECTION};
+use crate::test_support::{MOCK_INJECTION, MockDetectorMode, detector_cfg, spawn_mock_detector};
 
 fn detector(url: &str, tweak: impl FnOnce(&mut DetectorConfig)) -> Detector {
     let mut cfg = detector_cfg(url);
@@ -219,20 +219,14 @@ async fn many_chunks_split_into_concurrent_batches_under_one_deadline() {
         c.timeout_ms = 2000;
     });
     let text = "b".repeat(crate::guard::MAX_SCAN_BYTES);
-    let started = Instant::now();
     let out = d.classify(Lane::Enforce, "c", &text).await;
-    let elapsed = started.elapsed();
     assert_eq!(out.unavailable, None);
     assert!(mock.calls() > 1, "more than one batch was needed");
+    // The mock's own count proves the overlap; a wall-clock bound would also
+    // measure how busy the test host is.
     assert!(
         mock.max_in_flight.load(Ordering::SeqCst) > 1,
         "batches must be in flight together"
-    );
-    assert!(
-        elapsed < Duration::from_millis(300) * 3,
-        "{} serial batches would take {}ms; took {elapsed:?}",
-        mock.calls(),
-        mock.calls() * 300
     );
 }
 
@@ -766,9 +760,10 @@ async fn a_tripped_shadow_lane_leaves_the_enforce_lane_alone() {
         d.admit(Lane::Shadow, Instant::now()),
         d.admit(Lane::Shadow, Instant::now()),
     ];
-    assert!(held
-        .iter()
-        .all(|p| matches!(p, Err(Unavailable::CircuitOpen))));
+    assert!(
+        held.iter()
+            .all(|p| matches!(p, Err(Unavailable::CircuitOpen)))
+    );
     let _a = d
         .admit(Lane::Enforce, Instant::now())
         .expect("enforce slot 1");

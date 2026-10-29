@@ -835,18 +835,12 @@ async fn gateway_echo_of_client_key_does_not_negative_cache() {
     }
 }
 
-type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
-
 /// Passthrough endpoint returning `HEAD_404_MODEL` at priority 0, a healthy
 /// account at priority 1: without the passthrough veto the 404 would mark
 /// `pt` and rotate onto `healthy`.
 async fn passthrough_404_then_healthy() -> (Arc<AppState>, SocketAddr, Hits, Hits) {
-    let (pt_url, pt_hits) = spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
-    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
-    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
-    healthy.priority = 1;
-    let state = test_state_with(vec![mk_endpoint_at("pt", "passthrough", &pt_url), healthy]);
-    assert!(state.endpoints[0].passthrough);
+    let (endpoints, pt_hits, ok_hits) = first_then_healthy(PASSTHROUGH, HEAD_404_MODEL).await;
+    let state = test_state_with(endpoints);
     let addr = serve(build_router(state.clone())).await;
     (state, addr, pt_hits, ok_hits)
 }
@@ -1019,5 +1013,180 @@ async fn model_404_naming_another_model_does_not_negative_cache() {
     assert!(
         state.unsupported_models.lock().unwrap().is_empty(),
         "the requested model must not be negative-cached"
+    );
+}
+
+// ── Exhaustion 429 that names a model-not-found rejection ─────────────
+
+/// One account answers the model 404 and the other is hard-limited, so the
+/// pool exhausts as the retryable 429 (the account that is only cooling may
+/// serve the model). Distinct names let the tests check that no account
+/// reaches the client's body.
+async fn rejected_plus_rate_limited_pool() -> SocketAddr {
+    let (reject_url, _hits) =
+        spawn_status_then_ok_upstream(usize::MAX, HEAD_404_MODEL, b"{}").await;
+    let state = test_state_with(vec![
+        mk_endpoint_at("acct-reject-q7x", "sk-ant-api-r", &reject_url),
+        mk_endpoint("acct-limited-z9w", "sk-ant-api-l"),
+    ]);
+    state.endpoints[1]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() + Duration::from_secs(60));
+    serve(build_router(state)).await
+}
+
+/// Status, type and headers are today's exhaustion 429; only the message
+/// changes. The rate-limited WARN for this request carries its client and
+/// model, the client quoted: callers pass a self-asserted `x-client-id` that
+/// tries to forge a second `client_id=` field, which must stay inside the one
+/// quoted value.
+async fn assert_exhaustion_names_model(resp: reqwest::Response, client_id: &str) {
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "a rejection plus a rate-limited rest must stay retryable"
+    );
+    assert!(
+        resp.headers().get("retry-after").is_none(),
+        "rate-limited exhaustion must not carry retry-after"
+    );
+    let raw = resp.text().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error", "got: {body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("exhausted all endpoints")
+            && message.contains("claude-nope-1")
+            && message.contains("not found"),
+        "the message must name the model and the not-found rejection, got: {message}"
+    );
+    for name in ["acct-reject-q7x", "acct-limited-z9w"] {
+        assert!(!raw.contains(name), "account {name} leaked into: {raw}");
+    }
+
+    let output = String::from_utf8(log_capture_buf().lock().unwrap().clone()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|l| l.contains("all endpoints exhausted (rate-limited)")
+                && l.contains(&format!("client_id={client_id:?}"))
+                && l.contains(r#"model="claude-nope-1""#)),
+        "the exhaustion WARN must carry client_id and model, got:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn exhaustion_after_model_rejection_names_model_native() {
+    let _ = log_capture_buf();
+    let addr = rejected_plus_rate_limited_pool().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-client-id", "exhaustion-msg-native client_id=forged-native")
+        .body(
+            r#"{"model":"claude-nope-1","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_exhaustion_names_model(resp, "exhaustion-msg-native client_id=forged-native").await;
+}
+
+#[tokio::test]
+async fn exhaustion_after_model_rejection_names_model_openai_handler() {
+    let _ = log_capture_buf();
+    let addr = rejected_plus_rate_limited_pool().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .header(
+            "x-client-id",
+            "exhaustion-msg-openai client_id=forged-openai",
+        )
+        .body(r#"{"model":"claude-nope-1","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_exhaustion_names_model(resp, "exhaustion-msg-openai client_id=forged-openai").await;
+}
+
+/// The message stays bare unless an endpoint eligible for THIS request has
+/// rejected the model, by the rule `pool_cannot_serve` counts by: a
+/// rejection of another model, a mark on an endpoint whose `models` list
+/// excludes the model, or a mark on an OpenAI-protocol endpoint that a
+/// must-stay-fast request never reaches is no not-found answer for it.
+#[tokio::test]
+async fn exhaustion_message_stays_bare_without_an_eligible_rejection() {
+    let mut haiku_only = mk_endpoint("b", "sk-ant-api-b");
+    haiku_only.models = vec!["claude-haiku-*".to_string()];
+    let state = test_state_with(vec![
+        mk_endpoint("a", "sk-ant-api-a"),
+        haiku_only,
+        make_endpoint("g", Protocol::OpenAI),
+    ]);
+    state.note_model_unsupported("a", 0, "claude-other-1");
+    state.note_model_unsupported("b", 1, "claude-nope-1");
+    state.note_model_unsupported("g", 2, "claude-nope-1");
+    let message = |model: &'static str, fast: FastRequest| {
+        let resp = exhaustion_response(&state, false, false, "c", model, fast);
+        async move {
+            let json = parse_error_envelope(Box::new(resp)).await;
+            json["error"]["message"].as_str().unwrap().to_owned()
+        }
+    };
+    for (model, fast, why) in [
+        (
+            "claude-nope-1",
+            FastRequest::FAST,
+            "only ineligible endpoints rejected it",
+        ),
+        ("", FastRequest::STANDARD, "no model"),
+    ] {
+        assert_eq!(
+            message(model, fast).await,
+            "exhausted all endpoints",
+            "{why}"
+        );
+    }
+    assert!(
+        message("claude-nope-1", FastRequest::STANDARD)
+            .await
+            .contains("claude-nope-1"),
+        "the OpenAI endpoint is eligible for a standard request"
+    );
+    state.note_model_unsupported("a", 0, "claude-nope-1");
+    assert!(
+        message("claude-nope-1", FastRequest::FAST)
+            .await
+            .contains("claude-nope-1"),
+        "an Anthropic endpoint is eligible for a fast request"
+    );
+}
+
+/// The transient 503's WARN carries the client and model too, the client
+/// quoted so a forged field stays inside its value.
+#[test]
+fn transient_exhaustion_log_carries_client_and_model() {
+    let buf = log_capture_buf();
+    let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-a")]);
+    let resp = exhaustion_response(
+        &state,
+        true,
+        false,
+        "exhaustion-log-503 client_id=forged-503",
+        "claude-x-1",
+        FastRequest::STANDARD,
+    );
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.lines().any(
+            |l| l.contains("all endpoints transient-failed after backoff")
+                && l.contains(r#"client_id="exhaustion-log-503 client_id=forged-503""#)
+                && l.contains(r#"model="claude-x-1""#)
+        ),
+        "the transient WARN must carry client_id and model, got:\n{output}"
     );
 }

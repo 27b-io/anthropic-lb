@@ -205,10 +205,12 @@ pub(crate) const MAX_CLIENT_REJECTION_LABELS: usize = 64;
 /// generous slack.
 pub(crate) const MAX_CLIENT_MODEL_LABELS: usize = 256;
 
-/// Max chars retained from a caller-controlled string used as a metric label
-/// or echoed in an error body. The model field is bounded only by the request
-/// body cap, so an untruncated copy would be retained for the process lifetime
-/// and re-serialized on every `/metrics` scrape.
+/// Max chars retained from a caller-controlled string used as a metric label,
+/// echoed in an error body, or logged from a request header on the `proxied`
+/// line (`MAX_LOGGED_VALUE_CHARS` states that line's bound). The model field
+/// is bounded only by the request body cap, so an untruncated copy would be
+/// retained for the process lifetime and re-serialized on every `/metrics`
+/// scrape.
 pub(crate) const MAX_LABEL_CHARS: usize = 64;
 
 /// Truncate a caller-controlled string to `MAX_LABEL_CHARS`, marking that it
@@ -235,6 +237,67 @@ pub(crate) fn escape_sentinel(label: &str, stems: &[&str]) -> String {
         return format!("_{label}");
     }
     label.to_owned()
+}
+
+/// Longest value `GoQuoted` writes, in characters, before its `…`. Escaped,
+/// that is at most 10 bytes a character (an escape above U+FFFF), so three
+/// such fields come close to the log sink's `MAX_LINE_BYTES` cut, past which a
+/// line loses its later fields, the token counts among them. The whole
+/// `proxied` line stays inside it because only `model` takes this cap there:
+/// `err` is held to `MAX_UPSTREAM_ERR_CHARS`, and `err_type` and every
+/// header-fed value (`client_id`, `ver`, `agent`, `session`, the hints) to
+/// `MAX_LABEL_CHARS`. A header value escapes to at most 2 bytes a character.
+/// `a_proxied_line_at_every_cap_fits_the_sink_cut` holds both `proxied` lines,
+/// every value at its cap, to the cut.
+pub(crate) const MAX_LOGGED_VALUE_CHARS: usize = 1024;
+
+/// A log field value from the request body, the URI or an upstream, which can
+/// hold any Unicode, logged as `field = %GoQuoted(s)`. It is written in double
+/// quotes, and every character Debug would escape is escaped in a form Go's
+/// `strconv.Unquote` reads back: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, or
+/// `\UXXXXXXXX` above U+FFFF. That covers control, format and other
+/// non-printable characters (bidi controls, the U+E0000 tag block) and
+/// combining marks. Debug's own `\u{1}`, `\0` forms are not Go syntax: a
+/// logfmt reader that unquotes with Go's `strconv` rejects them and reads the
+/// value unquoted up to the next space, so a ` client_id=x` inside it parses as
+/// a second field. Every other character, `'` included, is written as is, so
+/// printable ASCII prints the same bytes as Debug. A value longer than
+/// `MAX_LOGGED_VALUE_CHARS` is cut there and marked with `…`.
+///
+/// The rule for every log field: a value from the request body, the URI or an
+/// upstream is `%GoQuoted(..)`, never `?`, bare or `%`. A request header value
+/// may use Debug (`?` or a bare `&str`), because `HeaderValue::to_str` admits
+/// only visible ASCII and tab. The message is written unquoted, so no caller-
+/// or upstream-fed text is interpolated into it.
+pub(crate) struct GoQuoted<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for GoQuoted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        f.write_char('"')?;
+        let mut chars = self.0.chars();
+        for c in chars.by_ref().take(MAX_LOGGED_VALUE_CHARS) {
+            match c {
+                '"' => f.write_str(r#"\""#)?,
+                '\\' => f.write_str(r"\\")?,
+                '\n' => f.write_str(r"\n")?,
+                '\r' => f.write_str(r"\r")?,
+                '\t' => f.write_str(r"\t")?,
+                // `char::escape_debug` writes `\'`, which Go refuses inside
+                // double quotes; a string's Debug leaves `'` raw there too.
+                '\'' => f.write_char(c)?,
+                c if c.escape_debug().len() > 1 => match u32::from(c) {
+                    v @ ..=0xffff => write!(f, r"\u{v:04x}")?,
+                    v => write!(f, r"\U{v:08x}")?,
+                },
+                c => f.write_char(c)?,
+            }
+        }
+        if chars.next().is_some() {
+            f.write_char('…')?;
+        }
+        f.write_char('"')
+    }
 }
 
 /// Cap on distinct UNRESERVED 7d claim keys per account. Keys are minted from
@@ -390,6 +453,16 @@ const MAX_429_BODY_LOG_BYTES: usize = 512;
 pub(crate) const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
     &["auth", "cookie", "token", "key", "secret", "session"];
 
+/// Whether a response was served on paid extra usage: its
+/// `anthropic-ratelimit-unified-overage-in-use` header reads `true` (any
+/// case). Absent or anything else is `false`.
+pub(crate) fn overage_in_use(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("anthropic-ratelimit-unified-overage-in-use")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
 /// True when a 429 is a transient BURST limit rather than capacity exhaustion:
 /// `x-should-retry` set, but no `retry-after` and no rate-limit headers.
 ///
@@ -397,7 +470,7 @@ pub(crate) const SENSITIVE_HEADER_SUBSTRINGS: &[&str] =
 /// (per-minute RPM / concurrency) limits to the ACCOUNT, not to a request's
 /// rate bucket, so a burst 429 is real evidence about the account even when
 /// the request asked for fast mode — which is why the fast-mode exemption in
-/// `classify_retry_status` defers to it (LAB-2675 panel finding). Shared with
+/// `classify_retry_status` defers to it (LAB-2675). Shared with
 /// `mark_hard_limited_for`, which uses it to pick the backoff ladder over the
 /// capacity cooldown, so the two can never disagree on what "burst" means.
 pub(crate) fn is_burst_429(headers: &reqwest::header::HeaderMap) -> bool {
@@ -444,7 +517,7 @@ pub(crate) async fn log_429_details(account_name: &str, resp: reqwest::Response)
     debug!(
         account = account_name,
         headers = headers_fmt.join(" | "),
-        body = body_str,
+        body = %GoQuoted(&body_str),
         "429 response details"
     );
 }
@@ -456,13 +529,9 @@ const STATUS_EMERGENCY_FLOOR: f64 = 0.95;
 
 /// Compute the budget pressure status for a response header.
 /// Returns one of "healthy", "elevated", "critical", "emergency".
-pub(crate) fn compute_pressure_status(
-    effective_util: f64,
-    client_id: &str,
-    state: &AppState,
-) -> &'static str {
+pub(crate) fn compute_pressure_status(effective_util: f64, caller: &Caller) -> &'static str {
     // Operator always sees healthy
-    if state.is_operator(client_id) {
+    if caller.principal.role == Role::Operator {
         return "healthy";
     }
 
@@ -477,15 +546,15 @@ pub(crate) fn compute_pressure_status(
     };
 
     // Upgrade status if client's utilization limit proximity exceeds 80%
-    if let Some(&limit) = state.client_utilization_limits.get(client_id) {
-        if effective_util >= limit * 0.80 {
-            status = match status {
-                "healthy" => "elevated",
-                "elevated" => "critical",
-                "critical" => "emergency",
-                _ => status,
-            };
-        }
+    if let Some(limit) = caller.utilization_limit()
+        && effective_util >= limit * 0.80
+    {
+        status = match status {
+            "healthy" => "elevated",
+            "elevated" => "critical",
+            "critical" => "emergency",
+            _ => status,
+        };
     }
 
     status
@@ -529,11 +598,16 @@ pub(crate) struct Endpoint {
 }
 
 /// Exact match with `*`-suffix wildcards. Empty pattern list, or an empty
-/// model, allows everything.
+/// model, allows everything. A non-empty list never matches a model holding a
+/// `,`: an OpenAI-compatible gateway may split it and serve every listed
+/// model, while a `*` pattern would match the whole string (LAB-6894).
+/// The empty-model allowance is safe for `Protocol::OpenAI` endpoints only
+/// because both surfaces refuse an empty or non-string model before routing
+/// to one (`request_model`).
 ///
 /// The SINGLE list-level implementation behind both model allowlists: which
 /// models an *endpoint* may serve (`Endpoint::serves_model`) and which models
-/// a *client* may request (`AppState::client_allows_model`, LAB-1083). The
+/// a *client* may request (`Caller::allows_model`, LAB-1083). The
 /// per-pattern wildcard semantics live in `suffix_wildcard_match`, shared
 /// with the beta-flag allow-list (LAB-1191) — two matchers would be two sets
 /// of wildcard semantics to keep in sync, and the divergence would show up as
@@ -542,7 +616,7 @@ pub(crate) fn model_matches(patterns: &[String], model: &str) -> bool {
     if patterns.is_empty() || model.is_empty() {
         return true;
     }
-    patterns.iter().any(|p| suffix_wildcard_match(p, model))
+    !model.contains(',') && patterns.iter().any(|p| suffix_wildcard_match(p, model))
 }
 
 impl Endpoint {
@@ -550,6 +624,30 @@ impl Endpoint {
     /// Identical to the historical `Account::serves_model` predicate.
     pub(crate) fn serves_model(&self, model: &str) -> bool {
         model_matches(&self.models, model)
+    }
+
+    /// True when `inject_account_auth` passes this endpoint's client
+    /// `anthropic-beta` flags through the allow-list: an Anthropic OAuth
+    /// account. API-key and passthrough endpoints forward the caller's betas,
+    /// and so `speed`, unfiltered.
+    pub(crate) fn filters_client_betas(&self) -> bool {
+        self.protocol == Protocol::Anthropic
+            && !self.passthrough
+            && self.token.starts_with(OAUTH_TOKEN_PREFIX)
+    }
+
+    /// True when `rate_info` describes this endpoint, so it is worth
+    /// persisting, restoring and syncing across replicas. An OpenAI endpoint
+    /// carries no Anthropic rate-limit data. A passthrough endpoint's
+    /// responses describe whichever caller sent them, so its `rate_info` is
+    /// never ingested; restored or synced data could then never be
+    /// refreshed, and would pin its routing weight indefinitely.
+    ///
+    /// Persistence drops the whole entry, not just `rate_info`, so a
+    /// passthrough endpoint's `requests_total` restarts at 0 after a restart.
+    /// That is deliberate: do not loosen this predicate to keep the counter.
+    pub(crate) fn has_own_rate_state(&self) -> bool {
+        self.protocol == Protocol::Anthropic && !self.passthrough
     }
 }
 
@@ -561,7 +659,7 @@ pub(crate) struct AppState {
     /// inter-chunk silence — kills any generation longer than 180s as
     /// "operation timed out" (LAB-718 GEO judge wedge, 2026-07-24: ~20k-token
     /// structured-output calls died 18×/hour across 9 accounts and the SDK
-    /// retried for hours). No read_timeout here; the 900s total budget is the
+    /// retried for hours). No read_timeout here; `NONSTREAMING_TOTAL_SECS` is the
     /// only cap, and the h2 keep-alive PING still evicts dead connections.
     pub(crate) client_nonstreaming: Client,
     /// Unified routing endpoints — the sole endpoint pool.
@@ -574,13 +672,18 @@ pub(crate) struct AppState {
     /// exercise breaker re-entry without a 30s sleep.
     pub(crate) transport_cooldown: Duration,
     pub(crate) state_path: PathBuf,
-    /// Legacy single shared secret. Mutually exclusive with `clients`.
-    pub(crate) proxy_key: Option<String>,
-    /// Authenticated client registry (LAB-1083). Non-empty ⇒ every request
-    /// through an authenticated entry point carries a verified principal, and
-    /// `client_id` is that principal's name rather than a client-asserted
-    /// header. Empty ⇒ legacy `proxy_key` / open behaviour.
-    pub(crate) clients: Vec<ClientConfig>,
+    /// How callers authenticate, decided once at boot by `ClientPolicy::build`.
+    /// Under `Clients` every request through an authenticated entry point
+    /// carries a verified principal, and `client_id` is that principal's name
+    /// rather than a client-asserted header (LAB-1083).
+    pub(crate) auth_mode: AuthMode,
+    /// Every per-client rule: the principal each client key resolves to (by
+    /// digest; no plaintext client key is held anywhere in this state), and
+    /// each name's model list, pins, guard policy, budget, utilization ceiling
+    /// and role. Read through `current_client_policy`, replaced whole through
+    /// `swap_client_policy`. `auth_mode` stays outside it, fixed at boot, so
+    /// no replacement can change how callers authenticate.
+    pub(crate) client_policy: std::sync::RwLock<Arc<ClientPolicy>>,
     /// LAB-3877: Tier 0 content guard — the compiled scanners plus their
     /// metrics. Built once at startup; scanned read-only per request. Present
     /// only under the `guard` feature.
@@ -610,23 +713,20 @@ pub(crate) struct AppState {
     /// global ("_other", "_other") bucket), so callers cannot inflate the
     /// label set on either axis.
     pub(crate) client_model_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
+    /// Per-(client, model) usage served on paid extra usage: the serving
+    /// response carried `overage-in-use: true` (LAB-8496). Same key, layout
+    /// and cap as `client_model_usage`, but counted independently: it also
+    /// counts anonymous (`-`) traffic, which is billed all the same, and the
+    /// two maps reach their `_other` overflow at different times.
+    pub(crate) overage_usage: Mutex<HashMap<(String, String), [u64; 4]>>,
     /// Shadow log sender (fire-and-forget JSONL appends). None = disabled.
     pub(crate) shadow_log_tx: Option<tokio::sync::mpsc::Sender<String>>,
     /// Count of shadow log entries dropped due to channel backpressure.
     pub(crate) shadow_log_dropped: AtomicU64,
-    /// Per-client daily token budgets: client_id → max tokens per day.
-    pub(crate) client_budgets: HashMap<String, u64>,
     /// Budget tracking: client_id → (epoch_day, tokens_used). Resets on new day.
     /// Process-local; with Redis it is re-seeded from the shared counter every
     /// sync tick (`fold_budget_mirror`, LAB-3217) so it survives restarts.
     pub(crate) budget_usage: Mutex<HashMap<String, (u64, u64)>>,
-    /// Per-client utilization limits: client_id → max effective utilization.
-    pub(crate) client_utilization_limits: HashMap<String, f64>,
-    /// Operator client IDs — never throttled by budgets, ceilings, or emergency brake.
-    pub(crate) operators: Vec<String>,
-    /// Read-only client IDs — `/_stats` + `/metrics` only, 403 on every `/v1`
-    /// surface. Disjoint from `operators`; the overlap is a boot error.
-    pub(crate) admin_readers: Vec<String>,
     /// Whether the emergency brake is enabled. Default: true.
     pub(crate) emergency_brake: bool,
     /// Emergency brake threshold. Default: 0.88.
@@ -678,10 +778,13 @@ pub(crate) struct AppState {
     /// Count of requests shed because the body was not fully received within
     /// `body_read_timeout`. Exposed as `anthropic_body_read_timeout_total`.
     pub(crate) body_read_timeout_total: AtomicU64,
-    /// Affinity overrides that migrated a session, indexed by `AffinityBind`
-    /// (what bound the sticky account). Exposed as
-    /// `anthropic_affinity_migrations_total{reason="loaded"|"spent"|"floored"}`.
-    pub(crate) affinity_migrations: [AtomicU64; 3],
+    /// Keyed sessions that moved to another account, indexed by
+    /// `MigrationReason`. Exposed as `anthropic_affinity_migrations_total{reason}`.
+    pub(crate) affinity_migrations: [AtomicU64; MigrationReason::ALL.len()],
+    /// The account each affinity key was last routed to on this replica, so
+    /// `affinity_migrations` counts moves rather than requests. Signal only:
+    /// routing never reads it.
+    pub(crate) affinity_last_pick: Mutex<AffinityLastPick>,
     /// Client-facing pool-exhaustion responses, indexed by `PoolExhaustion`.
     /// Exposed as `anthropic_pool_exhausted_total{kind="rate_limited"|"transient"}`.
     /// The only metric trace of the 429/503 a caller actually received when the
@@ -735,6 +838,10 @@ pub(crate) struct AppState {
     /// Upstream "prompt is too long" 400s by model (LAB-916). Exposed as
     /// `anthropic_prompt_too_long_total`; bounded via `_other` overflow.
     pub(crate) prompt_too_long: Mutex<HashMap<String, u64>>,
+    /// Requests re-sent without `speed` because the model rejects it
+    /// (LAB-4190), by requested model. Exposed as
+    /// `anthropic_speed_unsupported_total`; bounded like `prompt_too_long`.
+    pub(crate) speed_unsupported: Mutex<HashMap<String, u64>>,
     /// Upstream 429s on fast-mode requests, by account (LAB-2675). These are
     /// forwarded to the caller instead of cooling the account — fast mode has
     /// its own rate bucket — so this counter is the only operator-visible
@@ -780,6 +887,12 @@ pub(crate) struct AppState {
     /// (LAB-933). None = feature off — the no-config case is byte-identical
     /// to pre-cache behaviour (AC1).
     pub(crate) response_cache: Option<ResponseCache>,
+    /// The client store reader, when `[client_store]` is configured. Its
+    /// state feeds `/metrics`; the policy it builds is `client_policy`.
+    pub(crate) client_store: Option<Arc<ClientStore>>,
+    /// The log sink, when `[log_sink]` is configured: the tracing writer feeds
+    /// it, `/metrics` reads its counters and shutdown drains it.
+    pub(crate) log_sink: Option<Arc<LogSink>>,
 }
 
 /// RAII reservation against `AppState::inflight_body_bytes`. Holding it keeps the
@@ -830,7 +943,7 @@ impl AppState {
                     return Some(BodyReservation {
                         state: Arc::clone(self),
                         bytes,
-                    })
+                    });
                 }
                 Err(actual) => cur = actual,
             }
@@ -843,6 +956,11 @@ impl AppState {
 /// hold for the request, or a `503 + Retry-After` Response to return when the
 /// budget is exhausted (load-shedding). Shared by `proxy_handler` and
 /// `openai_chat_handler` so the two paths can't drift.
+///
+/// A request carrying Transfer-Encoding reserves the full cap, as one with no
+/// Content-Length does: TE overrides CL (RFC 9112 §6.3), and hyper keeps a CL
+/// sent before the TE line in the header map while it decodes the body as
+/// chunked, so that CL bounds nothing `read_body_bounded` buffers.
 pub(crate) fn reserve_request_body(
     state: &Arc<AppState>,
     parts: &axum::http::request::Parts,
@@ -852,6 +970,11 @@ pub(crate) fn reserve_request_body(
     let reserve_bytes = parts
         .headers
         .get(axum::http::header::CONTENT_LENGTH)
+        .filter(|_| {
+            !parts
+                .headers
+                .contains_key(axum::http::header::TRANSFER_ENCODING)
+        })
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(MAX_REQUEST_BODY_BYTES as u64)
@@ -940,8 +1063,8 @@ pub(crate) struct RoutingCandidate {
     pub(crate) gate: f64,
     pub(crate) wr: f64,
     /// Unused share of the model's weekly (7d) quota; 1.0 when unknown or
-    /// superseded by overage. Time-free — the affinity override reads this,
-    /// never `wr`/`weight` (see `affinity_headroom`).
+    /// superseded by overage. Time-free: the affinity rule reads this, never
+    /// `wr`/`weight` (see `affinity_headroom`).
     pub(crate) unused_7d: f64,
     pub(crate) weight: f64,
     /// The effective `gate` is set by an Anthropic status floor
@@ -950,6 +1073,67 @@ pub(crate) struct RoutingCandidate {
     /// routine status-floor migration logs at INFO, not WARN (LAB-3295).
     pub(crate) gate_floor_bound: bool,
     pub(crate) source: &'static str,
+}
+
+/// Bounded memory of the account each affinity key was last routed to for a
+/// model, keyed by a hash of both. Two generations bound it: when the current one
+/// fills it becomes the previous, and the old previous is dropped, so an entry
+/// outlives at least `GENERATION` newer keys and the map never holds more than
+/// twice that. A forgotten key's next request reads as its first, never as a
+/// move.
+#[derive(Default)]
+pub(crate) struct AffinityLastPick {
+    current: HashMap<u64, EndpointIdx>,
+    previous: HashMap<u64, EndpointIdx>,
+}
+
+impl AffinityLastPick {
+    /// Keys per generation: several times the distinct keys a busy replica
+    /// sees in 30 minutes.
+    pub(crate) const GENERATION: usize = 8192;
+
+    /// Record `endpoint` as the last pick for `key_hash`; return the pick it
+    /// replaces, if this map still remembers one.
+    pub(crate) fn swap(&mut self, key_hash: u64, endpoint: EndpointIdx) -> Option<EndpointIdx> {
+        let last = self
+            .current
+            .insert(key_hash, endpoint)
+            .or_else(|| self.previous.remove(&key_hash));
+        if self.current.len() >= Self::GENERATION {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        last
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
+    }
+}
+
+/// Weighted rendezvous (highest-random-weight) score of `account` for an
+/// affinity `key`: `weight / -ln(u)`, with `u` drawn uniformly from (0, 1) by
+/// hashing the pair. `-ln(u) / weight` is exponential with rate `weight`, so
+/// the highest score wins with probability `weight / total`. Each account
+/// scores the key on its own, so a weight change moves keys only onto or off
+/// that account, and removing an account moves only its own keys. Hashing the
+/// name rather than the index keeps a key's scores fixed when the candidate
+/// set changes.
+pub(crate) fn rendezvous_score(key: &str, account: &str, weight: f64) -> f64 {
+    use std::hash::Hasher;
+
+    #[allow(deprecated)]
+    let mut hasher = std::hash::SipHasher::new_with_keys(0, 0);
+    hasher.write(key.as_bytes());
+    // The separator keeps ("ab", "c") apart from ("a", "bc"); NUL can't
+    // appear in a header-derived key.
+    hasher.write(&[0]);
+    hasher.write(account.as_bytes());
+    // Top 52 bits, centred in their cell: strictly inside (0, 1), so ln(u) is
+    // finite and negative. 52, not 53: `x + 0.5` is exact only below 2^52, and
+    // a rounded-up top value would give u = 1.0 and a score of -inf.
+    let u = ((hasher.finish() >> 12) as f64 + 0.5) / (1u64 << 52) as f64;
+    weight / -u.ln()
 }
 
 pub(crate) fn stable_affinity_hash(key: &str) -> u64 {

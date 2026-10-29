@@ -10,16 +10,17 @@ use super::*;
 async fn gate_rejection_counted_by_client_and_reason() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 100u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
-    state.record_budget_usage("client-a", 200).await;
+    }));
+    state
+        .record_budget_usage(&state.caller("client-a"), 200)
+        .await;
 
     for expected in [1u64, 2] {
         let resp = state
-            .pre_request_gate("-", "client-a", "claude-sonnet-4-6")
+            .pre_request_gate("-", &state.caller("client-a"), "claude-sonnet-4-6")
             .await
             .expect_err("exhausted budget must reject");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -104,12 +105,13 @@ fn rejection_counter_truncates_client_label() {
 async fn metrics_expose_client_rejections() {
     let mut budgets = HashMap::new();
     budgets.insert("client-a".to_string(), 100u64);
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().budgets(budgets).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        client_budgets: budgets,
         ..test_state_base()
-    });
-    state.record_budget_usage("client-a", 200).await;
+    }));
+    state
+        .record_budget_usage(&state.caller("client-a"), 200)
+        .await;
     let addr = serve(build_router(state)).await;
     let c = reqwest::Client::new();
 
@@ -157,21 +159,26 @@ async fn limit_all_below() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("testclient".to_string(), 0.80);
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("a", "sk-ant-api-x"),
-            mk_endpoint("b", "sk-ant-api-y"),
-        ],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint("a", "sk-ant-api-x"),
+                    mk_endpoint("b", "sk-ant-api-y"),
+                ],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.60, 0.50, now + 10000, now + 100000).await;
-    assert!(state
-        .check_utilization_limit("testclient", "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .check_utilization_limit(&state.caller("testclient"), "")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -179,18 +186,23 @@ async fn limit_all_above() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("testclient".to_string(), 0.50);
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("a", "sk-ant-api-x"),
-            mk_endpoint("b", "sk-ant-api-y"),
-        ],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint("a", "sk-ant-api-x"),
+                    mk_endpoint("b", "sk-ant-api-y"),
+                ],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
-    let result = state.check_utilization_limit("testclient", "").await;
+    let result = state
+        .check_utilization_limit(&state.caller("testclient"), "")
+        .await;
     assert!(result.is_err(), "all above limit should return Err");
     let retry = result.unwrap_err();
     assert!(retry >= 60, "retry-after should be >= 60");
@@ -202,27 +214,37 @@ async fn limit_one_below() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("testclient".to_string(), 0.70);
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("a", "sk-ant-api-x"),
-            mk_endpoint("b", "sk-ant-api-y"),
-        ],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint("a", "sk-ant-api-x"),
+                    mk_endpoint("b", "sk-ant-api-y"),
+                ],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.90, 0.80, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.50, 0.40, now + 10000, now + 100000).await;
-    assert!(state
-        .check_utilization_limit("testclient", "")
-        .await
-        .is_ok());
+    assert!(
+        state
+            .check_utilization_limit(&state.caller("testclient"), "")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
 async fn limit_no_config() {
     let state = test_state_with(vec![mk_endpoint("a", "sk-ant-api-x")]);
-    assert!(state.check_utilization_limit("anyone", "").await.is_ok());
+    assert!(
+        state
+            .check_utilization_limit(&state.caller("anyone"), "")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -230,19 +252,27 @@ async fn limit_operator_bypass() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("ray".to_string(), 0.10); // very low limit
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        operators: vec!["ray".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .operators(&["ray"])
+            .install(AppState {
+                endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.95, 0.90, now + 10000, now + 100000).await;
     // Operator bypasses everything
-    assert!(state.is_operator("ray"));
-    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
+    assert_eq!(state.caller("ray").principal.role, Role::Operator);
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("ray"), "")
+            .await
+            .is_ok()
+    );
     // Non-operator does not bypass
-    assert!(!state.is_operator("gastown"));
+    assert_eq!(state.caller("gastown").principal.role, Role::Client);
 }
 
 #[tokio::test]
@@ -253,16 +283,19 @@ async fn limit_no_compatible_accounts_passes() {
     limits.insert("test-client".to_string(), 0.01); // very low limit
     let mut acct = mk_endpoint("a", "sk-ant-api-x");
     acct.models = vec!["claude-sonnet".to_string()]; // only serves sonnet
-    let state = Arc::new(AppState {
-        endpoints: vec![acct],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![acct],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     // Request for "claude-opus" — no account serves it → should pass
     assert!(
         state
-            .check_utilization_limit("test-client", "claude-opus")
+            .check_utilization_limit(&state.caller("test-client"), "claude-opus")
             .await
             .is_ok(),
         "should not 429 when no account serves the requested model"
@@ -274,20 +307,23 @@ async fn limit_unknown_accounts_fail_open() {
     // Accounts with no rate data (source="unknown") should not trigger the limit gate
     let mut limits = HashMap::new();
     limits.insert("testclient".to_string(), 0.30); // below the 0.5 unknown default
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("a", "sk-ant-api-x"),
-            mk_endpoint("b", "sk-ant-api-y"),
-        ],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint("a", "sk-ant-api-x"),
+                    mk_endpoint("b", "sk-ant-api-y"),
+                ],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     // Don't set any utilization — accounts remain "unknown" (0.5)
     // With limit=0.30, unknown 0.5 would appear "above limit" without fail-open
     assert!(
         state
-            .check_utilization_limit("testclient", "")
+            .check_utilization_limit(&state.caller("testclient"), "")
             .await
             .is_ok(),
         "should fail-open when all accounts have unknown utilization"
@@ -301,23 +337,26 @@ async fn limit_mixed_known_unknown_fails_open() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("testclient".to_string(), 0.50);
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint("a", "sk-ant-api-x"),
-            mk_endpoint("b", "sk-ant-api-y"),
-            mk_endpoint("c", "sk-ant-api-z"),
-        ],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint("a", "sk-ant-api-x"),
+                    mk_endpoint("b", "sk-ant-api-y"),
+                    mk_endpoint("c", "sk-ant-api-z"),
+                ],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     // Two known accounts above limit, one unknown (no data set)
     set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.90, 0.80, now + 10000, now + 100000).await;
     // Account "c" has no rate data → unknown
     assert!(
         state
-            .check_utilization_limit("testclient", "")
+            .check_utilization_limit(&state.caller("testclient"), "")
             .await
             .is_ok(),
         "should fail-open when unknown compatible account may have capacity"
@@ -353,19 +392,32 @@ async fn emergency_operator_bypass() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("ray".to_string(), 0.10);
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: limits,
-        operators: vec!["ray".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits(limits)
+            .operators(&["ray"])
+            .install(AppState {
+                endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.98, 0.96, now + 10000, now + 100000).await;
     assert!(state.is_emergency_brake_active().await);
     // Operator bypasses pre_request_gate even during emergency
-    assert!(state.pre_request_gate("-", "ray", "").await.is_ok());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("ray"), "")
+            .await
+            .is_ok()
+    );
     // Non-operator gets blocked
-    assert!(state.pre_request_gate("-", "gastown", "").await.is_err());
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("gastown"), "")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -566,16 +618,15 @@ async fn emergency_single_unknown_account_fails_open() {
 
 #[tokio::test]
 async fn gate_unknown_client_not_operator() {
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::open().operators(&["ray"]).install(AppState {
         endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
         state_path: PathBuf::from("/tmp/test.state.json"),
-        operators: vec!["ray".to_string()],
         ..test_state_base()
-    });
+    }));
     // "-" is not the operator
-    assert!(!state.is_operator("-"));
-    assert!(!state.is_operator("gastown"));
-    assert!(state.is_operator("ray"));
+    assert_eq!(state.caller("-").principal.role, Role::Client);
+    assert_eq!(state.caller("gastown").principal.role, Role::Client);
+    assert_eq!(state.caller("ray").principal.role, Role::Operator);
 }
 
 // ── Task 7: Full integration tests ──
@@ -586,14 +637,16 @@ async fn request_rejected_by_utilization_limit() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("-".to_string(), 0.50); // default client gets 0.50 limit
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-        state_path: PathBuf::from("/tmp/test-limit-reject.state.json"),
-        proxy_key: Some("key".to_string()),
-        auto_cache: false,
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("key"))
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
+                state_path: PathBuf::from("/tmp/test-limit-reject.state.json"),
+                auto_cache: false,
+                ..test_state_base()
+            }),
+    );
     // Set utilization above client's limit (0.80 > 0.50)
     set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
@@ -604,7 +657,7 @@ async fn request_rejected_by_utilization_limit() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -623,14 +676,16 @@ async fn request_passes_utilization_limit() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("-".to_string(), 0.90);
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-        state_path: PathBuf::from("/tmp/test-limit-pass.state.json"),
-        proxy_key: Some("key".to_string()),
-        auto_cache: false,
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("key"))
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
+                state_path: PathBuf::from("/tmp/test-limit-pass.state.json"),
+                auto_cache: false,
+                ..test_state_base()
+            }),
+    );
     // Set utilization below client's limit (0.50 < 0.90)
     set_account_utilization(&state, 0, 0.50, 0.40, now + 10000, now + 100000).await;
 
@@ -641,7 +696,7 @@ async fn request_passes_utilization_limit() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -654,17 +709,19 @@ async fn request_passes_utilization_limit() {
 async fn emergency_brake_blocks_non_operator() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let now = AppState::now_epoch();
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
-            mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
-        ],
-        state_path: PathBuf::from("/tmp/test-emergency-block.state.json"),
-        proxy_key: Some("key".to_string()),
-        auto_cache: false,
-        operators: vec!["ray".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("key"))
+            .operators(&["ray"])
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
+                    mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
+                ],
+                state_path: PathBuf::from("/tmp/test-emergency-block.state.json"),
+                auto_cache: false,
+                ..test_state_base()
+            }),
+    );
     // All accounts above emergency threshold. 5h=0.96 > emergency threshold (0.88).
     set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.97, 0.0, now + 10000, now + 100000).await;
@@ -676,7 +733,7 @@ async fn emergency_brake_blocks_non_operator() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -696,18 +753,20 @@ async fn emergency_brake_allows_operator() {
     let now = AppState::now_epoch();
     let mut client_names = HashMap::new();
     client_names.insert("127.0.0.1".to_string(), "ray".to_string());
-    let state = Arc::new(AppState {
-        endpoints: vec![
-            mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
-            mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
-        ],
-        state_path: PathBuf::from("/tmp/test-emergency-operator.state.json"),
-        proxy_key: Some("key".to_string()),
-        client_names,
-        auto_cache: false,
-        operators: vec!["ray".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("key"))
+            .operators(&["ray"])
+            .install(AppState {
+                endpoints: vec![
+                    mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url),
+                    mk_endpoint_at("b", "sk-ant-api-test-bbb", &mock_url),
+                ],
+                state_path: PathBuf::from("/tmp/test-emergency-operator.state.json"),
+                client_names,
+                auto_cache: false,
+                ..test_state_base()
+            }),
+    );
     // All accounts above emergency threshold — 5h only (avoid claim penalty on 7d)
     set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
     set_account_utilization(&state, 1, 0.97, 0.0, now + 10000, now + 100000).await;
@@ -720,7 +779,7 @@ async fn emergency_brake_allows_operator() {
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -739,14 +798,16 @@ async fn openai_handler_enforces_utilization_limit() {
     let now = AppState::now_epoch();
     let mut limits = HashMap::new();
     limits.insert("-".to_string(), 0.50);
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
-        state_path: PathBuf::from("/tmp/test-openai-limit.state.json"),
-        proxy_key: Some("key".to_string()),
-        auto_cache: false,
-        client_utilization_limits: limits,
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::shared_key(&test_key("key"))
+            .utilization_limits(limits)
+            .install(AppState {
+                endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
+                state_path: PathBuf::from("/tmp/test-openai-limit.state.json"),
+                auto_cache: false,
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.80, 0.70, now + 10000, now + 100000).await;
 
     let app = build_router(state);
@@ -756,7 +817,7 @@ async fn openai_handler_enforces_utilization_limit() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -773,13 +834,12 @@ async fn openai_handler_enforces_utilization_limit() {
 async fn openai_handler_enforces_emergency_brake() {
     let (mock_url, _handle) = spawn_mock_upstream().await;
     let now = AppState::now_epoch();
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key(&test_key("key")).install(AppState {
         endpoints: vec![mk_endpoint_at("a", "sk-ant-api-test-aaa", &mock_url)],
         state_path: PathBuf::from("/tmp/test-openai-emergency.state.json"),
-        proxy_key: Some("key".to_string()),
         auto_cache: false,
         ..test_state_base()
-    });
+    }));
     set_account_utilization(&state, 0, 0.96, 0.0, now + 10000, now + 100000).await;
 
     let app = build_router(state);
@@ -789,7 +849,7 @@ async fn openai_handler_enforces_emergency_brake() {
     let resp = client
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -807,14 +867,14 @@ async fn no_new_config_identical_behavior() {
     // Default config: no operator, no limits, no emergency override
     // Should behave exactly like before the feature was added
     let (mock_url, _handle) = spawn_mock_upstream().await;
-    let (app, _state) = test_app(&mock_url, Some("key".to_string()));
+    let (app, _state) = test_app(&mock_url, Some(test_key("key")));
     let addr = serve(app).await;
 
     let client = Client::new();
     let resp = client
         .post(format!("http://{}/v1/messages", addr))
         .header("content-type", "application/json")
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .body(r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
@@ -829,7 +889,7 @@ async fn no_new_config_identical_behavior() {
     // Stats should still work with aggregate section
     let stats = client
         .get(format!("http://{}/_stats", addr))
-        .header("x-api-key", "key")
+        .header("x-api-key", test_key("key"))
         .send()
         .await
         .unwrap();
@@ -844,9 +904,13 @@ async fn no_new_config_identical_behavior() {
 
 #[tokio::test]
 async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
-    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
+    let state = state_with_clients(vec![mk_client(
+        "limited",
+        &test_key("k1"),
+        &["claude-haiku-*"],
+    )]);
     let err = state
-        .pre_request_gate("-", "limited", "claude-opus-5")
+        .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
         .await
         .expect_err("opus must be denied");
     assert_eq!(
@@ -870,23 +934,33 @@ async fn gate_denies_model_outside_client_allow_list_with_403_naming_both() {
 
 #[tokio::test]
 async fn gate_allows_model_inside_client_allow_list() {
-    let state = state_with_clients(vec![mk_client("limited", "k1", &["claude-haiku-*"])]);
-    assert!(state
-        .pre_request_gate("-", "limited", "claude-haiku-4-5")
-        .await
-        .is_ok());
+    let state = state_with_clients(vec![mk_client(
+        "limited",
+        &test_key("k1"),
+        &["claude-haiku-*"],
+    )]);
+    assert!(
+        state
+            .pre_request_gate("-", &state.caller("limited"), "claude-haiku-4-5")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
 async fn gate_allow_list_bypassed_by_operators() {
-    let state = Arc::new(AppState {
-        clients: vec![mk_client("limited", "k1", &["claude-haiku-*"])],
-        operators: vec!["limited".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_client(
+            "limited",
+            &test_key("k1"),
+            &["claude-haiku-*"],
+        )])
+        .operators(&["limited"])
+        .install(test_state_base()),
+    );
     assert!(
         state
-            .pre_request_gate("-", "limited", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
             .await
             .is_ok(),
         "operators bypass the allow-list like every other gate check"
@@ -905,10 +979,11 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
         // then allows the request and `expect_err` fails with no defect.
         let _clock = FrozenClock::at(frozen);
         let today = frozen / 86400;
-        let state = Arc::new(AppState {
-            client_budgets: [("budgeted".to_string(), 100)].into_iter().collect(),
-            ..test_state_base()
-        });
+        let state = Arc::new(
+            TestPolicy::open()
+                .budgets([("budgeted".to_string(), 100)].into_iter().collect())
+                .install(test_state_base()),
+        );
         // Pre-populate usage to exceed the budget
         state
             .budget_usage
@@ -916,7 +991,7 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
             .unwrap()
             .insert("budgeted".to_string(), (today, 200));
         let err = state
-            .pre_request_gate("-", "budgeted", "")
+            .pre_request_gate("-", &state.caller("budgeted"), "")
             .await
             .expect_err("exceeded budget must be denied");
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -937,25 +1012,30 @@ async fn gate_429_budget_returns_json_envelope_with_retry_after() {
         let json = parse_error_envelope(err).await;
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "rate_limit_error");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("daily token budget exceeded"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("daily token budget exceeded")
+        );
     }
 }
 
 #[tokio::test]
 async fn gate_429_utilization_returns_json_envelope() {
     let now = AppState::now_epoch();
-    let state = Arc::new(AppState {
-        endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
-        state_path: PathBuf::from("/tmp/test.state.json"),
-        client_utilization_limits: [("capped".to_string(), 0.10)].into_iter().collect(),
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::open()
+            .utilization_limits([("capped".to_string(), 0.10)].into_iter().collect())
+            .install(AppState {
+                endpoints: vec![mk_endpoint("a", "sk-ant-api-x")],
+                state_path: PathBuf::from("/tmp/test.state.json"),
+                ..test_state_base()
+            }),
+    );
     set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
     let err = state
-        .pre_request_gate("-", "capped", "")
+        .pre_request_gate("-", &state.caller("capped"), "")
         .await
         .expect_err("utilization above limit must be denied");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -966,10 +1046,12 @@ async fn gate_429_utilization_returns_json_envelope() {
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "rate_limit_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("utilization limit exceeded"));
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("utilization limit exceeded")
+    );
 }
 
 /// The brake is the same condition as `exhaustion_response`'s rate-limited
@@ -987,7 +1069,7 @@ async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
     });
     set_account_utilization(&state, 0, 0.95, 0.95, now + 10000, now + 100000).await;
     let err = state
-        .pre_request_gate("-", "anyone", "")
+        .pre_request_gate("-", &state.caller("anyone"), "")
         .await
         .expect_err("emergency brake must deny");
     assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -998,19 +1080,22 @@ async fn gate_429_emergency_brake_returns_json_envelope_without_retry_after() {
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "rate_limit_error");
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("emergency"));
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("emergency")
+    );
 }
 
 #[tokio::test]
 async fn authenticate_401_returns_json_envelope() {
-    let state = state_with_clients(vec![mk_client("valid", "k1", &[])]);
-    let headers = hdrs(&[("x-api-key", "wrong-key")]);
+    let state = state_with_clients(vec![mk_client("valid", &test_key("k1"), &[])]);
+    let headers = hdrs(&[("x-api-key", &test_key("wrong-key"))]);
     let err = state
         .authenticate(&headers, false)
-        .expect_err("bad key must 401");
+        .expect_err("bad key must 401")
+        .into_response();
     assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
     let json = parse_error_envelope(err).await;
     assert_eq!(json["type"], "error");
@@ -1023,24 +1108,28 @@ async fn authenticate_401_returns_json_envelope() {
 /// with the gate's own check removed. If this test is ever retired as
 /// "unreachable state", that call site goes unpinned with it.
 ///
-/// The denial is checked ABOVE the operator bypass, so a name that somehow
-/// reached both lists loses its bypass rather than keeping it.
-/// `validate_clients` rejects that config at boot — this pins the runtime
+/// A name in both lists resolves to the reader's denial (`role_in`).
+/// `ClientPolicy::build` rejects that config at boot — this pins the runtime
 /// behaviour as fail-closed if the boot check is ever weakened.
 #[tokio::test]
 async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
-    let state = Arc::new(AppState {
-        clients: vec![mk_client("both", "k1", &[])],
-        operators: vec!["both".to_string()],
-        admin_readers: vec!["both".to_string()],
-        ..test_state_base()
-    });
+    // The build refuses this overlap, so only the unchecked install reaches it.
+    let state = Arc::new(
+        TestPolicy::clients(vec![mk_client("both", &test_key("k1"), &[])])
+            .operators(&["both"])
+            .admin_readers(&["both"])
+            .install_unchecked(test_state_base()),
+    );
     assert!(
         state
-            .pre_request_gate("-", "both", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("both"), "claude-opus-5")
             .await
             .is_err(),
         "overlap must resolve to the denial, never to the bypass"
+    );
+    assert!(
+        !state.current_client_policy().is_operator("both"),
+        "/_stats and /metrics fold the name by the gate's rule, not into _operator"
     );
 }
 
@@ -1048,21 +1137,24 @@ async fn gate_denial_beats_the_operator_bypass_when_a_name_holds_both_roles() {
 /// current gate treatment. The new arm must not shadow the allow-list.
 #[tokio::test]
 async fn gate_leaves_a_plain_client_on_its_existing_policy() {
-    let state = Arc::new(AppState {
-        clients: vec![mk_client("limited", "k1", &["claude-haiku-*"])],
-        admin_readers: vec!["viewer".to_string()],
-        ..test_state_base()
-    });
+    let state = Arc::new(
+        TestPolicy::clients(vec![
+            mk_client("limited", &test_key("k1"), &["claude-haiku-*"]),
+            mk_client("viewer", &test_key("k2"), &[]),
+        ])
+        .admin_readers(&["viewer"])
+        .install(test_state_base()),
+    );
     assert!(
         state
-            .pre_request_gate("-", "limited", "claude-haiku-4-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-haiku-4-5")
             .await
             .is_ok(),
         "an allowed model still passes"
     );
     assert!(
         state
-            .pre_request_gate("-", "limited", "claude-opus-5")
+            .pre_request_gate("-", &state.caller("limited"), "claude-opus-5")
             .await
             .is_err(),
         "the allow-list still denies"

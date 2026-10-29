@@ -199,10 +199,8 @@ impl AppState {
             }
         }
 
-        // Skip OpenAI endpoints — their rate_info is a permanent stub with no
-        // state worth persisting.
         for ep in &self.endpoints {
-            if ep.protocol == Protocol::OpenAI {
+            if !ep.has_own_rate_state() {
                 continue;
             }
             endpoints.push(persist_one(&ep.name, &ep.requests, &ep.rate_info, now).await);
@@ -293,14 +291,14 @@ impl AppState {
         // Check if hard-limited — don't waste a request
         {
             let info = ep.rate_info.read().await;
-            if let Some(until) = info.hard_limited_until {
-                if Instant::now() < until {
-                    debug!(
-                        endpoint = ep.name,
-                        "skipping probe, endpoint is hard-limited"
-                    );
-                    return;
-                }
+            if let Some(until) = info.hard_limited_until
+                && Instant::now() < until
+            {
+                debug!(
+                    endpoint = ep.name,
+                    "skipping probe, endpoint is hard-limited"
+                );
+                return;
             }
         }
 
@@ -399,6 +397,9 @@ impl AppState {
                     resp.headers(),
                     // Probes never request fast mode (PROBE_MODELS, fixed body).
                     /* is_fast_mode */
+                    false,
+                    // Passthrough endpoints are never probed (skipped above).
+                    /* caller_credential */
                     false,
                 )
                 .await;
@@ -519,7 +520,7 @@ impl AppState {
             let restore_target: Option<(&AtomicU64, &RwLock<RateLimitInfo>)> = self
                 .endpoints
                 .iter()
-                .find(|e| e.name == pa.name)
+                .find(|e| e.name == pa.name && e.has_own_rate_state())
                 .map(|e| (&e.requests, &e.rate_info));
             if let Some((requests, rate_info)) = restore_target {
                 requests.store(pa.requests_total, Ordering::Relaxed);

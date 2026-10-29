@@ -89,7 +89,7 @@ Single Rust binary, no library crate. `src/main.rs` holds startup (`main`, confi
 ### Core Data Flow
 
 ```text
-Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key) → throttle failed credentials (valid principals always pass) → resolve client_id (authenticated principal, else x-client-id/IP map) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
+Request → resolve_client_ip(peer, x-forwarded-for vs trusted_proxies) → IP allowlist check → authenticate([[clients]] key, else legacy proxy_key; reads the client-policy snapshot once) → throttle failed credentials (valid principals always pass) → resolve the Caller (authenticated principal, else x-client-id/IP map, plus that snapshot) → pre_request_gate(operator bypass → model allow-list → budget → utilization limit → emergency brake) → pick_endpoint(affinity, model, skip) → forward to endpoint → parse rate-limit headers → extract token usage → shadow log → persist state (+ Redis sync)
 ```
 
 ### Where things live
@@ -99,8 +99,10 @@ Some module names are older than their contents; this is the map.
 | File | Holds |
 |------|-------|
 | `src/config.rs` | TOML config structs (`Config`, `ClientConfig`, `EndpointConfig`, `Protocol`, `RoutingStrategy`) |
-| `src/state.rs` | `AppState`, `Endpoint`, `RateLimitInfo`: shared via `Arc<AppState>`, per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting). Also EWMA / burn rate, label bounding, request-body admission, affinity hashing and content fingerprints |
-| `src/response_cache.rs` | The encrypted response cache (`ResponseCache`) **and** the admission surface: IP allow-list, failed-auth throttle, `authenticate`, `authorize_admin`, `resolve_client_ip` / `resolve_client_id`, client model allow-lists, the guard hook |
+| `src/client_policy.rs` | `ClientPolicy::build`, the one builder of every per-client rule (called from `load_config`): `AuthMode`, `Principal` / `Role`, `key_digest` (SHA-256) and the digest → principal table, the client name rule. Also the snapshot each request carries: `Authenticated`, `Caller` (principal + policy snapshot, and every per-client lookup), `AppState::current_client_policy` / `swap_client_policy`. And the client store's side of it: `ClientPolicy::with_store` (the file's policy plus what the reader holds), the `StoreGate` and `StoreRefusal` that `authenticate` applies |
+| `src/client_store.rs` | The client store reader (`docs/client-store.md`, corpus in `tests/client-store/`): the document and part checks, the merge and set hash, `Reader` (one poll answer → what is held), and `ClientStore`, which polls, installs into the client policy, saves the resume copy beside the state file, logs installs and restrictions, and serves `/_ready` |
+| `src/state.rs` | `AppState`, `Endpoint`, `RateLimitInfo`: shared via `Arc<AppState>`, the client-policy snapshot (`client_policy`), per-endpoint `RwLock<RateLimitInfo>`, atomic counters, optional fred `RedisClient` (auto-reconnecting). Also EWMA / burn rate, label bounding, request-body admission, affinity hashing and content fingerprints |
+| `src/response_cache.rs` | The encrypted response cache (`ResponseCache`) **and** the admission surface: IP allow-list, failed-auth throttle, `authenticate`, `authorize_admin`, `resolve_client_ip` / `resolve_client_id`, the model allow-list's denial counter, the guard hook |
 | `src/persistence.rs` | JSON state file at `<config_path>.state.json`, saved after every request and on shutdown; probes. Its tests hold the Redis coordination suites, including `src/persistence/tests/real_redis.rs` |
 | `src/utilization.rs` | Time-adjusted utilization, 7d claims, waste risk, `compute_routing_weight`, `routing_candidates`. Also the retry / transport / Redis / body-limit constants, `start_coordination_redis`, credential fingerprinting, the client `anthropic-beta` allow-list (`DEFAULT_CLIENT_BETA_ALLOWLIST`) and beta body-field stripping |
 | `src/routing.rs` | `pick_endpoint` and the weighted pickers, rate-limit header ingestion (`update_rate_info_for`), hard-limit marking, transport health, Redis sync / publish, `cluster_info` |
@@ -109,6 +111,7 @@ Some module names are older than their contents; this is the map.
 | `src/oauth_prompt.rs`, `src/auto_cache.rs` | OAuth system-prompt injection; prompt-cache breakpoint injection (up to 3: last tool, system, last user message) |
 | `src/handler.rs` | `proxy_handler` (main Anthropic proxy): retry / rotation outcomes, the upstream client, header reflection and stripping, guard responses |
 | `src/fallback.rs` | Forwarding to `protocol = "openai"` endpoints (`try_fallback_upstream`, called by both handlers) |
+| `src/log_sink.rs` | The optional HTTP log sink (`[log_sink]`): `StdoutTee`, the fmt layer's stdout writer that also hands each event to `LogSink::push` (bounded queue, never blocks), the batching flush task, the delivery counters on `/metrics` and the shutdown drain |
 | `src/stats.rs`, `src/metrics.rs` | `stats_handler` (`/_stats` JSON); `metrics_handler` (`/metrics` Prometheus) |
 | `src/openai_compat.rs` | OpenAI→Anthropic translation for `/v1/chat/completions` (`translate_*`, `StreamContext`, streaming SSE) |
 | `src/reverse_translation.rs` | Anthropic→OpenAI translation for `openai` endpoints, SSE error frames, and `openai_chat_handler` (the `/v1/chat/completions` handler) |
@@ -121,7 +124,7 @@ Headroom-proportional weighted bucket hashing:
 2. Skip endpoints in the `skip` list (already tried in this retry loop)
 3. Skip hard-limited (429) endpoints
 4. Each remaining endpoint gets a bucket proportional to `(1.0 - utilization)`
-5. Affinity key (client+session hash) provides sticky routing; no-affinity uses Fibonacci scatter
+5. Affinity key (client+session hash) provides sticky routing: under `sticky-weighted-v2` a keyed request takes the rendezvous-hash winner weighted on waste risk raised to `KEYED_WR_EXPONENT` (0.5, LAB-9985) among candidates whose `affinity_headroom` is at least `1 − soft_limit` (LAB-9360; README "Session affinity"); no-affinity uses Fibonacci scatter
 6. On 429 or 5xx/529, the failed endpoint index is added to `skip` and `pick_endpoint` is called again, guaranteeing a different endpoint on retry
 
 ### Token Type Detection
@@ -178,8 +181,8 @@ Routing consequences (`constraining_7d_claims`):
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | string | required | Bind address (e.g. `"0.0.0.0:8080"`) |
-| `clients[].name` | string | required | Identity the credential resolves to — becomes `client_id`, overriding `x-client-id` and `client_names` entirely |
-| `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Constant-time compared |
+| `clients[].name` | string | required | Identity the credential resolves to — becomes `client_id`, overriding `x-client-id` and `client_names` entirely. Must match `^[a-z0-9][a-z0-9_-]{0,62}$`; a leading `_` is reserved for internal labels |
+| `clients[].key` | string | required | Per-client secret (`x-api-key`; also `Authorization: Bearer` on `/v1/chat/completions`). Held and matched only as a SHA-256 digest (`key_digest`); a presented key shorter than `MIN_KEY_LEN` never matches |
 | `clients[].models` | string[]? | [] (all) | Models this client may request; same exact + `*`-suffix matcher as `endpoints[].models`. Violation = 403 |
 | `clients[].preferred_endpoints` | string[]? | [] (no pin) | Endpoint names this client is pinned to (LAB-2636/#151). While ≥1 is healthy (serves the model, not hard-limited/transport-unhealthy, `gate < soft_limit`, not overage/Fable-paid demoted), routing restricts to this set; otherwise the request spills to the full pool. Entries must name configured endpoints (startup-validated). Per-request serving logs (`proxied`, `proxied (openai-compat)`, `fallback: routing to unified OpenAI endpoint`) carry `pin=pinned\|spilled\|-` |
 | `proxy_key` | string? | none | **Legacy** single shared secret for `x-api-key` auth. Mutually exclusive with `[[clients]]` — configuring both is rejected at startup |
@@ -208,6 +211,9 @@ Routing consequences (`constraining_7d_claims`):
 | `endpoints[].fable_included` | bool? | true | Plan includes Fable's 50%-of-weekly band. Set false for Pro / standard Team accounts: Fable requests demote the endpoint by `overage_penalty`; non-Fable routing unaffected |
 | `endpoints[].allow_nonstandard_host` | bool? | false | Allow an `anthropic` endpoint whose `base_url` host isn't `api.anthropic.com` (otherwise startup fails — token exfil guard, LAB-1191) |
 | `expose_upstream_ratelimit_headers` | bool? | false | Reflect upstream `anthropic-ratelimit-*` headers to callers (reveals pooled account capacity — trusted networks only, LAB-1191) |
+| `client_store.poll_url` | string? | none | Poll a client store for ordinary clients (`docs/client-store.md`). Requires `[[clients]]`; no ordinary client is served, file keys included, until a complete set of restrictions is held |
+| `client_store.token` | string? | none | Reader token, sent as `Authorization: Bearer`; refused at boot over plain `http://` |
+| `log_sink.url` | string? | none | Also POST every stdout log line to this `http(s)://` collector (e.g. VictoriaLogs `/insert/jsonline`) as JSON lines (`_time`, `_msg`), batched at 1000 lines / ~1 MiB / 1 s. Best effort: queue of 10,000 lines / 16 MiB, lines over 32 KiB cut and marked, overflow and failed batches dropped (never retried) and counted in `anthropic_log_sink_lines_{sent,dropped}_total`. Credentials in the URL are refused; the URL is never logged |
 | `allowed_client_betas` | string[]? | built-in list | Client `anthropic-beta` flags forwarded on OAuth endpoints (`*` suffix wildcard); a configured list REPLACES the default (copy defaults alongside additions); unlisted flags dropped + logged + counted in `anthropic_beta_flag_dropped_total` (LAB-1191). When anything is dropped, top-level body fields belonging to a dropped flag are stripped with it (only on `/v1/messages` + `/v1/messages/count_tokens`), so the feature turns off quietly instead of 400ing upstream — counted in `anthropic_beta_body_field_stripped_total` (LAB-1261). Fields owned by a flag that SURVIVED are protected, which requires `BETA_BODY_FIELDS` to stay total over this list (build-time test); a surviving flag with no row switches the strip off for that request rather than risk deleting its field |
 
 
@@ -236,3 +242,5 @@ Routing consequences (`constraining_7d_claims`):
 Tests use a `spawn_mock_upstream()` helper that starts a real TCP listener returning canned Anthropic-style responses with rate-limit headers. Integration tests bind to `127.0.0.1:0` (random port) and make real HTTP requests through the full axum router with `ConnectInfo<SocketAddr>`.
 
 `test_state_with()` and `test_app()` are the two test fixture builders — the former for unit tests (no HTTP), the latter for integration tests (full router + mock upstream). `test_openai_app()` builds a minimal router for OpenAI-compat handler tests.
+
+Per-client state (`[[clients]]`, `proxy_key`, `operators`, `admin_readers`, budgets, utilization limits) is never set on `AppState` by hand: build it with `TestPolicy` and `install` it, which runs the real `ClientPolicy::build`, so a fixture holds nothing a boot would refuse. Keys must clear `MIN_KEY_LEN`: configure and present `test_key(tag)`. `install_unchecked` exists only for tests that pin runtime behaviour in a state the build refuses. A per-client decision takes the request's `Caller`, never a client id: a test that drives one without a request takes `state.caller(name)`, and a test that replaces the policy mid-run calls `swap_into(&state)` on a `TestPolicy`.

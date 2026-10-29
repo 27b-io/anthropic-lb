@@ -1104,11 +1104,13 @@ fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
         "index": 0,
         "delta": {"type": "text_delta", "text": "```json\n{\"ok\":true}\n```"},
     });
-    assert!(translate_sse_event(
-        &format!("event: content_block_delta\ndata: {payload}"),
-        &mut ctx
-    )
-    .is_none());
+    assert!(
+        translate_sse_event(
+            &format!("event: content_block_delta\ndata: {payload}"),
+            &mut ctx
+        )
+        .is_none()
+    );
 
     let output = translate_sse_event(
         "event: message_stop\ndata: {\"type\":\"message_stop\"}",
@@ -1123,6 +1125,6 @@ fn json_mode_stream_message_stop_safety_net_flushes_buffer() {
     assert_eq!(frames.next(), Some("[DONE]"));
     // The stream loop detects the terminator with ends_with("data: [DONE]\n\n")
     // — a combined frame that failed this would earn a second [DONE] from the
-    // post-loop guard (LAB-710 panel finding).
+    // post-loop guard (LAB-710).
     assert!(output.ends_with("data: [DONE]\n\n"));
 }

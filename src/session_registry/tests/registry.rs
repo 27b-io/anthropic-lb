@@ -74,7 +74,11 @@ fn session_registry_evicts_by_ttl() {
         assert!(map.contains_key("new"));
     }
     // The /_stats snapshot ALSO filters expired entries before any prune runs.
-    assert!(state.sessions_snapshot(1_000 + 1801 + 1801).is_empty());
+    assert!(
+        state
+            .sessions_snapshot(&state.current_client_policy(), 1_000 + 1801 + 1801)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -141,7 +145,7 @@ fn sessions_snapshot_sorts_by_pct_desc_and_caps_top_n() {
     state.record_session("high", rctx, "m", "a", 190_000, 200_000, 100);
     state.record_session("mid", rctx, "m", "a", 100_000, 200_000, 100);
     let pcts: Vec<f64> = state
-        .sessions_snapshot(100)
+        .sessions_snapshot(&state.current_client_policy(), 100)
         .iter()
         .map(|s| s["context_window_pct"].as_f64().unwrap())
         .collect();
@@ -151,7 +155,12 @@ fn sessions_snapshot_sorts_by_pct_desc_and_caps_top_n() {
     for i in 0..(SESSIONS_STATS_TOP_N + 10) {
         state.record_session(&format!("k{i}"), rctx, "m", "a", i as u64, 200_000, 100);
     }
-    assert_eq!(state.sessions_snapshot(100).len(), SESSIONS_STATS_TOP_N);
+    assert_eq!(
+        state
+            .sessions_snapshot(&state.current_client_policy(), 100)
+            .len(),
+        SESSIONS_STATS_TOP_N
+    );
 }
 
 #[test]
@@ -226,7 +235,7 @@ fn prompt_too_long_shape_detection_and_parse() {
 #[test]
 fn prompt_too_long_counter_bounds_model_cardinality() {
     let state = test_state_with(vec![]);
-    for i in 0..(MAX_PROMPT_TOO_LONG_MODELS + 5) {
+    for i in 0..(MAX_COUNTED_MODELS + 5) {
         state.note_prompt_too_long(
             "req",
             &format!("model-{i}"),
@@ -237,7 +246,7 @@ fn prompt_too_long_counter_bounds_model_cardinality() {
     let counts = state.prompt_too_long.lock().unwrap();
     assert_eq!(
         counts.len(),
-        MAX_PROMPT_TOO_LONG_MODELS + 1,
+        MAX_COUNTED_MODELS + 1,
         "distinct models capped, overflow buckets into _other"
     );
     assert_eq!(counts.get("_other"), Some(&5));

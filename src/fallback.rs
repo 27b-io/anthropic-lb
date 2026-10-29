@@ -82,7 +82,7 @@ pub(crate) async fn try_fallback_upstream(
     // caller; each attempt clones the refcounted `Bytes`.
     request_body: &bytes::Bytes,
     req_id: &str,
-    client_id: &str,
+    caller: &Caller,
     client_ip: &std::net::IpAddr,
     agent_id: &str,
     session_id: &str,
@@ -92,15 +92,16 @@ pub(crate) async fn try_fallback_upstream(
     translate: bool, // true = upstream response needs OpenAI→Anthropic translation
     is_streaming: bool,
 ) -> ForwardOutcome {
+    let client_id = caller.name();
     let ep = &state.endpoints[endpoint_idx];
 
     info!(
         req_id,
         client_id,
-        model,
+        model = %GoQuoted(model),
         upstream = ep.name,
         translate,
-        pin = state.pin_status(client_id, endpoint_idx),
+        pin = state.pin_status(caller, endpoint_idx),
         "fallback: routing to unified OpenAI endpoint"
     );
 
@@ -174,6 +175,9 @@ pub(crate) async fn try_fallback_upstream(
         /* openai_error_shape */ !translate,
         // The OpenAI request shape cannot express `speed` — never fast.
         None,
+        // Always the endpoint's own token, never the caller's.
+        /* caller_credential */
+        false,
     )
     .await
     {
@@ -190,7 +194,7 @@ pub(crate) async fn try_fallback_upstream(
             req_id,
             upstream = ep.name,
             status = status.as_u16(),
-            body = ?err_body,
+            body = %GoQuoted(&err_body),
             "fallback: unified endpoint returned error"
         );
         // Gateway rejected the MODEL (e.g. LiteLLM "Invalid model name"):
@@ -200,7 +204,7 @@ pub(crate) async fn try_fallback_upstream(
         // 529 storm drained the Anthropic accounts into an OpenAI-protocol
         // LiteLLM gateway).
         // Only the model rejection: this path has never re-sent on an
-        // entitlement 400.
+        // entitlement 400, and forwards a speed 400 unchanged (LAB-4190).
         let model_unsupported =
             serde_json::from_str::<serde_json::Value>(&err_body).is_ok_and(|v| {
                 // Always the endpoint's own bearer token here, never the caller's.
@@ -468,7 +472,7 @@ pub(crate) async fn try_fallback_upstream(
             warn!(
                 req_id,
                 client_id,
-                model,
+                model = %GoQuoted(model),
                 upstream = ep.name,
                 error = %e,
                 "fallback: unified endpoint response body is not valid JSON; usage not recorded"
@@ -481,7 +485,7 @@ pub(crate) async fn try_fallback_upstream(
         state,
         ep,
         req_id,
-        client_id,
+        caller,
         model,
         openai_resp.get("model").and_then(|v| v.as_str()),
         &ep.name,
@@ -498,6 +502,7 @@ pub(crate) async fn try_fallback_upstream(
         0,
         // OpenAI endpoints carry stub RateLimitInfo — no routing snapshot to
         // merge with; this path keeps its own usage-only log line (LAB-3214).
+        None,
         None,
     )
     .await;

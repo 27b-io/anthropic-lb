@@ -55,7 +55,9 @@ struct UpstreamProbe {
 /// stamp marks when the proxy stopped reading. A whole multi-MB frame per
 /// write stamps only when the kernel takes its last byte: with default TCP
 /// buffers that is while the proxy is still reading and scanning megabytes of
-/// it, and that work then lands in the stall measurement.
+/// it, and that work then lands in the stall measurement. The same holds for
+/// a blocked slice unless the writer is woken as the proxy reads, hence
+/// `wake_writer_per_slice`.
 async fn spawn_endless_sse_upstream(
     prelude: &'static str,
     frame: String,
@@ -66,6 +68,8 @@ async fn spawn_endless_sse_upstream(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
+        #[cfg(target_os = "linux")]
+        wake_writer_per_slice(&s);
         let mut buf = vec![0u8; 8192];
         let _ = s.read(&mut buf).await;
         let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
@@ -83,6 +87,42 @@ async fn spawn_endless_sse_upstream(
         }
     });
     (format!("http://{addr}"), probe)
+}
+
+/// Wake a blocked write as soon as fewer than `PROBE_WRITE` bytes wait
+/// unsent (`TCP_NOTSENT_LOWAT`). By default the kernel wakes it only once a
+/// large share of the autotuned, multi-MB send buffer has drained, so the
+/// last stamped write can precede the proxy's last read by however long the
+/// proxy takes to work through what is already queued: seconds on a busy
+/// host, all of it counted as stall. Declared by hand: the crate has no
+/// libc dependency.
+#[cfg(target_os = "linux")]
+fn wake_writer_per_slice(s: &tokio::net::TcpStream) {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32) -> c_int;
+    }
+    const IPPROTO_TCP: c_int = 6;
+    const TCP_NOTSENT_LOWAT: c_int = 25;
+    let lowat = PROBE_WRITE as c_int;
+    // SAFETY: `s` owns an open socket, and the option value is a live
+    // `c_int` whose size is passed with it.
+    let rc = unsafe {
+        setsockopt(
+            s.as_raw_fd(),
+            IPPROTO_TCP,
+            TCP_NOTSENT_LOWAT,
+            (&lowat as *const c_int).cast::<c_void>(),
+            std::mem::size_of::<c_int>() as u32,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "TCP_NOTSENT_LOWAT: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// Send a streaming request on a raw socket that is never read. The small
@@ -131,13 +171,22 @@ async fn assert_stall_drops_upstream(
     let addr = serve(build_router(state.clone())).await;
     let client = stalled_request(addr, path, body).await;
 
-    let deadline = Instant::now() + DOWNSTREAM_SEND_TIMEOUT + Duration::from_secs(5);
+    // Timed from the upstream's last accepted write, not the request:
+    // filling the buffers between upstream and client takes as long as the
+    // host allows, and none of it is the stall.
+    let sent = Instant::now();
     let closed_at = loop {
         if let Some(t) = *probe.closed_at.lock().unwrap() {
             break t;
         }
+        // A relay that never stops reading never lets that clock run out.
         assert!(
-            Instant::now() < deadline,
+            sent.elapsed() < Duration::from_secs(30),
+            "upstream still being read 30s on: the relay is buffering the stream, not stalling"
+        );
+        let last_write = probe.last_write.lock().unwrap().unwrap_or(sent);
+        assert!(
+            Instant::now() < last_write + DOWNSTREAM_SEND_TIMEOUT + Duration::from_secs(5),
             "upstream still open {:?} after the stall bound while the client holds its socket",
             Duration::from_secs(5)
         );

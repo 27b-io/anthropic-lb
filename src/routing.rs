@@ -1,5 +1,57 @@
 use crate::*;
 
+/// Every `anthropic-ratelimit-unified-*` header on a response, prefix
+/// stripped, as space-separated `name=value` pairs sorted by name. Logged on
+/// each hard 429 so the log shows which window refused and whether an
+/// overage path was open: `retry-after` alone reads the same for a spent
+/// week and for a refusal that clears within a minute (LAB-8497). Sorted
+/// because `HeaderMap` iteration order is unspecified, and identical header
+/// sets must log identically to be grouped. The unified headers carry
+/// window state only, never a credential.
+fn unified_ratelimit_summary(headers: &reqwest::header::HeaderMap) -> String {
+    let mut pairs: Vec<String> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let short = name.as_str().strip_prefix("anthropic-ratelimit-unified-")?;
+            Some(format!("{short}={}", value.to_str().unwrap_or("<binary>")))
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.join(" ")
+}
+
+/// Cap on the cooldown for a spent weekly window with no overage path.
+const WEEKLY_SPENT_COOLDOWN: Duration = Duration::from_secs(900);
+
+/// Exponent on waste risk in the keyed rendezvous score (`pick_keyed`). When an
+/// account's score changes by a small relative amount d, about `a * d` of its
+/// keys move, so 0.5 halves the moves a drift in waste risk causes, such as a
+/// busy session burning its own account's week. An account joining or leaving
+/// the set still gains or loses its whole share. The cost is flatter
+/// placement: 4x the waste risk wins 2x the keys. Chosen by replaying a day
+/// of keyed traffic (LAB-9985): rehomes fell 31% at 0.5 and 16% at 0.75, and
+/// every weekly reset in that day still ended fully used. Un-keyed and
+/// degraded picks keep the full weight.
+const KEYED_WR_EXPONENT: f64 = 0.5;
+
+/// A 429 from an account whose weekly window is spent and which has no
+/// credit to spend on overage. Its `retry-after` runs to the weekly reset,
+/// days out, so the default cooldown would re-try it every minute for
+/// nothing; it is cooled for up to `WEEKLY_SPENT_COOLDOWN` instead, and the
+/// next request or probe after that re-checks it (LAB-8497). A spent 5h
+/// window carries the same overage headers with `7d-status: allowed`, so it
+/// keeps its own `retry-after`. The `7d-*` headers describe whichever claim
+/// `representative-claim` names, and a per-family claim such as
+/// `seven_day_sonnet` limits only that family, so only the general
+/// `seven_day` claim says the whole account is spent.
+fn is_weekly_spent_no_overage(headers: &reqwest::header::HeaderMap) -> bool {
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    header("anthropic-ratelimit-unified-representative-claim") == Some("seven_day")
+        && header("anthropic-ratelimit-unified-7d-status") == Some("rejected")
+        && header("anthropic-ratelimit-unified-overage-disabled-reason")
+            == Some("member_zero_credit_limit")
+}
+
 impl AppState {
     pub(crate) fn routing_weight_publish_ttl(probe_interval_secs: u64) -> u64 {
         const FALLBACK_PUBLISH_INTERVAL_SECS: u64 = 60;
@@ -108,10 +160,9 @@ impl AppState {
                 }
             });
         };
-        // OpenAI endpoints are skipped — sync_from_redis only reads weights
-        // for Anthropic targets.
+        // Mirrors `sync_from_redis`'s targets: nothing reads the others' weights.
         for ep in &self.endpoints {
-            if ep.protocol == Protocol::OpenAI {
+            if !ep.has_own_rate_state() {
                 continue;
             }
             publish(
@@ -189,8 +240,15 @@ impl AppState {
         total_weight: f64,
         affinity_key: Option<&str>,
     ) -> &'a RoutingCandidate {
+        // The fallback for a target at the very top of the range (float
+        // rounding) is the last bucket with width, never a weight-0 account.
+        let last = effective
+            .iter()
+            .rev()
+            .find(|c| c.weight > 0.0)
+            .unwrap_or_else(|| effective.last().unwrap());
         let walk_buckets = |target: f64| -> &'a RoutingCandidate {
-            let mut picked = effective.last().unwrap();
+            let mut picked = *last;
             let mut cumulative = 0.0;
             for c in effective {
                 cumulative += c.weight;
@@ -229,10 +287,13 @@ impl AppState {
             };
             let (picked_headroom, bind) = affinity_headroom(picked);
             let (other_headroom, _) = affinity_headroom(other);
-            if picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO {
+            // A weight-0 account (a spent week) can still read as headroom
+            // near its reset; it must not take the session.
+            if other.weight > 0.0
+                && picked_headroom < other_headroom * LEGACY_AFFINITY_OVERRIDE_RATIO
+            {
                 self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                // Loud on purpose — see the StickyWeightedV2 override below for
-                // the cascade rationale. Breaking affinity is a pool-health
+                // Loud on purpose. Breaking affinity is a pool-health
                 // warning sign, NOT routine — EXCEPT when a status floor bound
                 // the sticky account (`Floored`): Anthropic flagged it and we're
                 // moving the session onto fresh capacity, which is what the
@@ -255,10 +316,16 @@ impl AppState {
                         )
                     };
                 }
-                if matches!(bind, AffinityBind::Floored) {
-                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
+                if matches!(bind, MigrationReason::Floored) {
+                    log_migration!(
+                        info,
+                        "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)"
+                    );
                 } else {
-                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)");
+                    log_migration!(
+                        warn,
+                        "affinity broken: sticky endpoint out of headroom, migrating session (cascade risk)"
+                    );
                 }
                 picked = other;
             }
@@ -272,100 +339,152 @@ impl AppState {
         picked
     }
 
+    /// Whether a keyed session may stay on `c` (LAB-9360): it passes the
+    /// healthy filter (`is_healthy`) that `pick_endpoint_for_client` applies,
+    /// and its `affinity_headroom` is at least `1 - soft_limit`, so
+    /// neither its 5h gate nor its weekly quota is near the limit. Outside a
+    /// degraded tier the healthy filter has already enforced the gate, so only
+    /// the weekly half can fail. A status floor alone does not fail it unless
+    /// the floor itself reaches `soft_limit` (`throttled`, `rejected`); the
+    /// weekly `allowed_warning` floor (0.80) keeps the session.
+    fn keeps_affinity(&self, c: &RoutingCandidate) -> bool {
+        self.is_healthy(c.gate, c.weight) && affinity_headroom(c).0 >= 1.0 - self.soft_limit
+    }
+
+    /// The healthy filter: a gate under `soft_limit` and a positive routing
+    /// weight. A weekly claim spent before its reset weighs 0 while its 5h
+    /// gate can sit low; counting it healthy would let it hold a client's pin
+    /// or stand in for a tier's healthy capacity, so the pick returns `None`
+    /// while positive-weight capacity goes unused. Pin viability, tier
+    /// membership, the affinity rule and the routing weight and share gauges
+    /// all read it.
+    pub(crate) fn is_healthy(&self, gate: f64, weight: f64) -> bool {
+        gate < self.soft_limit && weight > 0.0
+    }
+
+    /// The candidate in `pool` with the highest `rendezvous_score` for `key`,
+    /// each weighted by `score`. Candidates without a positive finite routing
+    /// weight never win, whatever their score; `None` when no candidate has one.
+    fn pick_rendezvous<'a>(
+        &self,
+        pool: &[&'a RoutingCandidate],
+        key: &str,
+        score: impl Fn(&RoutingCandidate) -> f64,
+    ) -> Option<&'a RoutingCandidate> {
+        pool.iter()
+            .copied()
+            .filter(|c| c.weight.is_finite() && c.weight > 0.0)
+            .map(|c| {
+                let name = &self.endpoints[c.endpoint].name;
+                (c, rendezvous_score(key, name, score(c)))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(c, _)| c)
+    }
+
+    /// `pick_rendezvous` over accounts that pass the overage rule, scored on
+    /// waste risk alone raised to `KEYED_WR_EXPONENT`, so a 5h window filling
+    /// or resetting on a passing account moves none of its keys;
+    /// `keeps_affinity` sheds them once the gate reaches `soft_limit`. An
+    /// account with no waste risk (missing reset data) is scored as its
+    /// lowest-scoring routable peer, never above them.
+    fn pick_keyed<'a>(
+        &self,
+        pool: &[&'a RoutingCandidate],
+        key: &str,
+    ) -> Option<&'a RoutingCandidate> {
+        let floor = pool
+            .iter()
+            .filter(|c| c.weight > 0.0 && c.wr > 0.0)
+            .map(|c| c.wr)
+            .reduce(f64::min)
+            .unwrap_or(1.0);
+        self.pick_rendezvous(pool, key, |c| {
+            let wr = if c.wr > 0.0 { c.wr } else { floor };
+            wr.powf(KEYED_WR_EXPONENT)
+        })
+    }
+
+    /// A keyed session goes to the account that wins its rendezvous hash among
+    /// the candidates that pass the overage rule (`keeps_affinity`), scored on
+    /// damped waste risk (`pick_keyed`), so it stays on that account until the
+    /// account fails the rule or leaves the candidate set, or another
+    /// account's waste risk rises enough to win the key. Waste risk still
+    /// places new sessions, so expiring quota is burned first. An account that
+    /// fails the rule loses its sessions to their next highest score, which
+    /// spreads them over the pool rather than onto one best account. When
+    /// nothing in the tier passes, the hash runs over the whole effective set
+    /// on the full weight, as the tier's degraded mode does for load.
+    /// Un-keyed requests scatter over the weighted buckets.
     fn pick_sticky_weighted_v2<'a>(
         &self,
         effective: &[&'a RoutingCandidate],
         total_weight: f64,
         affinity_key: Option<&str>,
     ) -> &'a RoutingCandidate {
-        let mut picked = self.pick_weighted_bucket(effective, total_weight, affinity_key);
+        let Some(key) = affinity_key else {
+            return self.pick_weighted_bucket(effective, total_weight, None);
+        };
+        let passing: Vec<&RoutingCandidate> = effective
+            .iter()
+            .copied()
+            .filter(|c| self.keeps_affinity(c))
+            .collect();
+        self.pick_keyed(&passing, key)
+            .or_else(|| self.pick_rendezvous(effective, key, |c| c.weight))
+            // Unreachable: `pick_endpoint_for_client` only picks from a set
+            // with positive total weight, and every weight is finite.
+            .unwrap_or_else(|| self.pick_weighted_bucket(effective, total_weight, Some(key)))
+    }
 
-        if let Some(key) = affinity_key {
-            let (picked_headroom, bind) = affinity_headroom(picked);
-            let (best, best_headroom) = effective
-                .iter()
-                .map(|c| (*c, affinity_headroom(c).0))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap();
-            if best.endpoint != picked.endpoint
-                && picked_headroom < best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO
-            {
-                // The sticky account is out of headroom for this session. Do NOT
-                // migrate to `best` (the global argmax): that target rotates every
-                // request as utilizations drift, so a session chases it across the
-                // whole pool and pays a cold-cache `cache_creation` charge on every
-                // hop (measured in prod: a swept client ran a 1.18 create:read ratio
-                // vs ~0.05 for sticky clients — it created more cache than it ever
-                // read back). Instead re-pick over the healthy remainder using a
-                // SALTED hash of the same affinity key: deterministic per session
-                // (so the cache warms on the replacement and stays there) yet spread
-                // across sessions (distinct keys → distinct replacements), and
-                // independent of which account is momentarily `best`.
-                //
-                // "Healthy" = the override would not flee it: the negation of the
-                // trigger above. Excluding only `picked` let a 7d-spent account
-                // (gate-healthy, big expiring-quota bucket) replace an equally
-                // spent one, which answered the caller with Anthropic's
-                // entitlement 400 (LAB-4719). The floor also excludes `picked`.
-                // Never empty: `best` always clears it, and clearing it means
-                // headroom > 0, so gate < 1 and weight > 0. The `best` fallback
-                // below is therefore unreachable from routing_candidates; it
-                // stays as a guard, and it would still satisfy the floor.
-                let floor = best_headroom * STICKY_WEIGHTED_OVERRIDE_RATIO;
-                let remaining: Vec<&RoutingCandidate> = effective
-                    .iter()
-                    .copied()
-                    .filter(|c| affinity_headroom(c).0 >= floor)
-                    .collect();
-                let remaining_weight: f64 = remaining.iter().map(|c| c.weight).sum();
-                let replacement = if remaining_weight > 0.0 {
-                    // NUL separator can't appear in a header-derived affinity key
-                    // (ip:client:agent:session), so the salted key never collides
-                    // with a real one.
-                    let salted = format!("{key}\u{0}migrate");
-                    self.pick_weighted_bucket(&remaining, remaining_weight, Some(&salted))
-                } else {
-                    best
-                };
-                self.affinity_migrations[bind as usize].fetch_add(1, Ordering::Relaxed);
-                // Loud on purpose. Sustained breaking with reason="loaded" means
-                // the pool is the bottleneck — add capacity, don't tune the
-                // ratio. reason="spent" means one account's week is nearly gone
-                // while others are fresh; expect it to cluster before weekly
-                // resets and vanish after. reason="floored" is neither: Anthropic
-                // put a status floor on the sticky account and we're moving the
-                // session onto fresh capacity — the floor doing its job, not a
-                // pool problem. It logs at INFO so the WARN stays a real signal
-                // (LAB-3295); the counter records all three. Field set is
-                // identical across levels — tracing's compile-time level forces
-                // the two arms — so it lives once in this local macro.
-                macro_rules! log_migration {
-                    ($lvl:ident, $msg:literal) => {
-                        $lvl!(
-                            strategy = RoutingStrategy::StickyWeightedV2.as_str(),
-                            affinity = key,
-                            reason = bind.as_str(),
-                            picked_account = self.endpoint_name(picked.endpoint),
-                            picked_headroom = format!("{:.3}", picked_headroom),
-                            replacement_account = self.endpoint_name(replacement.endpoint),
-                            replacement_headroom =
-                                format!("{:.3}", affinity_headroom(replacement).0),
-                            best_account = self.endpoint_name(best.endpoint),
-                            ratio = format!("{:.3}", picked_headroom / best_headroom),
-                            $msg
-                        )
-                    };
-                }
-                if matches!(bind, AffinityBind::Floored) {
-                    log_migration!(info, "affinity migrated: sticky endpoint gate is status-floored, moving session to fresh capacity (routine)");
-                } else {
-                    log_migration!(warn, "affinity broken: sticky endpoint out of headroom, migrating session to stable replacement");
-                }
-                picked = replacement;
-            }
+    /// Signal only: count and log a keyed session's move to another account
+    /// on this replica (LAB-9360). Called at the first pick of a request, after
+    /// routing decided; nothing here changes a pick. A move is a change from
+    /// the account this replica last picked for the key and model, so a
+    /// session that sits on its replacement logs once, not on every request.
+    /// Per model because candidates and weights are: a key alternating models
+    /// may rightly sit on one account per model, which is not a move. The reason
+    /// says why the old account lost the key (`MigrationReason`). A pick made
+    /// while nothing in the tier passes the overage rule is degraded routing,
+    /// not a move: it is neither counted nor recorded, so the first pick after
+    /// the tier recovers is compared with the key's last pick before it.
+    fn record_affinity_pick(
+        &self,
+        key: &str,
+        model: &str,
+        picked: EndpointIdx,
+        candidates: &[RoutingCandidate],
+        effective: &[&RoutingCandidate],
+        tier: u32,
+    ) {
+        if !effective.iter().any(|c| self.keeps_affinity(c)) {
+            return;
         }
-
-        picked
+        let key_hash = stable_affinity_hash(&format!("{key}\u{0}{model}"));
+        let last =
+            lock_recovering(&self.affinity_last_pick, "affinity_last_pick").swap(key_hash, picked);
+        let Some(from) = last.filter(|&from| from != picked) else {
+            return;
+        };
+        // A tier candidate that passes the rule passes `is_healthy`, so it is
+        // in `effective` too: the healthy filter reads the same predicate.
+        let reason = match candidates
+            .iter()
+            .find(|c| c.endpoint == from && c.priority == tier)
+        {
+            None => MigrationReason::Unavailable,
+            Some(c) if self.keeps_affinity(c) => MigrationReason::Rehomed,
+            Some(c) => affinity_headroom(c).1,
+        };
+        self.affinity_migrations[reason as usize].fetch_add(1, Ordering::Relaxed);
+        info!(
+            strategy = self.routing_strategy.as_str(),
+            affinity = key,
+            reason = reason.as_str(),
+            from_account = self.endpoint_name(from),
+            to_account = self.endpoint_name(picked),
+            "affinity migrated: session moved to another account"
+        );
     }
 
     /// Select from a pre-filtered candidate slice using the configured routing strategy.
@@ -403,18 +522,6 @@ impl AppState {
         picked.endpoint
     }
 
-    /// The client's non-empty `preferred_endpoints` list, if it has one.
-    /// Resolved through the authenticated `[[clients]]` registry only — on the
-    /// legacy `proxy_key` / open path `clients` is empty, so a spoofable
-    /// header-derived client id can never acquire another client's pin.
-    fn client_preferred_endpoints(&self, client_id: &str) -> Option<&[String]> {
-        self.clients
-            .iter()
-            .find(|c| c.name == client_id)
-            .map(|c| c.preferred_endpoints.as_slice())
-            .filter(|p| !p.is_empty())
-    }
-
     /// Whether `endpoint_idx` is in a `preferred_endpoints` list. The ONE
     /// membership predicate, shared by the pick-time filter and `pin_status`
     /// — if they ever diverged, the `pin=` log field would lie about what the
@@ -426,11 +533,11 @@ impl AppState {
     }
 
     /// `pin` field for the per-request serving log lines: "pinned" when the
-    /// serving endpoint is in the client's preferred set, "spilled" when the
-    /// client has preferences but was served outside them, "-" for clients
+    /// serving endpoint is in the caller's preferred set, "spilled" when the
+    /// caller has preferences but was served outside them, "-" for callers
     /// without preferences.
-    pub(crate) fn pin_status(&self, client_id: &str, endpoint_idx: EndpointIdx) -> &'static str {
-        match self.client_preferred_endpoints(client_id) {
+    pub(crate) fn pin_status(&self, caller: &Caller, endpoint_idx: EndpointIdx) -> &'static str {
+        match caller.preferred_endpoints() {
             Some(p) if self.endpoint_is_preferred(p, endpoint_idx) => "pinned",
             Some(_) => "spilled",
             None => "-",
@@ -439,7 +546,8 @@ impl AppState {
 
     /// Test-only convenience: pick with no client identity and standard
     /// speed — no pinning, no fast-mode exclusion. Keeps the pre-LAB-2636
-    /// routing tests byte-identical.
+    /// routing tests byte-identical. An empty `skip` counts as a request's
+    /// first pick, as it is in the handlers' first round.
     #[cfg(test)]
     pub(crate) async fn pick_endpoint(
         &self,
@@ -447,16 +555,24 @@ impl AppState {
         model: &str,
         skip: &[EndpointIdx],
     ) -> Option<EndpointIdx> {
-        self.pick_endpoint_for_client(affinity_key, model, skip, "", false)
-            .await
+        let anonymous = self.caller("");
+        self.pick_endpoint_for_client(
+            affinity_key,
+            model,
+            skip,
+            &anonymous,
+            FastRequest::STANDARD,
+            skip.is_empty(),
+        )
+        .await
     }
 
     /// Pick the best available endpoint (account or fallback upstream).
     ///
-    /// Per-client pinning (LAB-2636 / #151) runs first: if `client_id` names a
+    /// Per-client pinning (LAB-2636 / #151) runs first: if the caller has a
     /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
     /// is a healthy, undemoted candidate (serves the model, not hard-limited,
-    /// not transport-unhealthy, not skipped, `gate < soft_limit`, and not
+    /// not transport-unhealthy, not skipped, `is_healthy`, and not
     /// priority-demoted for serving via paid overage / always-paid Fable), the
     /// candidate set is restricted to the preferred endpoints. The filter runs
     /// BEFORE tier/affinity/weighted selection, so a prior affinity landing on
@@ -468,36 +584,36 @@ impl AppState {
     /// free general-pool capacity — violating the free-before-paid guarantee
     /// below, which the retain would otherwise bypass.
     ///
-    /// `fast` (LAB-2687): a `speed: "fast"` request also drops
-    /// `fast_mode_disabled` accounts BEFORE the pin filter, so a non-entitled
-    /// pin spills rather than serving.
+    /// `fast`: a `speed: "fast"` request also drops the
+    /// `fast_mode_disabled` accounts it reaches as fast BEFORE the pin filter,
+    /// so a non-entitled pin spills rather than serving.
     ///
     /// Tiers are tried strictly in ascending priority order. Within a tier:
-    /// healthy candidates (`gate < soft_limit`) are preferred; if none are healthy
+    /// healthy candidates (`is_healthy`) are preferred; if none are healthy
     /// the tier degrades to its soft-limited candidates. Only when a tier has zero
     /// total weight (genuinely exhausted) does routing move to the next tier — so
     /// `soft_limit` is intra-tier load-shedding and never causes a tier jump. This
     /// guarantees free capacity is fully drained before any paid (overage/upstream)
     /// tier is touched.
+    ///
+    /// `first_pick`: this is the request's first pick, not a retry's re-pick.
+    /// Only a first pick feeds the affinity-move signal (`record_affinity_pick`).
     pub(crate) async fn pick_endpoint_for_client(
         &self,
         affinity_key: Option<&str>,
         model: &str,
         skip: &[EndpointIdx],
-        client_id: &str,
-        fast: bool,
+        caller: &Caller,
+        fast: FastRequest,
+        first_pick: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
-        let fast_disabled = if fast {
-            self.fast_mode_disabled_endpoints()
-        } else {
-            Vec::new()
-        };
+        let fast_disabled = self.fast_mode_disabled_for(fast);
         candidates.retain(|c| {
             if fast_disabled.contains(&c.endpoint) {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, fast mode disabled on endpoint"
                 );
                 return false;
@@ -506,17 +622,17 @@ impl AppState {
             // has no org entitlement to reject) and its request translation
             // drops `speed` entirely — routing a fast request there would
             // silently serve it at standard speed (LAB-2687).
-            if fast && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
+            if fast.excludes_openai() && self.endpoints[c.endpoint].protocol == Protocol::OpenAI {
                 trace!(
                     endpoint = self.endpoints[c.endpoint].name,
-                    model,
+                    model = %GoQuoted(model),
                     "pick: skipping, openai-protocol endpoint can't honor speed:\"fast\""
                 );
                 return false;
             }
             true
         });
-        if let Some(preferred) = self.client_preferred_endpoints(client_id) {
+        if let Some(preferred) = caller.preferred_endpoints() {
             let is_preferred =
                 |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
             // Undemoted = candidate priority equals the configured priority.
@@ -527,15 +643,15 @@ impl AppState {
                 |c: &RoutingCandidate| c.priority == self.endpoints[c.endpoint].priority;
             if candidates
                 .iter()
-                .any(|c| is_preferred(c) && undemoted(c) && c.gate < self.soft_limit)
+                .any(|c| is_preferred(c) && undemoted(c) && self.is_healthy(c.gate, c.weight))
             {
                 candidates.retain(is_preferred);
             } else {
                 // Greppable spill marker — the request leaves its dedicated
                 // account(s) and will consume shared-pool cache/claims.
                 info!(
-                    client_id,
-                    model,
+                    client_id = caller.name(),
+                    model = %GoQuoted(model),
                     fast_mode_disabled = fast_disabled
                         .iter()
                         .any(|&i| self.endpoint_is_preferred(preferred, i)),
@@ -560,7 +676,7 @@ impl AppState {
             // Prefer healthy candidates; fall back to soft-limited ones within the tier.
             let healthy: Vec<&RoutingCandidate> = tier_candidates
                 .iter()
-                .filter(|c| c.gate < self.soft_limit)
+                .filter(|c| self.is_healthy(c.gate, c.weight))
                 .copied()
                 .collect();
 
@@ -585,7 +701,15 @@ impl AppState {
                     "pick: tier all soft-limited — degrading within tier"
                 );
             }
-            return Some(self.pick_from_candidates(&effective, total_weight, affinity_key, *tier));
+            let picked = self.pick_from_candidates(&effective, total_weight, affinity_key, *tier);
+            let sticky_v2 = self.routing_strategy == RoutingStrategy::StickyWeightedV2;
+            match affinity_key {
+                Some(key) if first_pick && sticky_v2 => {
+                    self.record_affinity_pick(key, model, picked, &candidates, &effective, *tier)
+                }
+                _ => {}
+            }
+            return Some(picked);
         }
 
         debug!("pick: all tiers exhausted");
@@ -601,18 +725,26 @@ impl AppState {
             &ep.name,
             headers,
             /* is_fast_mode */ false,
+            /* caller_credential */ false,
         )
         .await;
     }
 
     /// Parse rate-limit headers from a response into the supplied
     /// `RateLimitInfo` lock.
+    ///
+    /// `caller_credential` is true when the request went out with the
+    /// caller's own auth (a passthrough endpoint). The headers then describe
+    /// the caller's plan, not the endpoint, so they are skipped like a
+    /// fast-mode response's: ingesting them would let one caller's plan set
+    /// the endpoint's routing weight for every other caller.
     pub(crate) async fn update_rate_info_for(
         &self,
         rate_info: &RwLock<RateLimitInfo>,
         endpoint_name: &str,
         headers: &reqwest::header::HeaderMap,
         is_fast_mode: bool,
+        caller_credential: bool,
     ) {
         // A fast-mode response's `anthropic-ratelimit-unified-*` headers
         // describe the FAST/paid POOL, not the account's 5h/7d subscription
@@ -641,7 +773,7 @@ impl AppState {
         // fast response could still freeze this account's standard view; the
         // ≤`probe_interval_secs` background probe refreshes the real 5h/7d view
         // regardless of traffic, bounding that staleness.
-        if is_fast_mode {
+        if is_fast_mode || caller_credential {
             return;
         }
 
@@ -650,15 +782,15 @@ impl AppState {
         // Debug: log all ratelimit headers
         for (name, value) in headers.iter() {
             let name_str = name.as_str();
-            if name_str.contains("ratelimit") || name_str.contains("retry") {
-                if let Ok(v) = value.to_str() {
-                    tracing::trace!(
-                        account = endpoint_name,
-                        header = name_str,
-                        value = v,
-                        "rate-limit header"
-                    );
-                }
+            if (name_str.contains("ratelimit") || name_str.contains("retry"))
+                && let Ok(v) = value.to_str()
+            {
+                tracing::trace!(
+                    account = endpoint_name,
+                    header = name_str,
+                    value = v,
+                    "rate-limit header"
+                );
             }
         }
 
@@ -736,29 +868,24 @@ impl AppState {
 
         // Capture per-window reset timestamps (epoch seconds).
         // Sanity-capped: 5h window can't reset >5h out, 7d can't reset >7d out (Bug #6).
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset") {
-            if let Ok(s) = v.to_str() {
-                if let Ok(epoch) = s.parse::<u64>() {
-                    if epoch <= now_epoch + 18000 {
-                        info.reset_5h = Some(epoch);
-                    }
-                }
-            }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-5h-reset")
+            && let Ok(s) = v.to_str()
+            && let Ok(epoch) = s.parse::<u64>()
+            && epoch <= now_epoch + 18000
+        {
+            info.reset_5h = Some(epoch);
         }
         // 7d reset → only update existing claims_7d entries. Creating a placeholder
         // with utilization=None would shadow real fallback entries in resolve_7d_claim
         // (model-specific key takes priority over "seven_day" via or_else).
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset") {
-            if let Ok(s) = v.to_str() {
-                if let Ok(epoch) = s.parse::<u64>() {
-                    if epoch <= now_epoch + 604800 {
-                        if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
-                            entry.reset = Some(epoch);
-                            entry.last_seen = now_epoch;
-                        }
-                    }
-                }
-            }
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-reset")
+            && let Ok(s) = v.to_str()
+            && let Ok(epoch) = s.parse::<u64>()
+            && epoch <= now_epoch + 604800
+            && let Some(entry) = info.claims_7d.get_mut(claim_key_7d)
+        {
+            entry.reset = Some(epoch);
+            entry.last_seen = now_epoch;
         }
 
         // Capture per-window status. These signal API-side pressure (burst limits, concurrent
@@ -774,11 +901,11 @@ impl AppState {
         }
         // 7d status → only update existing claims_7d entries (same shadowing concern).
         if let Some(v) = headers.get("anthropic-ratelimit-unified-7d-status") {
-            if let Ok(s) = v.to_str() {
-                if let Some(entry) = info.claims_7d.get_mut(claim_key_7d) {
-                    entry.status = Some(s.to_string());
-                    entry.last_seen = now_epoch;
-                }
+            if let Ok(s) = v.to_str()
+                && let Some(entry) = info.claims_7d.get_mut(claim_key_7d)
+            {
+                entry.status = Some(s.to_string());
+                entry.last_seen = now_epoch;
             }
         } else if got_7d_util {
             // Status absent but util present → pressure subsided for this claim
@@ -797,48 +924,43 @@ impl AppState {
         // exactly like every other claim. Anchored on the utilization header so
         // a partial triplet never creates a utilization-less placeholder (same
         // shadowing rule as the general 7d claim).
-        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d_oi-utilization") {
-            if let Ok(s) = v.to_str() {
-                if let Ok(util) = s.parse::<f64>() {
-                    let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
-                    let entry = info
-                        .claims_7d
-                        .entry(FABLE_BAND_CLAIM.to_string())
-                        .or_default();
-                    entry.utilization = Some(util.clamp(0.0, 1.0));
-                    entry.last_seen = now_epoch;
-                    entry.reset = headers
-                        .get("anthropic-ratelimit-unified-7d_oi-reset")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
-                        .or(entry.reset);
-                    // Status absent within a present triplet = pressure subsided
-                    // (same semantics as the general 7d claim, Bug #1).
-                    entry.status = headers
-                        .get("anthropic-ratelimit-unified-7d_oi-status")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    if first_sighting {
-                        info!(
-                            account = endpoint_name,
-                            utilization = util,
-                            "fable band claim first observed (7d_oi headers) — \
+        if let Some(v) = headers.get("anthropic-ratelimit-unified-7d_oi-utilization")
+            && let Ok(s) = v.to_str()
+            && let Ok(util) = s.parse::<f64>()
+        {
+            let first_sighting = !info.claims_7d.contains_key(FABLE_BAND_CLAIM);
+            let entry = info
+                .claims_7d
+                .entry(FABLE_BAND_CLAIM.to_string())
+                .or_default();
+            entry.utilization = Some(util.clamp(0.0, 1.0));
+            entry.last_seen = now_epoch;
+            entry.reset = headers
+                .get("anthropic-ratelimit-unified-7d_oi-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&epoch| epoch <= now_epoch + 604800) // 7d sanity cap
+                .or(entry.reset);
+            // Status absent within a present triplet = pressure subsided
+            // (same semantics as the general 7d claim, Bug #1).
+            entry.status = headers
+                .get("anthropic-ratelimit-unified-7d_oi-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            if first_sighting {
+                info!(
+                    account = endpoint_name,
+                    utilization = util,
+                    "fable band claim first observed (7d_oi headers) — \
                              fable-aware routing active for this account"
-                        );
-                    }
-                }
+                );
             }
         }
 
         // Overage (paid extra usage) — account-level, covers whichever subscription
         // window is exhausted. `overage-in-use` is always overwritten: header absent
         // or "false" → false (so demotion auto-clears when the window refills).
-        info.overage_in_use = headers
-            .get("anthropic-ratelimit-unified-overage-in-use")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        info.overage_in_use = overage_in_use(headers);
         if info.overage_in_use {
             info.overage_status = headers
                 .get("anthropic-ratelimit-unified-overage-status")
@@ -900,31 +1022,51 @@ impl AppState {
         }
         info.utilization = max_util;
 
+        // A capacity 429 poisons remaining_* to 0 (mark_hard_limited_for), and
+        // only the legacy headers below overwrite them. Unified-header accounts
+        // never send those, so drop the poison once its hard limit has ended
+        // and unified utilization is held. While it is, the legacy-token
+        // routing fallback is never read, so a genuine legacy 0 is only
+        // dropped when it no longer steers anything. Restored and Redis-synced
+        // values pass through here on the next update.
+        if info.utilization.is_some()
+            && !info
+                .hard_limited_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            if info.remaining_requests == Some(0) {
+                info.remaining_requests = None;
+            }
+            if info.remaining_tokens == Some(0) {
+                info.remaining_tokens = None;
+            }
+        }
+
         // Legacy headers (still try them)
         let mut got_legacy = false;
-        if let Some(v) = headers.get("x-ratelimit-remaining-requests") {
-            if let Ok(s) = v.to_str() {
-                info.remaining_requests = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-remaining-requests")
+            && let Ok(s) = v.to_str()
+        {
+            info.remaining_requests = s.parse().ok();
+            got_legacy = true;
         }
-        if let Some(v) = headers.get("x-ratelimit-remaining-tokens") {
-            if let Ok(s) = v.to_str() {
-                info.remaining_tokens = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-remaining-tokens")
+            && let Ok(s) = v.to_str()
+        {
+            info.remaining_tokens = s.parse().ok();
+            got_legacy = true;
         }
-        if let Some(v) = headers.get("x-ratelimit-limit-requests") {
-            if let Ok(s) = v.to_str() {
-                info.limit_requests = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-limit-requests")
+            && let Ok(s) = v.to_str()
+        {
+            info.limit_requests = s.parse().ok();
+            got_legacy = true;
         }
-        if let Some(v) = headers.get("x-ratelimit-limit-tokens") {
-            if let Ok(s) = v.to_str() {
-                info.limit_tokens = s.parse().ok();
-                got_legacy = true;
-            }
+        if let Some(v) = headers.get("x-ratelimit-limit-tokens")
+            && let Ok(s) = v.to_str()
+        {
+            info.limit_tokens = s.parse().ok();
+            got_legacy = true;
         }
 
         // Only advance last_updated when we actually parsed rate-limit data.
@@ -943,9 +1085,9 @@ impl AppState {
             util_5h = ?info.utilization_5h,
             reset_5h = ?info.reset_5h,
             reset_7d = ?info.reset_7d,
-            status_5h = ?info.status_5h,
-            status_7d = ?info.status_7d,
-            claim = ?info.representative_claim,
+            status_5h = %GoQuoted(info.status_5h.as_deref().unwrap_or("-")),
+            status_7d = %GoQuoted(info.status_7d.as_deref().unwrap_or("-")),
+            claim = %GoQuoted(info.representative_claim.as_deref().unwrap_or("-")),
             n_claims_7d = info.claims_7d.len(),
             remaining_requests = ?info.remaining_requests,
             remaining_tokens = ?info.remaining_tokens,
@@ -988,10 +1130,10 @@ impl AppState {
             let conn = redis.clone();
             let key = format!("alb:rate:{}", endpoint_name);
             tokio::spawn(async move {
-                if let Ok(json) = serde_json::to_string(&rate_data) {
-                    if let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await {
-                        tracing::warn!(error = %e, "redis rate info write failed");
-                    }
+                if let Ok(json) = serde_json::to_string(&rate_data)
+                    && let Err(e) = redis_set_ex(&conn, &key, json, ttl as i64).await
+                {
+                    tracing::warn!(error = %e, "redis rate info write failed");
                 }
             });
         }
@@ -1037,18 +1179,19 @@ impl AppState {
             Duration::from_secs(burst_secs)
         } else {
             info.consecutive_burst_429s = 0;
-            if let Some(ref s) = raw_retry_after {
-                if let Ok(secs) = s.parse::<f64>() {
-                    if secs.is_finite() && secs > 0.0 && secs < 86400.0 {
-                        Duration::from_secs_f64(secs)
-                    } else {
-                        self.cooldown
-                    }
-                } else {
-                    self.cooldown
-                }
+            let retry_after = raw_retry_after
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|secs| secs.is_finite() && *secs > 0.0);
+            if is_weekly_spent_no_overage(headers) {
+                // Clamped before conversion: `from_secs_f64` panics on a
+                // value too large for a `Duration`.
+                let cap = WEEKLY_SPENT_COOLDOWN.as_secs_f64();
+                Duration::from_secs_f64(retry_after.map_or(cap, |secs| secs.min(cap)))
             } else {
-                self.cooldown
+                retry_after
+                    .filter(|secs| *secs < 86400.0)
+                    .map_or(self.cooldown, Duration::from_secs_f64)
             }
         };
 
@@ -1066,9 +1209,10 @@ impl AppState {
         warn!(
             account = endpoint_name,
             cooldown_secs = cooldown.as_secs(),
-            retry_after_raw = ?raw_retry_after,
+            retry_after_raw = %GoQuoted(raw_retry_after.as_deref().unwrap_or("-")),
             burst = is_burst_limit,
             consecutive_burst = info.consecutive_burst_429s,
+            unified = unified_ratelimit_summary(headers),
             "account hard rate-limited (429), cooling down"
         );
 
@@ -1143,18 +1287,20 @@ impl AppState {
         }
     }
 
-    /// Sync shared state from Redis: hard limits + rate info.
-    /// Called periodically by background task.
-    pub(crate) async fn sync_from_redis(&self) {
+    /// Sync shared state from Redis. Every scope syncs hard limits, flushes
+    /// transport errors and refreshes the cluster info (budgets, heartbeats);
+    /// `SyncScope::Full` also syncs rate info and routing weights.
+    /// Called periodically by background task. Returns whether the rate-info
+    /// read ran and succeeded, which only a `Full` tick attempts.
+    pub(crate) async fn sync_from_redis(&self, scope: SyncScope) -> bool {
         let redis = match self.coordination_redis() {
             Some(r) => r,
-            None => return,
+            None => return false,
         };
         let now_epoch = Self::now_epoch();
         let now_instant = Instant::now();
 
-        // Sync target list over the endpoint pool. OpenAI endpoints are
-        // skipped: they carry no Anthropic rate-limit data.
+        // Sync target list over the endpoints whose rate state is their own.
         struct SyncTarget<'a> {
             name: &'a str,
             rate_info: &'a RwLock<RateLimitInfo>,
@@ -1164,7 +1310,7 @@ impl AppState {
         }
         let mut targets: Vec<SyncTarget<'_>> = Vec::new();
         for e in &self.endpoints {
-            if e.protocol == Protocol::OpenAI {
+            if !e.has_own_rate_state() {
                 continue;
             }
             targets.push(SyncTarget {
@@ -1218,59 +1364,74 @@ impl AppState {
             }
         }
 
-        // 2. Sync rate info (MGET for all targets in one round-trip)
+        // 2. Flush this replica's transport-error deltas into the shared Redis
+        //    hash so the fleet-wide by-kind count is visible cluster-wide.
+        //    Drains the local accumulator; the cluster_info refresh below then
+        //    reads the freshly-flushed total back via HGETALL.
+        self.flush_transport_errors().await;
+
+        // 3. Refresh cluster info cache for /_stats endpoint
+        let info = self.cluster_info().await;
+        *self.lock_cluster_info_cache() = info;
+
+        if scope == SyncScope::Fast {
+            return false;
+        }
+
+        // 4. Sync rate info (MGET for all targets in one round-trip)
         let rate_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:rate:{}", t.name))
             .collect();
 
-        if let Ok(values) = redis.mget::<Vec<Option<String>>, _>(rate_keys).await {
+        let rate_reply = redis.mget::<Vec<Option<String>>, _>(rate_keys).await;
+        let rate_synced = rate_reply.is_ok();
+        if let Ok(values) = rate_reply {
             for (i, val) in values.iter().enumerate() {
-                if let Some(json) = val {
-                    if let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json) {
-                        let mut info = targets[i].rate_info.write().await;
-                        // "Most recent wins": only apply remote data if it's newer
-                        // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
-                        let local_age = info
-                            .last_updated_epoch
-                            .map(|epoch| now_epoch.saturating_sub(epoch))
-                            .unwrap_or(u64::MAX);
-                        let remote_age = now_epoch.saturating_sub(remote.updated_at);
-                        if remote_age < local_age {
-                            info.utilization = remote.utilization;
-                            info.utilization_5h = remote.utilization_5h;
-                            info.utilization_7d = remote.utilization_7d;
-                            info.reset_5h = remote.reset_5h;
-                            info.reset_7d = remote.reset_7d;
-                            info.status_5h = remote.status_5h;
-                            info.status_7d = remote.status_7d;
-                            info.claims_7d = bound_ingested_claims(remote.claims_7d);
-                            // Truncated to match the keys `bound_ingested_claims`
-                            // just wrote — see the same pairing in `load_state`.
-                            info.representative_claim =
-                                remote.representative_claim.as_deref().map(truncate_label);
-                            info.remaining_requests = remote.remaining_requests;
-                            info.remaining_tokens = remote.remaining_tokens;
-                            info.limit_requests = remote.limit_requests;
-                            info.limit_tokens = remote.limit_tokens;
-                            info.overage_in_use = remote.overage_in_use;
-                            info.overage_status = remote.overage_status;
-                            info.overage_utilization = remote.overage_utilization;
-                            info.overage_reset = remote.overage_reset;
-                            info.last_updated = Some(now_instant);
-                            info.last_updated_epoch = Some(remote.updated_at);
-                            trace!(
-                                endpoint = targets[i].name,
-                                remote_age,
-                                "synced rate info from redis"
-                            );
-                        }
+                if let Some(json) = val
+                    && let Ok(remote) = serde_json::from_str::<RedisRateInfo>(json)
+                {
+                    let mut info = targets[i].rate_info.write().await;
+                    // "Most recent wins": only apply remote data if it's newer
+                    // Both ages use wall-clock epoch to avoid mixed-clock-domain bugs
+                    let local_age = info
+                        .last_updated_epoch
+                        .map(|epoch| now_epoch.saturating_sub(epoch))
+                        .unwrap_or(u64::MAX);
+                    let remote_age = now_epoch.saturating_sub(remote.updated_at);
+                    if remote_age < local_age {
+                        info.utilization = remote.utilization;
+                        info.utilization_5h = remote.utilization_5h;
+                        info.utilization_7d = remote.utilization_7d;
+                        info.reset_5h = remote.reset_5h;
+                        info.reset_7d = remote.reset_7d;
+                        info.status_5h = remote.status_5h;
+                        info.status_7d = remote.status_7d;
+                        info.claims_7d = bound_ingested_claims(remote.claims_7d);
+                        // Truncated to match the keys `bound_ingested_claims`
+                        // just wrote — see the same pairing in `load_state`.
+                        info.representative_claim =
+                            remote.representative_claim.as_deref().map(truncate_label);
+                        info.remaining_requests = remote.remaining_requests;
+                        info.remaining_tokens = remote.remaining_tokens;
+                        info.limit_requests = remote.limit_requests;
+                        info.limit_tokens = remote.limit_tokens;
+                        info.overage_in_use = remote.overage_in_use;
+                        info.overage_status = remote.overage_status;
+                        info.overage_utilization = remote.overage_utilization;
+                        info.overage_reset = remote.overage_reset;
+                        info.last_updated = Some(now_instant);
+                        info.last_updated_epoch = Some(remote.updated_at);
+                        trace!(
+                            endpoint = targets[i].name,
+                            remote_age, "synced rate info from redis"
+                        );
                     }
                 }
             }
         }
 
-        // 3. Sync precomputed routing weights (published by probing pod)
+        // 5. Sync precomputed routing weights (published by probing pod)
         let weight_keys: Vec<String> = targets
             .iter()
             .map(|t| format!("alb:weight:{}", t.name))
@@ -1279,29 +1440,20 @@ impl AppState {
             for (i, val) in values.iter().enumerate() {
                 if let Some(csv) = val {
                     let mut parts = csv.splitn(3, ',');
-                    if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next()) {
-                        if let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>()) {
-                            targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
-                            targets[i].share.store(s.to_bits(), Ordering::Relaxed);
-                            // Gate is optional (backward compat with older publishers)
-                            if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
-                                targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
-                            }
+                    if let (Some(w_str), Some(s_str)) = (parts.next(), parts.next())
+                        && let (Ok(w), Ok(s)) = (w_str.parse::<f64>(), s_str.parse::<f64>())
+                    {
+                        targets[i].weight.store(w.to_bits(), Ordering::Relaxed);
+                        targets[i].share.store(s.to_bits(), Ordering::Relaxed);
+                        // Gate is optional (backward compat with older publishers)
+                        if let Some(Ok(g)) = parts.next().map(|g| g.parse::<f64>()) {
+                            targets[i].gate.store(g.to_bits(), Ordering::Relaxed);
                         }
                     }
                 }
             }
         }
-
-        // 4. Flush this replica's transport-error deltas into the shared Redis
-        //    hash so the fleet-wide by-kind count is visible cluster-wide.
-        //    Drains the local accumulator; the cluster_info refresh below then
-        //    reads the freshly-flushed total back via HGETALL.
-        self.flush_transport_errors().await;
-
-        // 5. Refresh cluster info cache for /_stats endpoint
-        let info = self.cluster_info().await;
-        *self.lock_cluster_info_cache() = info;
+        rate_synced
     }
 
     /// Lock the transport-error accumulator via `lock_recovering`. Every
@@ -1338,6 +1490,12 @@ impl AppState {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
         lock_recovering(&self.client_model_usage, "client_model_usage")
+    }
+
+    pub(crate) fn lock_overage_usage(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), [u64; 4]>> {
+        lock_recovering(&self.overage_usage, "overage_usage")
     }
 
     pub(crate) fn lock_client_request_rates(
@@ -1384,10 +1542,7 @@ impl AppState {
         let truncated: Vec<String> = dropped
             .iter()
             .map(|f| {
-                let mut end = f.len().min(MAX_DROPPED_BETA_FLAG_LEN);
-                while !f.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let end = f.floor_char_boundary(MAX_DROPPED_BETA_FLAG_LEN);
                 // A literal `_other` flag must not land on the overflow key.
                 escape_sentinel(&f[..end], &["other"])
             })
@@ -1411,7 +1566,7 @@ impl AppState {
         if !first_seen.is_empty() {
             warn!(
                 client_id,
-                flags = %first_seen.join(","),
+                flags = ?first_seen.join(","),
                 "dropped client anthropic-beta flags not on the allow-list \
                  (a configured allowed_client_betas REPLACES the default list — \
                  include the defaults plus the flags to permit)"
@@ -1428,7 +1583,7 @@ impl AppState {
         if !repeats.is_empty() {
             debug!(
                 client_id,
-                flags = %repeats.join(","),
+                flags = ?repeats.join(","),
                 "dropped client anthropic-beta flags (previously reported)"
             );
         }
@@ -1468,7 +1623,7 @@ impl AppState {
         // Removals past the cap still happened, so they are still counted —
         // under `_other`, not discarded. Dropping them outright let an ordered
         // payload hide the actionable field behind eight junk ones and leave
-        // no trace that anything else went (Helly R finding 3).
+        // no trace that anything else went.
         let over_cap = stripped.len().saturating_sub(keys.len()) as u64;
         let mut map = lock_recovering(&self.beta_body_fields_stripped, "beta_body_fields_stripped");
         if over_cap > 0 {
@@ -1487,8 +1642,9 @@ impl AppState {
         }
         drop(map);
         if !first_seen.is_empty() {
-            // `dropped` is sanitized here too: it is logged raw by the sibling
-            // only because a header token cannot carry a newline.
+            // `dropped` is sanitized here too. The sibling logs it unsanitized
+            // but Debug-quoted (`?`), the rule for a header value (see
+            // `GoQuoted`): a comma-split flag can carry a space, `=` or `"`.
             let context: Vec<String> = dropped
                 .iter()
                 .take(MAX_STRIPPED_FIELDS_PER_REQUEST)
@@ -1689,9 +1845,10 @@ impl AppState {
         // re-seeds this replica's local `budget_usage` mirror (LAB-3217) —
         // see fold_budget_mirror for why it must receive THIS `today`.
         let mut redis_budgets = serde_json::Map::new();
-        if redis_ok && !self.client_budgets.is_empty() {
+        let policy = self.current_client_policy();
+        if redis_ok && !policy.client_budgets.is_empty() {
             let today = Self::now_epoch() / 86400;
-            let client_ids: Vec<&String> = self.client_budgets.keys().collect();
+            let client_ids: Vec<&String> = policy.client_budgets.keys().collect();
             let budget_keys: Vec<String> = client_ids
                 .iter()
                 .map(|id| format!("alb:budget:{id}:{today}"))
@@ -1704,7 +1861,7 @@ impl AppState {
                         .map(|(i, id)| (id.as_str(), values.get(i).copied().flatten().unwrap_or(0)))
                         .collect();
                     for &(client_id, used) in &used_by_client {
-                        let limit = self.client_budgets[client_id];
+                        let limit = policy.client_budgets[client_id];
                         redis_budgets.insert(
                             client_id.to_owned(),
                             serde_json::json!({ "limit": limit, "used": used }),

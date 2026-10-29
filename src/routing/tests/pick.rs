@@ -134,7 +134,9 @@ async fn pick_recovers_after_hard_limit_expires() {
 #[tokio::test]
 async fn pick_ignores_stale_rejected_claim_after_hard_limit() {
     // A "rejected" 7d claim from a 429 response should not permanently block the
-    // account once the hard limit has expired without fresh data.
+    // account once the hard limit has expired without fresh data. A claim used
+    // up to 1.0 before its reset is a spent week, which does block until the
+    // reset (`routing_weight_spent_week_is_zero`), so this one is not.
     let state = test_state_with(vec![mk_endpoint("recovering", "sk-ant-api-a")]);
     let now_epoch = AppState::now_epoch();
 
@@ -148,7 +150,7 @@ async fn pick_ignores_stale_rejected_claim_after_hard_limit() {
         info.claims_7d.insert(
             "seven_day_sonnet".to_string(),
             ClaimWindowData {
-                utilization: Some(1.0),
+                utilization: Some(0.97),
                 reset: Some(now_epoch + 100000),
                 status: Some("rejected".to_string()),
                 ..Default::default()
@@ -358,6 +360,297 @@ async fn mark_hard_limited_capacity_429_poisons_state() {
     );
 }
 
+/// A capacity 429 poisons `remaining_*` to 0, and only the legacy
+/// `x-ratelimit-remaining-*` headers ever overwrote it. Unified-header
+/// accounts never send those, so the 0 outlived the cooldown and read as
+/// "no headroom" forever. The first update after the cooldown clears it.
+#[tokio::test]
+async fn capacity_429_poison_clears_after_cooldown_on_unified_update() {
+    let state = test_state_with(vec![mk_endpoint("poison-clear", "sk-ant-api-a")]);
+
+    let mut h429 = reqwest::header::HeaderMap::new();
+    h429.insert(
+        "anthropic-ratelimit-unified-5h-utilization",
+        HeaderValue::from_static("1.0"),
+    );
+    state.mark_hard_limited(0, &h429).await;
+
+    let mut h200 = reqwest::header::HeaderMap::new();
+    h200.insert(
+        "anthropic-ratelimit-unified-5h-utilization",
+        HeaderValue::from_static("0.4"),
+    );
+
+    // Still cooling down: the poison stands.
+    state.update_rate_info(0, &h200).await;
+    {
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(info.remaining_requests, Some(0));
+        assert_eq!(info.remaining_tokens, Some(0));
+    }
+
+    // Cooldown over.
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+    state.update_rate_info(0, &h200).await;
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(info.remaining_requests, None);
+    assert_eq!(info.remaining_tokens, None);
+}
+
+/// The clear must not touch accounts that report the legacy headers: their
+/// value, a genuine 0 included, comes from the current response.
+#[tokio::test]
+async fn legacy_remaining_headers_still_reported_after_cooldown() {
+    let state = test_state_with(vec![mk_endpoint("legacy", "sk-ant-api-a")]);
+
+    let mut h429 = reqwest::header::HeaderMap::new();
+    h429.insert(
+        "x-ratelimit-remaining-requests",
+        HeaderValue::from_static("0"),
+    );
+    state.mark_hard_limited(0, &h429).await;
+    state.endpoints[0]
+        .rate_info
+        .write()
+        .await
+        .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+
+    let mut h200 = reqwest::header::HeaderMap::new();
+    h200.insert(
+        "x-ratelimit-remaining-requests",
+        HeaderValue::from_static("0"),
+    );
+    h200.insert(
+        "x-ratelimit-remaining-tokens",
+        HeaderValue::from_static("1234"),
+    );
+    state.update_rate_info(0, &h200).await;
+
+    let info = state.endpoints[0].rate_info.read().await;
+    assert_eq!(info.remaining_requests, Some(0));
+    assert_eq!(info.remaining_tokens, Some(1234));
+}
+
+/// A genuine legacy 0 is real exhaustion, not 429 poison: a later response
+/// with no rate data (a headerless 5xx) or only part of the legacy set must
+/// not erase it, with or without an expired 429 behind it.
+#[tokio::test]
+async fn genuine_legacy_zero_survives_headerless_and_partial_responses() {
+    for after_429 in [false, true] {
+        let state = test_state_with(vec![mk_endpoint("legacy-zero", "sk-ant-api-a")]);
+        if after_429 {
+            let mut h429 = reqwest::header::HeaderMap::new();
+            h429.insert(
+                "x-ratelimit-remaining-tokens",
+                HeaderValue::from_static("0"),
+            );
+            state.mark_hard_limited(0, &h429).await;
+            state.endpoints[0]
+                .rate_info
+                .write()
+                .await
+                .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        let mut h200 = reqwest::header::HeaderMap::new();
+        h200.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("0"),
+        );
+        h200.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+        state.update_rate_info(0, &h200).await;
+
+        state
+            .update_rate_info(0, &reqwest::header::HeaderMap::new())
+            .await;
+        let mut partial = reqwest::header::HeaderMap::new();
+        partial.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+        state.update_rate_info(0, &partial).await;
+
+        let info = state.endpoints[0].rate_info.read().await;
+        assert_eq!(info.remaining_tokens, Some(0), "after_429={after_429}");
+    }
+}
+
+/// Unified headers that yield no usable utilization (a bare claim label, a
+/// malformed value) leave the legacy-token fallback as the routing signal,
+/// so they must not erase a genuine legacy 0 either.
+#[tokio::test]
+async fn genuine_legacy_zero_survives_unified_headers_without_utilization() {
+    for (name, value) in [
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "five_hour",
+        ),
+        ("anthropic-ratelimit-unified-5h-utilization", "not-a-number"),
+    ] {
+        for after_429 in [false, true] {
+            let state = test_state_with(vec![mk_endpoint("legacy-zero", "sk-ant-api-a")]);
+            if after_429 {
+                state
+                    .mark_hard_limited(0, &reqwest::header::HeaderMap::new())
+                    .await;
+                state.endpoints[0]
+                    .rate_info
+                    .write()
+                    .await
+                    .hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+            }
+
+            let mut legacy = reqwest::header::HeaderMap::new();
+            legacy.insert(
+                "x-ratelimit-remaining-tokens",
+                HeaderValue::from_static("0"),
+            );
+            legacy.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("1000"));
+            state.update_rate_info(0, &legacy).await;
+
+            let mut unified = reqwest::header::HeaderMap::new();
+            unified.insert(name, HeaderValue::from_static(value));
+            state.update_rate_info(0, &unified).await;
+
+            let info = state.endpoints[0].rate_info.read().await;
+            assert_eq!(
+                info.remaining_tokens,
+                Some(0),
+                "{name}: {value}, after_429={after_429}"
+            );
+        }
+    }
+}
+
+/// LAB-8497: the hard-429 WARN carries every unified rate-limit header the
+/// 429 had, prefix stripped, so the log shows why upstream refused. Headers
+/// outside the unified family stay off the line.
+#[tokio::test]
+async fn mark_hard_limited_logs_unified_headers() {
+    let buf = log_capture_buf();
+    let state = test_state_with(vec![mk_endpoint("unified-log-8497", "sk-ant-api-a")]);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in [
+        ("retry-after", "250000"),
+        ("anthropic-ratelimit-unified-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day",
+        ),
+        ("anthropic-ratelimit-unified-7d-status", "rejected"),
+        ("anthropic-ratelimit-unified-7d-reset", "1790000000"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ("anthropic-ratelimit-unified-overage-in-use", "false"),
+        (
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "org_level_disabled",
+        ),
+        ("request-id", "req_not_logged"),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+
+    state.mark_hard_limited(0, &headers).await;
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains("unified-log-8497") && l.contains("account hard rate-limited"))
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "expected one 429 line, got:\n{}",
+        mine.join("\n")
+    );
+    let line = mine[0];
+    assert!(line.contains(" WARN "), "{line}");
+    // Sorted by name, whatever order the headers were inserted in.
+    assert!(
+        line.contains(
+            "unified=\"7d-reset=1790000000 7d-status=rejected \
+             overage-disabled-reason=org_level_disabled overage-in-use=false \
+             overage-status=rejected representative-claim=seven_day status=rejected\""
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("req_not_logged"), "{line}");
+}
+
+/// `status_5h`, `status_7d`, `claim` and `retry_after_raw` come from upstream
+/// headers, or from Redis. Each is one quoted value, `-` when absent, so text
+/// holding a space and ` client_id=forged` reads back whole, as a Go-strconv
+/// logfmt reader reads it, and adds no field.
+#[tokio::test]
+async fn upstream_fed_rate_limit_log_fields_read_back_whole() {
+    // The global subscriber goes in first, so the scoped one below is never
+    // the only one registered. Were it alone, a callsite first hit on another
+    // test's thread would ask only that thread's default, which is none, and
+    // cache "never" for this test too.
+    log_capture_buf();
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    // TRACE, for `rate info updated`, on this test's thread only.
+    let _log = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buf.clone()))
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("anthropic_lb=trace"))
+            .finish(),
+    );
+    let state = test_state_with(vec![mk_endpoint("forge-fields", "sk-ant-api-a")]);
+    let forged = |v: &str| format!("{v} client_id=forged");
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in [
+        ("anthropic-ratelimit-unified-5h-status", forged("allowed")),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            forged("five_hour"),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.5".to_owned(),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-status",
+            forged("allowed_warning"),
+        ),
+    ] {
+        headers.insert(name, HeaderValue::from_str(&value).unwrap());
+    }
+    state.update_rate_info(0, &headers).await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_str(&forged("7")).unwrap());
+    state.mark_hard_limited(0, &headers).await;
+    state
+        .mark_hard_limited(0, &reqwest::header::HeaderMap::new())
+        .await;
+
+    let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let lines = |message: &str| -> Vec<&str> {
+        output
+            .lines()
+            .filter(|l| l.contains("forge-fields") && l.contains(message))
+            .collect()
+    };
+    let (rate, limited) = (lines("rate info updated"), lines("hard rate-limited"));
+    assert_eq!((rate.len(), limited.len()), (1, 2), "{output}");
+    for (line, key, sent) in [
+        (rate[0], "status_5h", forged("allowed")),
+        (rate[0], "status_7d", forged("allowed_warning")),
+        (rate[0], "claim", forged("five_hour")),
+        (limited[0], "retry_after_raw", forged("7")),
+        (limited[1], "retry_after_raw", "-".to_owned()),
+    ] {
+        let fields = unpack_logfmt(line, true);
+        assert_eq!(field_values(&fields, key), [sent.as_str()], "{line}");
+        assert!(field_values(&fields, "client_id").is_empty(), "{line}");
+    }
+}
+
 #[tokio::test]
 async fn mark_hard_limited_burst_exponential_backoff() {
     // Consecutive burst 429s should produce increasing cooldowns.
@@ -428,6 +721,157 @@ async fn mark_hard_limited_retry_after_overrides_default() {
     assert_eq!(
         info.consecutive_burst_429s, 0,
         "non-burst 429 should reset burst counter"
+    );
+}
+
+/// LAB-8497: a capacity 429 as an account with no overage path sends it.
+/// `extra` overrides or adds headers on top of the weekly-spent shape.
+fn spent_429(
+    retry_after: &str,
+    extra: &[(&'static str, &'static str)],
+) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_str(retry_after).unwrap());
+    for (name, value) in [
+        ("anthropic-ratelimit-unified-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day",
+        ),
+        ("anthropic-ratelimit-unified-5h-status", "allowed"),
+        ("anthropic-ratelimit-unified-7d-status", "rejected"),
+        ("anthropic-ratelimit-unified-7d-utilization", "1.0"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        (
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "member_zero_credit_limit",
+        ),
+    ]
+    .iter()
+    .chain(extra)
+    {
+        headers.insert(*name, HeaderValue::from_static(value));
+    }
+    headers
+}
+
+async fn cooldown_secs_after(headers: &reqwest::header::HeaderMap) -> u64 {
+    let state = test_state_with(vec![mk_endpoint("spent", "sk-ant-api-a")]);
+    state.mark_hard_limited(0, headers).await;
+    let info = state.endpoints[0].rate_info.read().await;
+    let until = info.hard_limited_until.unwrap();
+    // Round up: a few microseconds pass between marking and reading.
+    until.duration_since(Instant::now()).as_secs() + 1
+}
+
+/// Move endpoint `idx` to the moment just after its hard limit lapsed: the
+/// 429's data (`last_updated`) still predates the expiry, as it does live.
+async fn lapse_hard_limit(state: &AppState, idx: usize) {
+    let mut info = state.endpoints[idx].rate_info.write().await;
+    info.last_updated = Some(Instant::now() - Duration::from_secs(2));
+    info.hard_limited_until = Some(Instant::now() - Duration::from_secs(1));
+}
+
+/// LAB-8497: a spent weekly window with no overage path cools for
+/// `WEEKLY_SPENT_COOLDOWN`, not the default, whatever the days-long
+/// `retry-after` says.
+#[tokio::test]
+async fn weekly_spent_no_overage_cools_fifteen_minutes() {
+    assert_eq!(cooldown_secs_after(&spent_429("258810", &[])).await, 900);
+}
+
+/// LAB-8497: a `retry-after` shorter than the cap wins — the window resets
+/// sooner than the cap would re-check it.
+#[tokio::test]
+async fn weekly_spent_no_overage_honours_shorter_retry_after() {
+    assert_eq!(cooldown_secs_after(&spent_429("120", &[])).await, 120);
+}
+
+/// LAB-8497: a `retry-after` too large for a `Duration` must not panic the
+/// request; the cap bounds it before conversion.
+#[tokio::test]
+async fn weekly_spent_no_overage_bounds_huge_retry_after() {
+    assert_eq!(cooldown_secs_after(&spent_429("1e300", &[])).await, 900);
+}
+
+/// LAB-8497: without the zero-credit reason the account may still pay for
+/// overage, so a weekly `retry-after` keeps today's default cooldown.
+#[tokio::test]
+async fn weekly_spent_with_overage_path_keeps_default_cooldown() {
+    let mut headers = spent_429("258810", &[]);
+    headers.remove("anthropic-ratelimit-unified-overage-disabled-reason");
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
+
+/// LAB-8497: a spent 5h window on the same account carries the same
+/// overage pair but `7d-status: allowed`; it keeps its own `retry-after`.
+#[tokio::test]
+async fn five_hour_refusal_keeps_its_retry_after() {
+    let headers = spent_429(
+        "955",
+        &[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ],
+    );
+    assert_eq!(cooldown_secs_after(&headers).await, 955);
+}
+
+/// LAB-8497: a spent Fable band (`7d_oi`) with the general week still open
+/// keeps the default cooldown. That the band skips Fable only is covered by
+/// `fable_band_rejected_skips_for_fable_only`.
+#[tokio::test]
+async fn fable_band_refusal_keeps_default_cooldown() {
+    let headers = spent_429(
+        "258810",
+        &[
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.6"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.0"),
+        ],
+    );
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
+
+/// LAB-8497: a spent per-family weekly claim limits that family only, so it
+/// must not lock the account for every model; it keeps the default.
+#[tokio::test]
+async fn per_family_weekly_refusal_keeps_default_cooldown() {
+    let headers = spent_429(
+        "258810",
+        &[(
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day_sonnet",
+        )],
+    );
+    assert_eq!(cooldown_secs_after(&headers).await, 60);
+}
+
+/// LAB-8497: the lock lapses on its own, and the account routes again so
+/// the next request or probe re-checks it — the recovery path after an
+/// early reset or extra usage switched on mid-week.
+#[tokio::test]
+async fn weekly_spent_lock_lapses_and_account_routes_again() {
+    let headers = spent_429("258810", &[]);
+    let state = test_state_with(vec![mk_endpoint("spent", "sk-ant-api-a")]);
+    state.update_rate_info(0, &headers).await;
+    state.mark_hard_limited(0, &headers).await;
+    assert_eq!(
+        state.pick_endpoint(None, "claude-opus-4-6", &[]).await,
+        None,
+        "locked account must not route"
+    );
+
+    lapse_hard_limit(&state, 0).await;
+    assert_eq!(
+        state.pick_endpoint(None, "claude-opus-4-6", &[]).await,
+        Some(0),
+        "a lapsed lock must let the account be re-checked"
     );
 }
 
@@ -866,10 +1310,10 @@ async fn pick_prefers_near_reset_account() {
     // Run 100 picks without affinity to see distribution
     let mut a_count = 0;
     for _ in 0..100 {
-        if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
-            if idx == 0 {
-                a_count += 1;
-            }
+        if let Some(idx) = state.pick_endpoint(None, "", &[]).await
+            && idx == 0
+        {
+            a_count += 1;
         }
     }
     // A's effective = max(adj_5h, adj_7d) = max(0.95*0.167, 0.30) = 0.30
@@ -915,10 +1359,10 @@ async fn pick_throttled_excludes() {
 
     let mut b_count = 0;
     for _ in 0..100 {
-        if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
-            if idx == 1 {
-                b_count += 1;
-            }
+        if let Some(idx) = state.pick_endpoint(None, "", &[]).await
+            && idx == 1
+        {
+            b_count += 1;
         }
     }
     // A is throttled → effective=0.98 → excluded by soft_limit=0.90
@@ -967,10 +1411,9 @@ async fn pick_model_specific_7d_throttled_claim_excludes() {
         if let Some(idx) = state
             .pick_endpoint(Some(&key), "claude-opus-4-6", &[])
             .await
+            && idx == 1
         {
-            if idx == 1 {
-                b_count += 1;
-            }
+            b_count += 1;
         }
     }
 
@@ -1009,10 +1452,10 @@ async fn pick_mid_block_unchanged() {
 
     let mut b_count = 0;
     for _ in 0..100 {
-        if let Some(idx) = state.pick_endpoint(None, "", &[]).await {
-            if idx == 1 {
-                b_count += 1;
-            }
+        if let Some(idx) = state.pick_endpoint(None, "", &[]).await
+            && idx == 1
+        {
+            b_count += 1;
         }
     }
     // A: effective=max(0.80, 0.40)=0.80, headroom=0.20

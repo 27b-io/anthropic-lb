@@ -141,8 +141,11 @@ pub(crate) fn test_state_base() -> AppState {
         cooldown: Duration::from_secs(60),
         transport_cooldown: TRANSPORT_UNHEALTHY_COOLDOWN,
         state_path: PathBuf::from("/tmp/anthropic-lb-test.state.json"),
-        proxy_key: None,
-        clients: vec![],
+        // `TestPolicy::open()`'s posture: install a `TestPolicy` for any other.
+        auth_mode: AuthMode::Open,
+        client_policy: std::sync::RwLock::new(Arc::new(
+            ClientPolicy::unchecked(&cfg("")).1.into_inner(),
+        )),
         #[cfg(feature = "guard")]
         guard: crate::guard::Guard::empty(),
         allowed_ips: vec![],
@@ -157,13 +160,10 @@ pub(crate) fn test_state_base() -> AppState {
         auto_cache: true,
         client_usage: Mutex::new(HashMap::new()),
         client_model_usage: Mutex::new(HashMap::new()),
+        overage_usage: Mutex::new(HashMap::new()),
         shadow_log_tx: None,
         shadow_log_dropped: AtomicU64::new(0),
-        client_budgets: HashMap::new(),
         budget_usage: Mutex::new(HashMap::new()),
-        client_utilization_limits: HashMap::new(),
-        operators: vec![],
-        admin_readers: vec![],
         emergency_brake: true,
         emergency_threshold: DEFAULT_EMERGENCY_THRESHOLD,
         client_request_rates: Mutex::new(HashMap::new()),
@@ -187,6 +187,7 @@ pub(crate) fn test_state_base() -> AppState {
         body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         body_read_timeout_total: AtomicU64::new(0),
         affinity_migrations: Default::default(),
+        affinity_last_pick: Default::default(),
         pool_exhausted: Default::default(),
         request_durations: Mutex::new(HashMap::new()),
         start_epoch: AppState::now_epoch(),
@@ -202,6 +203,7 @@ pub(crate) fn test_state_base() -> AppState {
         beta_flags_dropped: Mutex::new(HashMap::new()),
         beta_body_fields_stripped: Mutex::new(HashMap::new()),
         prompt_too_long: Mutex::new(HashMap::new()),
+        speed_unsupported: Mutex::new(HashMap::new()),
         fast_mode_429: Mutex::new(HashMap::new()),
         entitlement_400: Mutex::new(HashMap::new()),
         model_denied: Mutex::new(HashMap::new()),
@@ -209,6 +211,8 @@ pub(crate) fn test_state_base() -> AppState {
         unsupported_models: Mutex::new(HashMap::new()),
         fast_mode_disabled: Mutex::new(HashMap::new()),
         response_cache: None,
+        client_store: None,
+        log_sink: None,
     }
 }
 
@@ -314,12 +318,11 @@ fn test_app_with_strategy(
     acct_b.base_url = upstream_url.to_string();
     let endpoints = vec![acct_a, acct_b];
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key_or_open(proxy_key).install(AppState {
         endpoints,
         routing_strategy,
-        proxy_key,
         ..test_state_base()
-    });
+    }));
 
     (build_router(state.clone()), state)
 }
@@ -452,12 +455,11 @@ pub(crate) fn test_openai_app(
     acct_b.base_url = upstream_url.to_string();
     let accounts = vec![acct_a, acct_b];
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(TestPolicy::shared_key_or_open(proxy_key).install(AppState {
         endpoints: accounts,
         state_path: PathBuf::from("/tmp/anthropic-lb-openai-test.state.json"),
-        proxy_key,
         ..test_state_base()
-    });
+    }));
 
     let app = Router::new()
         .route(
@@ -488,8 +490,8 @@ pub(crate) async fn spawn_flaky_upstream(
     dead_first: usize,
     body: &'static [u8],
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
@@ -505,9 +507,9 @@ pub(crate) async fn spawn_flaky_upstream(
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf).await; // drain the request before responding
             let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
             let _ = s.write_all(head.as_bytes()).await;
             let _ = s.write_all(body).await;
             let _ = s.flush().await;
@@ -538,8 +540,8 @@ pub(crate) async fn spawn_status_then_ok_upstream(
     bad_head: &'static str,
     ok_body: &'static [u8],
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
@@ -608,6 +610,32 @@ pub(crate) const HEAD_429_RETRY_AFTER_7: &str = "HTTP/1.1 429 Too Many Requests\
 /// Raw 404 with Anthropic's model-not-found envelope (`connection: close`, so
 /// the body is EOF-delimited — no content-length needed).
 pub(crate) const HEAD_404_MODEL: &str = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nope-1\"}}";
+/// A capacity 429: `retry-after` plus unified headers reporting an exhausted
+/// 5h window, so ingesting or marking it visibly changes `rate_info`.
+pub(crate) const HEAD_429_CAPACITY: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\nanthropic-ratelimit-unified-5h-status: rejected\r\nanthropic-ratelimit-unified-representative-claim: five_hour\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}";
+/// A burst 429 (`is_burst_429`): `x-should-retry`, no `retry-after`, no rate
+/// headers. The body is EOF-delimited (`connection: close`).
+pub(crate) const HEAD_429_BURST: &str = "HTTP/1.1 429 Too Many Requests\r\nx-should-retry: true\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}";
+
+pub(crate) type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// Endpoint `name` (with `token`) at priority 0 that always answers `head`,
+/// and a healthy pooled account at priority 1. Any rotation off the first
+/// lands on `healthy`, so its hit count is the "did we rotate?" probe.
+/// `PASSTHROUGH` makes the first a passthrough endpoint, `pt`.
+pub(crate) async fn first_then_healthy(
+    (name, token): (&str, &str),
+    head: &'static str,
+) -> (Vec<Endpoint>, Hits, Hits) {
+    let (first_url, first_hits) = spawn_status_then_ok_upstream(usize::MAX, head, b"{}").await;
+    let (ok_url, ok_hits) = spawn_flaky_upstream(0, ANTHROPIC_OK_BODY).await;
+    let mut healthy = mk_endpoint_at("healthy", "sk-ant-api-h", &ok_url);
+    healthy.priority = 1;
+    let first = mk_endpoint_at(name, token, &first_url);
+    (vec![first, healthy], first_hits, ok_hits)
+}
+pub(crate) const PASSTHROUGH: (&str, &str) = ("pt", "passthrough");
+pub(crate) const POOLED: (&str, &str) = ("pooled", "sk-ant-api-pooled");
 
 /// Poll endpoint token counters until streamed usage lands (the finalize
 /// task is detached, so recording races the client seeing end-of-stream).
@@ -649,7 +677,7 @@ pub(crate) fn poison<T: Send>(mutex: &std::sync::Mutex<T>) {
 /// `MakeWriter` over a shared buffer, so a test can capture what the stderr
 /// layer would have written and inspect it after the request completes.
 #[derive(Clone)]
-struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct CapturedLog(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for CapturedLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -697,6 +725,68 @@ pub(crate) fn log_capture_buf() -> Arc<Mutex<Vec<u8>>> {
     })
     .clone()
 }
+
+/// Poll `done` every 10 ms until it holds; fail after `within`.
+pub(crate) async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + within;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// The test binary's allocator: the system's, counting what each thread
+// allocates, so a test can bound what one call allocates whatever other tests
+// do on their own threads meanwhile. The counter is const-initialised and
+// holds no destructor, so reading it never allocates.
+thread_local! {
+    static THREAD_ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CountingAlloc;
+
+fn count_allocation(bytes: usize) {
+    let _ = THREAD_ALLOCATED.try_with(|c| c.set(c.get().saturating_add(bytes)));
+}
+
+// SAFETY: every method forwards to `System` unchanged; counting touches only
+// a thread-local `Cell<usize>`.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        // SAFETY: the caller's contract is `System`'s.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation(layout.size());
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count_allocation(new_size);
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: as `alloc`.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
+
+/// Run `f`, and return what it returned with the bytes this thread allocated
+/// while it ran (frees not subtracted).
+pub(crate) fn allocated_by<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = THREAD_ALLOCATED.with(std::cell::Cell::get);
+    let out = f();
+    (out, THREAD_ALLOCATED.with(std::cell::Cell::get) - before)
+}
+
 /// Helper: set up account utilization for enforcement tests.
 pub(crate) async fn set_account_utilization(
     state: &AppState,
@@ -773,6 +863,8 @@ pub(crate) const PROMPT_TOO_LONG_BODY: &[u8] = br#"{"type":"error","error":{"typ
 // mostly prove one thing from several angles — that `client_id` cannot be
 // asserted by the caller once a client table exists.
 
+/// A `[[clients]]` entry. `key` is stored as given, so pass a `test_key`: the
+/// build refuses anything shorter than `MIN_KEY_LEN`.
 pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig {
     ClientConfig {
         name: name.to_string(),
@@ -785,10 +877,193 @@ pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig 
 }
 
 pub(crate) fn state_with_clients(clients: Vec<ClientConfig>) -> Arc<AppState> {
-    Arc::new(AppState {
-        clients,
-        ..test_state_base()
-    })
+    Arc::new(TestPolicy::clients(clients).install(test_state_base()))
+}
+
+/// A test credential: `tag` plus a fixed 33-character suffix, so it clears
+/// `MIN_KEY_LEN` whatever the tag. A test configures `test_key(tag)` and
+/// presents `test_key(tag)`. A near miss must be derived from the whole key:
+/// `test_key` of a near-miss tag differs in the tag only.
+pub(crate) fn test_key(tag: &str) -> String {
+    format!("{tag}-0123456789abcdef0123456789abcdef")
+}
+
+/// The per-client half of a test state, built by `ClientPolicy::build` — the
+/// checks a real boot runs — so a fixture holds nothing a config could not.
+/// Pick the auth mode, add the name-keyed policy, then `install` it.
+pub(crate) struct TestPolicy(Config);
+
+impl TestPolicy {
+    /// No credential: `allow_unauthenticated = true`, as `test_state_base()`.
+    pub(crate) fn open() -> Self {
+        Self(cfg("allow_unauthenticated = true\n"))
+    }
+
+    /// The legacy shared `proxy_key`.
+    pub(crate) fn shared_key(key: &str) -> Self {
+        let mut config = cfg("");
+        config.proxy_key = Some(key.to_string());
+        Self(config)
+    }
+
+    /// `shared_key` when given one, else `open`: the fixtures that take an
+    /// optional proxy key.
+    pub(crate) fn shared_key_or_open(proxy_key: Option<String>) -> Self {
+        proxy_key.map_or_else(Self::open, |key| Self::shared_key(&key))
+    }
+
+    /// `[[clients]]`.
+    pub(crate) fn clients(clients: Vec<ClientConfig>) -> Self {
+        let mut config = cfg("");
+        config.clients = clients;
+        Self(config)
+    }
+
+    pub(crate) fn operators(mut self, names: &[&str]) -> Self {
+        self.0.operators = names.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub(crate) fn admin_readers(mut self, names: &[&str]) -> Self {
+        self.0.admin_readers = names.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub(crate) fn budgets(mut self, budgets: HashMap<String, u64>) -> Self {
+        self.0.client_budgets = budgets;
+        self
+    }
+
+    /// `[client_store]`, polled at `poll_url`, with a token when given one.
+    pub(crate) fn client_store(mut self, poll_url: &str, token: Option<&str>) -> Self {
+        self.0.client_store = Some(ClientStoreConfig {
+            poll_url: poll_url.to_string(),
+            token: token.map(str::to_string),
+        });
+        self
+    }
+
+    pub(crate) fn utilization_limits(mut self, limits: HashMap<String, f64>) -> Self {
+        self.0.client_utilization_limits = limits;
+        self
+    }
+
+    /// Build against `state`. Its `endpoints` stand in for `[[endpoints]]`,
+    /// which the build checks pins and `passthrough` against. Panics with the
+    /// boot error when the build refuses.
+    fn build(mut self, state: &AppState) -> (AuthMode, BuiltPolicy) {
+        self.0.endpoints = state.endpoints.iter().map(endpoint_config).collect();
+        ClientPolicy::build(&self.0)
+            .unwrap_or_else(|e| panic!("test client policy refused at build: {e}"))
+    }
+
+    /// Build, then install into `state`.
+    pub(crate) fn install(self, state: AppState) -> AppState {
+        self.install_keeping(state).0
+    }
+
+    /// `install`, also returning the built policy, for a fixture that builds
+    /// a client store reader on it, as `main()` does.
+    pub(crate) fn install_keeping(self, state: AppState) -> (AppState, BuiltPolicy) {
+        let (auth_mode, policy) = self.build(&state);
+        (install_policy(state, auth_mode, policy.clone()), policy)
+    }
+
+    /// Build, then swap in as `state`'s policy, the way a runtime policy
+    /// source would. The auth mode stays the boot's, so the build must agree
+    /// with it.
+    pub(crate) fn swap_into(self, state: &AppState) {
+        let (auth_mode, policy) = self.build(state);
+        assert_eq!(
+            std::mem::discriminant(&auth_mode),
+            std::mem::discriminant(&state.auth_mode),
+            "a swap never changes how callers authenticate"
+        );
+        state
+            .swap_client_policy(policy)
+            .unwrap_or_else(|e| panic!("swap refused: {e}"));
+    }
+
+    /// Install with no check at all, for the tests that pin how the runtime
+    /// behaves in a state a boot refuses.
+    pub(crate) fn install_unchecked(self, state: AppState) -> AppState {
+        let (auth_mode, policy) = ClientPolicy::unchecked(&self.0);
+        install_policy(state, auth_mode, policy)
+    }
+}
+
+/// The before and after policies of the budget-gauge swap tests, in-process
+/// and cluster-wide, so the two cannot drift apart. An operator `ops` reads
+/// the gauges; across the swap `team-alpha` loses its budget, `team-bravo`'s
+/// grows and `team-charlie` gains one.
+pub(crate) fn budget_swap_policies() -> (TestPolicy, TestPolicy) {
+    let policy = |budgets: [(&str, u64); 2]| {
+        TestPolicy::clients(vec![
+            mk_client("ops", &test_key("ops"), &[]),
+            mk_client("team-alpha", &test_key("alpha"), &[]),
+            mk_client("team-bravo", &test_key("bravo"), &[]),
+            mk_client("team-charlie", &test_key("charlie"), &[]),
+        ])
+        .operators(&["ops"])
+        .budgets(
+            budgets
+                .map(|(name, budget)| (name.to_string(), budget))
+                .into(),
+        )
+    };
+    (
+        policy([("team-alpha", 1_000), ("team-bravo", 2_000)]),
+        policy([("team-bravo", 5_000), ("team-charlie", 300)]),
+    )
+}
+
+/// The `[[endpoints]]` entry `ep` would have been loaded from, for the build's
+/// endpoint cross-checks.
+fn endpoint_config(ep: &Endpoint) -> EndpointConfig {
+    EndpointConfig {
+        name: ep.name.clone(),
+        protocol: ep.protocol,
+        base_url: Some(ep.base_url.clone()),
+        token: ep.token.clone(),
+        models: ep.models.clone(),
+        priority: ep.priority,
+        fable_included: Some(ep.fable_included),
+        allow_nonstandard_host: None,
+    }
+}
+
+/// Install a built policy as `state`'s snapshot, as `main()` does.
+fn install_policy(state: AppState, auth_mode: AuthMode, policy: BuiltPolicy) -> AppState {
+    AppState {
+        auth_mode,
+        client_policy: std::sync::RwLock::new(Arc::new(policy.into_inner())),
+        ..state
+    }
+}
+
+impl AppState {
+    /// A caller named `name` under the current snapshot, built as a shared-
+    /// key or open proxy builds a header-derived caller: its role is looked up
+    /// by name, by the rule the build gave the principal table. For tests that
+    /// drive a per-client decision without a request.
+    pub(crate) fn caller(&self, name: &str) -> Caller {
+        Caller::named(self.current_client_policy(), name.to_string())
+    }
+}
+
+/// One `/metrics` family's values by `client` label, for the families
+/// labelled by client alone.
+pub(crate) fn metric_by_client(body: &str, family: &str) -> HashMap<String, u64> {
+    let prefix = format!("{family}{{client=\"");
+    body.lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|rest| {
+            let (client, value) = rest
+                .split_once("\"} ")
+                .unwrap_or_else(|| panic!("unexpected {family} line: {rest}"));
+            (client.to_string(), value.parse::<f64>().unwrap() as u64)
+        })
+        .collect()
 }
 
 pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
@@ -807,6 +1082,48 @@ pub(crate) fn hdrs(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
 /// native surface it was also a panic: `serde_json::Value`'s `IndexMut<&str>`
 /// auto-vivifies only on `Null` and `Object`.
 pub(crate) const NON_OBJECT_JSON_BODIES: [&str; 5] = ["[1,2,3]", "\"x\"", "7", "true", "null"];
+
+/// Bodies the proxy's `serde_json` parse refuses although another common JSON
+/// decoder reads `"model":"claude-opus-5"` out of them, so the proxy must never
+/// forward one (LAB-6781). Labelled for assertion messages. The last one also
+/// repeats `model`, pinning that an unparsed body cannot step around the
+/// duplicate-key rule either.
+pub(crate) fn unparseable_json_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    const HEAD: &[u8] =
+        br#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":""#;
+    const TAIL: &[u8] = br#""}]}"#;
+    let with_content = |content: &[u8]| [HEAD, content, TAIL].concat();
+    let object = String::from_utf8(with_content(b"hi")).unwrap();
+    let nested = format!(
+        r#"{{"model":"claude-opus-5","max_tokens":1,"metadata":{}{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    vec![
+        ("lone high surrogate", with_content(br"\ud800")),
+        ("lone low surrogate", with_content(br"\udc00")),
+        ("200-deep nesting", nested.into_bytes()),
+        (
+            "out-of-range number",
+            br#"{"model":"claude-opus-5","max_tokens":1e400}"#.to_vec(),
+        ),
+        ("raw 0xFF byte in a string", with_content(b"\xff")),
+        ("trailing bytes", format!("{object} trailing").into_bytes()),
+        ("UTF-8 BOM", [b"\xEF\xBB\xBF", object.as_bytes()].concat()),
+        (
+            "UTF-16LE",
+            object.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ),
+        (
+            "duplicate model plus lone surrogate",
+            [
+                br#"{"model":"claude-haiku-4-5","#.as_slice(),
+                &with_content(br"\ud800")[1..],
+            ]
+            .concat(),
+        ),
+    ]
+}
 
 /// Object bodies with an ambiguous top-level key, which both SDK surfaces
 /// reject locally. The first is the allow-list bypass: a `claude-haiku-*`
@@ -843,6 +1160,10 @@ pub(crate) fn openai_invalid_request_body(message: &str) -> serde_json::Value {
         }
     })
 }
+
+/// 64-hex — what `openssl rand -hex 32` emits, and the documented floor.
+pub(crate) const STRONG_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 pub(crate) const TEST_IP: &str = "10.0.0.7";
 
@@ -1050,4 +1371,136 @@ pub(crate) async fn spawn_mock_detector() -> MockDetector {
 #[cfg(feature = "guard")]
 pub(crate) fn detector_cfg(url: &str) -> guard::detector::DetectorConfig {
     toml::from_str(&format!("url = \"{url}\"")).expect("detector config")
+}
+
+// ── Go strconv unquoting and a logfmt reader, to read back a logged value ──
+
+/// One Go string escape, `rest` being the bytes after its `\`: the character
+/// it stands for and how many bytes of `rest` it spans. Only the escapes a
+/// logged value carries are read (`\n`, `\r`, `\t`, `\\`, `\"`, `\uXXXX`,
+/// `\UXXXXXXXX` naming a scalar value); any other is `None`. Go refuses Rust
+/// Debug's `\u{1}`, `\0` and `\'` too, and for the rest Go defines, `None`
+/// keeps the helper stricter than Go, never looser.
+fn go_escape(rest: &[u8]) -> Option<(char, usize)> {
+    // `from_str_radix` alone would also take a leading `+`.
+    let hex = |n: usize| {
+        let digits = std::str::from_utf8(rest.get(1..=n)?).ok()?;
+        if !digits.bytes().all(|d| d.is_ascii_hexdigit()) {
+            return None;
+        }
+        let c = char::from_u32(u32::from_str_radix(digits, 16).ok()?)?;
+        Some((c, n + 1))
+    };
+    match *rest.first()? {
+        b'n' => Some(('\n', 1)),
+        b'r' => Some(('\r', 1)),
+        b't' => Some(('\t', 1)),
+        b'\\' => Some(('\\', 1)),
+        b'"' => Some(('"', 1)),
+        b'u' => hex(4),
+        b'U' => hex(8),
+        _ => None,
+    }
+}
+
+/// Go's `strconv.QuotedPrefix` then `strconv.Unquote` on `s`, which starts
+/// with `"`: the unquoted value and the quoted prefix's length in bytes, or
+/// `None` where Go returns an error (an unterminated quote, a raw newline, an
+/// escape Go does not define). It is also `None`, stricter than Go, for an
+/// escape `go_escape` does not read (`\a`, `\b`, `\f`, `\v`, `\xNN`, octal),
+/// which Go accepts but no logged value carries.
+pub(crate) fn go_quoted_prefix(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let (mut i, mut out) = (1, Vec::new());
+    loop {
+        match *b.get(i)? {
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
+            b'\n' => return None,
+            b'\\' => {
+                let (c, len) = go_escape(&b[i + 1..])?;
+                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                i += 1 + len;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// `(name, value)` for each field VictoriaLogs' `unpack_logfmt` reads from
+/// `line`, ported from its `logfmtParser.parse` and `tryUnquoteString`: a
+/// value that opens with `"` and is a Go quoted prefix is unquoted, and any
+/// other value runs unquoted to the next space. A word with no `=` is a field
+/// with an empty value, as that reader stores it, so a bare `client_id` after
+/// the real one blanks it under last-wins. Only the words before the first
+/// `=` (the message) are skipped: anything they set, a later field overrides,
+/// and skipping them keeps the `model` in "model unsupported on account" out
+/// of the `model` values. A value opening with `'` or a backtick is not
+/// modelled and panics. With `strict`, a value that opens with `"` but that
+/// Go cannot unquote panics too, instead of being read the way that reader
+/// reads it: a test of our own lines must fail there, not mis-tokenise.
+pub(crate) fn unpack_logfmt(line: &str, strict: bool) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut add = |name: &str, value: &str| {
+        let name = name.trim();
+        if !(name.is_empty() && value.is_empty()) {
+            fields.push((name.to_owned(), value.to_owned()));
+        }
+    };
+    let (mut s, mut past_message) = (line, false);
+    while let Some(n) = s.find(['=', ' ']) {
+        let (name, separator) = (&s[..n], s.as_bytes()[n]);
+        s = &s[n + 1..];
+        if separator == b' ' {
+            if past_message {
+                add(name, "");
+            }
+            continue;
+        }
+        past_message = true;
+        assert!(
+            !s.starts_with(['\'', '`']),
+            "unmodelled quote after {name}= in: {line}"
+        );
+        let quoted = s.starts_with('"').then(|| go_quoted_prefix(s)).flatten();
+        assert!(
+            !strict || quoted.is_some() || !s.starts_with('"'),
+            "{name}= opens a quote Go cannot unquote in: {line}"
+        );
+        if let Some((value, len)) = quoted {
+            add(name, &value);
+            s = &s[len..];
+            match s.strip_prefix(' ') {
+                Some(rest) => s = rest,
+                None => return fields,
+            }
+            continue;
+        }
+        match s.split_once(' ') {
+            Some((value, rest)) => {
+                add(name, value);
+                s = rest;
+            }
+            None => {
+                add(name, s);
+                return fields;
+            }
+        }
+    }
+    if past_message {
+        add(s, "");
+    }
+    fields
+}
+
+/// The values of every `key` field on `fields`, in line order, empty ones
+/// included: an empty `client_id=` would blank the real one.
+pub(crate) fn field_values<'a>(fields: &'a [(String, String)], key: &str) -> Vec<&'a str> {
+    fields
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .collect()
 }
