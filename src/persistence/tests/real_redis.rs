@@ -64,6 +64,7 @@ mod redis_integration {
         ClusterBudgetGaugeAfterSwap = 21,
         FastTickSkipsSlowReads = 22,
         ResponseCacheRedisReconnect = 23,
+        ResponseCacheRedisOutageBound = 24,
     }
 
     impl Db {
@@ -2203,5 +2204,88 @@ mod redis_integration {
             }
         })
         .await;
+    }
+
+    /// LAB-10850: fred keeps every write abandoned at op_timeout during an
+    /// outage, value included, and replays it once Redis is back. So the keys
+    /// in Redis after recovery count exactly the writes that were held in
+    /// memory: `AbandonGate` must cap them, then let writes resume.
+    #[tokio::test]
+    async fn response_cache_redis_outage_holds_at_most_the_gate_cap() {
+        let Some(base) = test_redis_url() else {
+            return;
+        };
+        let target = base
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (proxy_addr, kill) = spawn_killable_proxy(target.clone()).await;
+        let url = Db::ResponseCacheRedisOutageBound.url(&format!("redis://{proxy_addr}"));
+        let mut direct = connect_and_flush(&Db::ResponseCacheRedisOutageBound.url(&base)).await;
+        let rc = ResponseCache::from_config(&ResponseCacheConfig {
+            clients: vec!["geo".to_string()],
+            backend: "redis".to_string(),
+            master_key: "ab".repeat(32),
+            ttl_secs: Some(60),
+            op_timeout_ms: Some(200),
+            redis_url: Some(url),
+            api_key: None,
+            api_url: None,
+        })
+        .await
+        .expect("valid response_cache config")
+        .expect("allow-list is non-empty");
+        let surface = CacheSurface::Messages;
+        let entry = CachedResponse {
+            status: 200,
+            content_type: "application/json".to_string(),
+            body: vec![7u8; 64 * 1024],
+        };
+        let seq = AtomicU64::new(0);
+        let fresh_key = || format!("{:064x}", seq.fetch_add(1, Ordering::Relaxed));
+        let misses = || rc.misses_for(surface).load(Ordering::Relaxed);
+        let keys_in_redis = async |conn: &mut redis::aio::ConnectionManager| -> u64 {
+            redis::cmd("DBSIZE").query_async(conn).await.unwrap()
+        };
+
+        kill_proxy(kill).await;
+        let writes = 4 * AbandonGate::CAP;
+        for _ in 0..writes {
+            rc.store("geo", &fresh_key(), &entry, surface).await;
+        }
+        assert_eq!(
+            rc.errors_for(surface).load(Ordering::Relaxed),
+            writes,
+            "every outage write fails open"
+        );
+
+        let (revived_addr, _revived_kill) = spawn_killable_proxy_at(&proxy_addr, target).await;
+        assert_eq!(revived_addr, proxy_addr);
+        // Probes are `PROBE_INTERVAL` apart, beyond `eventually`'s budget.
+        let deadline = std::time::Instant::now() + 6 * AbandonGate::PROBE_INTERVAL;
+        while misses() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a probe never reached Redis again"
+            );
+            rc.lookup("geo", &fresh_key(), surface).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let held = keys_in_redis(&mut direct).await;
+        assert!(
+            (1..=AbandonGate::CAP).contains(&held),
+            "{held} of {writes} outage writes were held for replay"
+        );
+
+        rc.store("geo", &fresh_key(), &entry, surface).await;
+        assert_eq!(
+            rc.stores_for(surface).load(Ordering::Relaxed),
+            1,
+            "writes resume"
+        );
+        assert_eq!(keys_in_redis(&mut direct).await, held + 1);
     }
 }

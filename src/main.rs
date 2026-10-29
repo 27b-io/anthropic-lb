@@ -675,7 +675,8 @@ async fn main() {
 
     // LAB-933: opt-in encrypted response cache. Invalid CONFIG fails startup
     // — an operator who configured a cache must not silently run without
-    // one. An unreachable BACKEND does not: operations fail open per-request.
+    // one. An unreachable BACKEND does not: cachekitio ops fail open
+    // per-request, and Redis unreachable at startup disables the cache.
     let response_cache = match config.response_cache {
         Some(ref cfg) => match ResponseCache::from_config(cfg).await {
             Ok(Some(rc)) => {
@@ -687,10 +688,8 @@ async fn main() {
                 );
                 Some(rc)
             }
-            Ok(None) => {
-                info!("response_cache configured with an empty client allow-list — inert");
-                None
-            }
+            // `from_config` logged why: an empty allow-list or unreachable Redis.
+            Ok(None) => None,
             Err(msg) => panic!("response_cache config error: {msg}"),
         },
         None => None,

@@ -1473,10 +1473,21 @@ not replayed — they described the original exchange.
 **Fail-open:** a slow, dead, or misconfigured cache backend never blocks a
 request. Every cache operation is bounded by `op_timeout_ms`; on any error the
 request proceeds upstream exactly as if the cache did not exist. With
-`backend = "redis"`, a connection dropped mid-run reconnects on its own (backoff
-up to 30 s), but if Redis is unreachable when the process starts, every cache
-operation fails open until the next restart. Hit / miss /
-store / error counters are exposed on `/metrics`, one series per endpoint
+`backend = "redis"`:
+
+- If Redis is unreachable when the process starts, the cache is disabled
+  (logged at error level, and no `anthropic_response_cache_*` series appear)
+  until the next restart.
+- A connection dropped mid-run reconnects on its own, with backoff up to 30 s.
+  The Redis driver keeps each operation that timed out queued in memory, value
+  included, and replays it once Redis is back. So after 16 timeouts in a row
+  the cache stops writing and probes with one read every 5 s, until Redis
+  answers. An outage therefore holds at most about 16 entries plus those
+  small reads.
+- A connection with a reply pending for more than 5 s is closed and
+  re-established.
+
+Hit / miss / store / error counters are exposed on `/metrics`, one series per endpoint
 (`anthropic_response_cache_*_total{surface="messages"}` and
 `{surface="count_tokens"}`).
 
