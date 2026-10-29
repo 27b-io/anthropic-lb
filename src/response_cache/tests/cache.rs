@@ -77,6 +77,8 @@ impl cachekit::backend::Backend for ErroringBackend {
 #[derive(Default)]
 struct StallableBackend {
     stalled: AtomicBool,
+    /// Latency of every op while not stalled.
+    delay_ms: AtomicU64,
     gets: AtomicU64,
     sets: AtomicU64,
     pings: AtomicU64,
@@ -87,6 +89,7 @@ impl StallableBackend {
         if self.stalled.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+        tokio::time::sleep(Duration::from_millis(self.delay_ms.load(Ordering::Relaxed))).await;
     }
 }
 
@@ -988,6 +991,99 @@ async fn response_cache_abandon_gate_caps_concurrent_and_cancelled_writes() {
         AbandonGate::CAP,
         "the cancelled write plus concurrent ones never exceed the cap"
     );
+}
+
+// LAB-10850: an answer clears only the ops abandoned before the answered op
+// was admitted. A reply that was ready before an outage but read after it
+// says nothing about the ops queued since.
+#[tokio::test]
+async fn response_cache_abandon_gate_late_answer_keeps_newer_abandonments() {
+    let backend = Arc::new(StallableBackend::default());
+    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(1);
+    let closed = |gate: &AbandonGate| gate.counts().abandoned >= AbandonGate::CAP;
+
+    let old = gate.admit(false, deadline()).await.expect("open gate");
+    for _ in 0..AbandonGate::CAP {
+        drop(gate.admit(true, deadline()).await.expect("under the cap"));
+    }
+    assert!(closed(&gate));
+    // No probe until the end: only the answers this test hands in count.
+    gate.counts().next_probe = std::time::Instant::now() + Duration::from_secs(3600);
+    old.answered();
+    assert!(
+        closed(&gate),
+        "a late answer must not forget newer abandonments"
+    );
+    assert!(gate.admit(true, deadline()).await.is_none());
+
+    // The PING is admitted after every abandonment, so its answer clears them.
+    gate.counts().next_probe = std::time::Instant::now();
+    gate.probe_slot().expect("probe due").answered();
+    assert!(!closed(&gate), "an answer to a newer op reopens the gate");
+}
+
+// LAB-10850: cancelled requests close the gate even on a healthy Redis, so
+// one tenant could pause the cache for all. Each close PINGs at once, and the
+// reply reopens the gate for the very request that sent it.
+#[tokio::test]
+async fn response_cache_abandon_gate_false_close_reopens_at_once() {
+    let backend = Arc::new(StallableBackend::default());
+    let mut rc = test_response_cache(backend.clone(), &["geo"], 100);
+    rc.gate = Some(AbandonGate::new(
+        backend.clone(),
+        AbandonGate::PROBE_INTERVAL,
+    ));
+    let gate = rc.gate.as_ref().unwrap();
+    let surface = CacheSurface::Messages;
+    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    for round in 1..=2 {
+        for _ in 0..AbandonGate::CAP {
+            // A request cancelled mid-op, on a live backend.
+            drop(gate.admit(true, far).await.expect("gate open"));
+        }
+        assert!(rc.lookup("geo", &"e".repeat(64), surface).await.is_none());
+        assert_eq!(
+            (
+                backend.pings.load(Ordering::Relaxed),
+                rc.misses_for(surface).load(Ordering::Relaxed),
+            ),
+            (round, round),
+            "close {round} PINGs at once and the lookup reaches Redis"
+        );
+    }
+}
+
+// LAB-10850: the probe runs inside the probing op's own op_timeout, so a
+// closed gate never stretches a request past it.
+#[tokio::test]
+async fn response_cache_abandon_gate_probe_shares_the_op_timeout() {
+    let budget = Duration::from_millis(100);
+    let backend = Arc::new(StallableBackend::default());
+    let mut rc = test_response_cache(backend.clone(), &["geo"], budget.as_millis() as u64);
+    rc.gate = Some(AbandonGate::new(
+        backend.clone(),
+        AbandonGate::PROBE_INTERVAL,
+    ));
+    let gate = rc.gate.as_ref().unwrap();
+    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    for _ in 0..AbandonGate::CAP {
+        drop(gate.admit(true, far).await.expect("under the cap"));
+    }
+
+    // PING and GET take 70 ms each: together they would overrun the budget.
+    backend.delay_ms.store(70, Ordering::Relaxed);
+    let surface = CacheSurface::Messages;
+    let started = std::time::Instant::now();
+    assert!(rc.lookup("geo", &"d".repeat(64), surface).await.is_none());
+    let elapsed = started.elapsed();
+    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        rc.misses_for(surface).load(Ordering::Relaxed),
+        0,
+        "the GET ran past the budget left after the PING ({elapsed:?})"
+    );
+    assert_eq!(rc.errors_for(surface).load(Ordering::Relaxed), 1);
 }
 
 // AC11 (redis): the real fred-backed RedisBackend against a dead port at

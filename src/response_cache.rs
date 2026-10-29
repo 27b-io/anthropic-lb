@@ -74,26 +74,41 @@ pub(crate) struct ResponseCache {
 /// the connection is back: fred skips a queued command only when its OWN
 /// command timeout fired, and cachekit-rs 0.13 exposes no queue bound.
 ///
-/// A write reaches fred only while writes in flight plus ops abandoned since
-/// Redis last answered stay at or under `CAP`, so fred never holds more than
-/// `CAP` values. Reads carry no value; they pass until `CAP` ops are
-/// abandoned. From then on the gate is closed: no op passes, and one PING per
-/// probe interval (under `op_timeout`) checks Redis. Any answer from Redis,
-/// PING included, clears the abandoned count and reopens the gate: fred
-/// answers in queue order, so everything queued before it has drained.
-/// A lookup that times out waiting on cachekit's per-key lock counts as
-/// abandoned too, though it never reached fred: a burst of identical lookups
-/// can close the gate on a healthy Redis, until the next PING reopens it.
+/// A write reaches fred only while writes in flight plus ops abandoned and
+/// not yet known drained stay at or under `CAP`, so fred never holds more
+/// than `CAP` values. On a healthy Redis that also caps concurrent writes at
+/// `CAP`. Reads carry no value; they pass until `CAP` ops are abandoned.
+/// From then on the gate is closed: no op passes, and a PING checks Redis,
+/// inside the probing op's own `op_timeout`.
+///
+/// A miss, a completed write or a PING reply (not a hit, which may come from
+/// L1, nor an error) clears only the ops abandoned before the answered op
+/// was admitted. fred answers in queue order, and an op abandoned before
+/// another was admitted was queued before it, if at all, so those have
+/// drained. An op abandoned later may sit behind the answered one and stays
+/// counted.
+///
+/// Cancelled requests and lookups that time out on cachekit's per-key lock
+/// count as abandoned too, though they may never have reached fred, so a
+/// healthy Redis can close the gate. The first PING is therefore sent at
+/// once, and its reply reopens the gate; only a PING that times out pushes
+/// the next one a probe interval out.
 pub(crate) struct AbandonGate {
     /// The backend the probe PINGs, the same one every op goes through.
     backend: cachekit::SharedBackend,
-    writes_in_flight: AtomicU64,
-    /// Ops abandoned since Redis last answered; fred may still hold them.
-    abandoned: AtomicU64,
-    /// Millis since `epoch` before which no probe may start.
-    next_probe_ms: AtomicU64,
     probe_interval: Duration,
-    epoch: std::time::Instant,
+    counts: std::sync::Mutex<GateCounts>,
+}
+
+/// Held only for a few integer updates, never across an await.
+struct GateCounts {
+    writes_in_flight: u64,
+    /// Ops abandoned since Redis last answered; fred may still hold them.
+    abandoned: u64,
+    /// Every op ever abandoned. A slot records it at admission, so an answer
+    /// can tell which abandonments came after its op was admitted.
+    abandoned_ever: u64,
+    next_probe: std::time::Instant,
 }
 
 impl AbandonGate {
@@ -103,105 +118,133 @@ impl AbandonGate {
     fn new(backend: cachekit::SharedBackend, probe_interval: Duration) -> Self {
         Self {
             backend,
-            writes_in_flight: AtomicU64::new(0),
-            abandoned: AtomicU64::new(0),
-            next_probe_ms: AtomicU64::new(0),
             probe_interval,
-            epoch: std::time::Instant::now(),
+            counts: std::sync::Mutex::new(GateCounts {
+                writes_in_flight: 0,
+                abandoned: 0,
+                abandoned_ever: 0,
+                next_probe: std::time::Instant::now(),
+            }),
         }
     }
 
-    fn is_closed(&self) -> bool {
-        self.abandoned.load(Ordering::SeqCst) >= Self::CAP
+    /// No code path panics while holding the lock, and a poisoned one still
+    /// holds consistent counts.
+    fn counts(&self) -> std::sync::MutexGuard<'_, GateCounts> {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A slot for one backend op, or `None` if the op must fail open
     /// without reaching fred. A closed gate first lets the op that wins the
-    /// probe slot PING Redis, and admits it if Redis answered.
-    async fn admit(&self, write: bool, op_timeout: Duration) -> Option<Slot<'_>> {
-        if self.is_closed() && self.probe_due() {
-            let ping = Slot(Some((self, false)));
-            match tokio::time::timeout(op_timeout, self.backend.health()).await {
+    /// probe slot PING Redis, within the same `deadline` as the op itself.
+    async fn admit(&self, write: bool, deadline: tokio::time::Instant) -> Option<Slot<'_>> {
+        if let Some(ping) = self.probe_slot() {
+            match tokio::time::timeout_at(deadline, self.backend.health()).await {
                 Ok(Ok(_)) => ping.answered(),
                 Ok(Err(_)) => ping.finished(),
                 Err(_) => drop(ping),
             }
         }
-        if self.is_closed() {
+        let mut counts = self.counts();
+        if counts.abandoned >= Self::CAP {
             return None;
         }
-        if !write {
-            return Some(Slot(Some((self, false))));
+        if write {
+            if counts.writes_in_flight + counts.abandoned >= Self::CAP {
+                return None;
+            }
+            counts.writes_in_flight += 1;
         }
-        // Reserve before checking, so concurrent writes cannot all pass.
-        let in_flight = self.writes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        if in_flight + self.abandoned.load(Ordering::SeqCst) > Self::CAP {
-            self.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(Slot(Some((self, true))))
+        Some(self.slot(&counts, write))
     }
 
-    fn probe_due(&self) -> bool {
-        let now = self.epoch.elapsed().as_millis() as u64;
-        let next = self.next_probe_ms.load(Ordering::Relaxed);
-        now >= next
-            && self
-                .next_probe_ms
-                .compare_exchange(
-                    next,
-                    now + self.probe_interval.as_millis() as u64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
+    /// The slot for a PING, if the gate is closed and a probe is due.
+    fn probe_slot(&self) -> Option<Slot<'_>> {
+        let mut counts = self.counts();
+        let now = std::time::Instant::now();
+        if counts.abandoned < Self::CAP || now < counts.next_probe {
+            return None;
+        }
+        counts.next_probe = now + self.probe_interval;
+        Some(self.slot(&counts, false))
+    }
+
+    fn slot(&self, counts: &GateCounts, write: bool) -> Slot<'_> {
+        Slot(Some(Held {
+            gate: self,
+            write,
+            abandoned_ever_at_admit: counts.abandoned_ever,
+        }))
     }
 }
 
 /// One admitted backend op (`None` inside: no gate). Dropped without an
 /// outcome — timed out, or the caller's future cancelled — it counts as
 /// abandoned, since fred may still hold it.
-pub(crate) struct Slot<'a>(Option<(&'a AbandonGate, bool)>);
+struct Slot<'a>(Option<Held<'a>>);
+
+struct Held<'a> {
+    gate: &'a AbandonGate,
+    write: bool,
+    abandoned_ever_at_admit: u64,
+}
+
+impl Held<'_> {
+    fn release(&self, counts: &mut GateCounts) {
+        if self.write {
+            counts.writes_in_flight -= 1;
+        }
+    }
+}
 
 impl Slot<'_> {
     /// Redis answered: a miss, a completed write or a PING. A hit does not
     /// count, as it may have come from L1.
     fn answered(mut self) {
-        if let Some((gate, write)) = self.0.take() {
-            let was = gate.abandoned.swap(0, Ordering::SeqCst);
-            Self::release(gate, write);
-            if was >= AbandonGate::CAP {
-                info!("response cache: Redis answered again — gate reopened");
-            }
+        let Some(held) = self.0.take() else {
+            return;
+        };
+        let mut counts = held.gate.counts();
+        held.release(&mut counts);
+        let was = counts.abandoned;
+        // The ops still counted are always the latest ones abandoned, so
+        // keeping those abandoned after this op's admission is a `min`.
+        counts.abandoned = was.min(counts.abandoned_ever - held.abandoned_ever_at_admit);
+        if was >= AbandonGate::CAP && counts.abandoned < AbandonGate::CAP {
+            info!("response cache: Redis answered again — gate reopened");
         }
     }
 
     /// Done without showing that Redis answered: a hit or an error.
     fn finished(mut self) {
-        if let Some((gate, write)) = self.0.take() {
-            Self::release(gate, write);
-        }
-    }
-
-    fn release(gate: &AbandonGate, write: bool) {
-        if write {
-            gate.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
+        if let Some(held) = self.0.take() {
+            held.release(&mut held.gate.counts());
         }
     }
 }
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        if let Some((gate, write)) = self.0.take() {
-            // Count it abandoned before releasing, so the sum never dips.
-            if gate.abandoned.fetch_add(1, Ordering::SeqCst) + 1 == AbandonGate::CAP {
-                warn!(
-                    cap = AbandonGate::CAP,
-                    probe_ms = gate.probe_interval.as_millis() as u64,
-                    "response cache: Redis ops keep timing out — cache paused, PINGing Redis once per interval"
-                );
-            }
-            Self::release(gate, write);
+        let Some(held) = self.0.take() else {
+            return;
+        };
+        let mut counts = held.gate.counts();
+        held.release(&mut counts);
+        counts.abandoned += 1;
+        counts.abandoned_ever += 1;
+        if counts.abandoned == AbandonGate::CAP {
+            // Probe at once: cancelled requests and per-key lock waits also
+            // count, so a healthy Redis can close the gate. Its PONG then
+            // reopens it within one round trip, not one interval. In an
+            // outage the PING times out and the next one waits the interval.
+            counts.next_probe = std::time::Instant::now();
+            warn!(
+                cap = AbandonGate::CAP,
+                probe_ms = held.gate.probe_interval.as_millis() as u64,
+                "response cache: Redis ops keep timing out — cache paused, PINGing Redis once per interval"
+            );
         }
     }
 }
@@ -482,10 +525,11 @@ impl ResponseCache {
     }
 
     /// A slot for one backend op, or `None` if the gate refuses it. Without
-    /// a gate every op gets one.
-    async fn admit(&self, write: bool) -> Option<Slot<'_>> {
+    /// a gate every op gets one. `deadline` bounds the gate's probe and the
+    /// op together, so neither pushes a request past `op_timeout`.
+    async fn admit(&self, write: bool, deadline: tokio::time::Instant) -> Option<Slot<'_>> {
         match &self.gate {
-            Some(gate) => gate.admit(write, self.op_timeout).await,
+            Some(gate) => gate.admit(write, deadline).await,
             None => Some(Slot(None)),
         }
     }
@@ -503,13 +547,14 @@ impl ResponseCache {
         surface: CacheSurface,
     ) -> Option<CachedResponse> {
         let cache = self.clients.get(client_id)?;
-        let Some(slot) = self.admit(false).await else {
+        let deadline = tokio::time::Instant::now() + self.op_timeout;
+        let Some(slot) = self.admit(false, deadline).await else {
             // No per-op log: `AbandonGate` warned once when it closed.
             self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
             return None;
         };
         let op = async { cache.secure_cache()?.get::<CachedResponse>(key).await };
-        match tokio::time::timeout(self.op_timeout, op).await {
+        match tokio::time::timeout_at(deadline, op).await {
             Ok(Ok(Some(entry))) => {
                 slot.finished();
                 self.hits_for(surface).fetch_add(1, Ordering::Relaxed);
@@ -551,12 +596,13 @@ impl ResponseCache {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
-        let Some(slot) = self.admit(true).await else {
+        let deadline = tokio::time::Instant::now() + self.op_timeout;
+        let Some(slot) = self.admit(true, deadline).await else {
             self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
             return;
         };
         let op = async { cache.secure_cache()?.set(key, entry).await };
-        match tokio::time::timeout(self.op_timeout, op).await {
+        match tokio::time::timeout_at(deadline, op).await {
             Ok(Ok(())) => {
                 slot.answered();
                 self.stores_for(surface).fetch_add(1, Ordering::Relaxed);
