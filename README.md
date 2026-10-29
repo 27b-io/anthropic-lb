@@ -1489,7 +1489,8 @@ request proceeds upstream exactly as if the cache did not exist. With
   A PING checks Redis at once, inside the paused request's `op_timeout_ms`,
   and its reply resumes the cache. If operations abandoned while it was in
   flight keep the cache paused, the next PING is sent at once too. Only a
-  PING that times out or is refused pushes the next one 5 s out. Operations
+  PING that times out or is refused pushes the next one 5 s out; a request
+  that disconnects mid-PING leaves the PING running to its answer. Operations
   the cache skips count as errors. The Redis user needs the `PING` command
   (`+ping` under an ACL), or a pause never ends. `redis_url` must start with
   `redis://` or `rediss://`; a cluster URL is refused.

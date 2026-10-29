@@ -1008,8 +1008,6 @@ async fn response_cache_abandon_gate_late_answer_keeps_newer_abandonments() {
         drop(gate.admit(true, deadline()).await.expect("under the cap"));
     }
     assert!(closed(&gate));
-    // No probe until the end: only the answers this test hands in count.
-    gate.counts().next_probe = std::time::Instant::now() + Duration::from_secs(3600);
     old.answered();
     assert!(
         closed(&gate),
@@ -1128,6 +1126,35 @@ async fn response_cache_abandon_gate_answer_while_still_closed_probes_at_once() 
         gate.probe_slot().is_some(),
         "an answer that leaves the gate closed makes the next PING due now"
     );
+}
+
+// LAB-11737: a request that wins the probe and disconnects mid-PING does
+// not cancel the PING. Its answer still reopens the gate, so such a caller
+// cannot hold the cache paused one probe interval at a time.
+#[tokio::test]
+async fn response_cache_abandon_gate_cancelled_request_still_lands_its_ping() {
+    let backend = Arc::new(StallableBackend::default());
+    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
+    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    for _ in 0..AbandonGate::CAP {
+        drop(gate.admit(true, far).await.expect("under the cap"));
+    }
+
+    backend.delay_ms.store(50, Ordering::Relaxed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), gate.admit(false, far))
+            .await
+            .is_err(),
+        "the caller gives up while its PING is in flight"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        gate.counts().abandoned,
+        0,
+        "the PING answered after its caller left and reopened the gate"
+    );
+    assert!(gate.admit(false, far).await.is_some());
 }
 
 // AC11 (redis): the real fred-backed RedisBackend against a dead port at

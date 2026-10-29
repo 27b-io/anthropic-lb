@@ -66,7 +66,7 @@ pub(crate) struct ResponseCache {
     count_tokens_stores: AtomicU64,
     /// Redis backend only: the cachekitio backend's HTTP client cancels an
     /// abandoned request, so nothing piles up there.
-    gate: Option<AbandonGate>,
+    gate: Option<Arc<AbandonGate>>,
 }
 
 /// Bounds what a Redis outage can pile up in memory (LAB-10850). An op
@@ -96,7 +96,8 @@ pub(crate) struct ResponseCache {
 /// healthy Redis can close the gate. A PING is therefore sent at once when
 /// the gate closes, and again at once after any answer that leaves it
 /// closed. Only a PING that times out or is refused pushes the next one a
-/// probe interval out.
+/// probe interval out. The PING runs on its own task, so a request
+/// cancelled mid-PING does not cancel it: its outcome still counts.
 pub(crate) struct AbandonGate {
     /// The backend the probe PINGs, the same one every op goes through.
     backend: cachekit::SharedBackend,
@@ -120,8 +121,9 @@ impl AbandonGate {
     pub(crate) const CAP: u64 = 16;
     pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-    fn new(backend: cachekit::SharedBackend, probe_interval: Duration) -> Self {
-        Self {
+    /// Shared, so a slot, and the PING's task, can outlive its request.
+    fn new(backend: cachekit::SharedBackend, probe_interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
             backend,
             probe_interval,
             counts: std::sync::Mutex::new(GateCounts {
@@ -130,7 +132,7 @@ impl AbandonGate {
                 abandoned_ever: 0,
                 next_probe: std::time::Instant::now(),
             }),
-        }
+        })
     }
 
     /// No code path panics while holding the lock, and a poisoned one still
@@ -144,13 +146,20 @@ impl AbandonGate {
     /// A slot for one backend op, or `None` if the op must fail open
     /// without reaching fred. A closed gate first lets the op that wins the
     /// probe slot PING Redis, within the same `deadline` as the op itself.
-    async fn admit(&self, write: bool, deadline: tokio::time::Instant) -> Option<Slot<'_>> {
+    async fn admit(self: &Arc<Self>, write: bool, deadline: tokio::time::Instant) -> Option<Slot> {
         if let Some(ping) = self.probe_slot() {
-            match tokio::time::timeout_at(deadline, self.backend.health()).await {
-                Ok(Ok(_)) => ping.answered(),
-                Ok(Err(_)) => ping.finished(),
-                Err(_) => drop(ping),
-            }
+            let backend = self.backend.clone();
+            // Spawned, so a caller that disconnects mid-PING cannot drop the
+            // probe slot and push the next PING an interval out. A JoinError
+            // is a panic the hook already reported, or runtime shutdown.
+            let _ = tokio::spawn(async move {
+                match tokio::time::timeout_at(deadline, backend.health()).await {
+                    Ok(Ok(_)) => ping.answered(),
+                    Ok(Err(_)) => ping.finished(),
+                    Err(_) => drop(ping),
+                }
+            })
+            .await;
         }
         let mut counts = self.counts();
         if counts.abandoned >= Self::CAP {
@@ -166,7 +175,7 @@ impl AbandonGate {
     }
 
     /// The slot for a PING, if the gate is closed and a probe is due.
-    fn probe_slot(&self) -> Option<Slot<'_>> {
+    fn probe_slot(self: &Arc<Self>) -> Option<Slot> {
         let mut counts = self.counts();
         let now = std::time::Instant::now();
         if counts.abandoned < Self::CAP || now < counts.next_probe {
@@ -176,9 +185,9 @@ impl AbandonGate {
         Some(self.slot(&counts, false))
     }
 
-    fn slot(&self, counts: &GateCounts, write: bool) -> Slot<'_> {
+    fn slot(self: &Arc<Self>, counts: &GateCounts, write: bool) -> Slot {
         Slot(Some(Held {
-            gate: self,
+            gate: self.clone(),
             write,
             abandoned_ever_at_admit: counts.abandoned_ever,
         }))
@@ -188,15 +197,15 @@ impl AbandonGate {
 /// One admitted backend op (`None` inside: no gate). Dropped without an
 /// outcome — timed out, or the caller's future cancelled — it counts as
 /// abandoned, since fred may still hold it.
-struct Slot<'a>(Option<Held<'a>>);
+struct Slot(Option<Held>);
 
-struct Held<'a> {
-    gate: &'a AbandonGate,
+struct Held {
+    gate: Arc<AbandonGate>,
     write: bool,
     abandoned_ever_at_admit: u64,
 }
 
-impl Held<'_> {
+impl Held {
     fn release(&self, counts: &mut GateCounts) {
         if self.write {
             counts.writes_in_flight -= 1;
@@ -204,7 +213,7 @@ impl Held<'_> {
     }
 }
 
-impl Slot<'_> {
+impl Slot {
     /// Redis answered: a miss, a completed write or a PING. A hit does not
     /// count, as it may have come from L1.
     fn answered(mut self) {
@@ -234,7 +243,7 @@ impl Slot<'_> {
     }
 }
 
-impl Drop for Slot<'_> {
+impl Drop for Slot {
     fn drop(&mut self) {
         let Some(held) = self.0.take() else {
             return;
@@ -543,7 +552,7 @@ impl ResponseCache {
     /// A slot for one backend op, or `None` if the gate refuses it. Without
     /// a gate every op gets one. `deadline` bounds the gate's probe and the
     /// op together, so neither pushes a request past `op_timeout`.
-    async fn admit(&self, write: bool, deadline: tokio::time::Instant) -> Option<Slot<'_>> {
+    async fn admit(&self, write: bool, deadline: tokio::time::Instant) -> Option<Slot> {
         match &self.gate {
             Some(gate) => gate.admit(write, deadline).await,
             None => Some(Slot(None)),
