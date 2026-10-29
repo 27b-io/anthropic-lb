@@ -1135,25 +1135,34 @@ async fn response_cache_abandon_gate_answer_while_still_closed_probes_at_once() 
 async fn response_cache_abandon_gate_cancelled_request_still_lands_its_ping() {
     let backend = Arc::new(StallableBackend::default());
     let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
-    let far = tokio::time::Instant::now() + Duration::from_secs(1);
+    // Far enough out that a loaded runner cannot time the PING out.
+    let far = tokio::time::Instant::now() + Duration::from_secs(60);
     for _ in 0..AbandonGate::CAP {
         drop(gate.admit(true, far).await.expect("under the cap"));
     }
 
-    backend.delay_ms.store(50, Ordering::Relaxed);
+    backend.delay_ms.store(300, Ordering::Relaxed);
     assert!(
         tokio::time::timeout(Duration::from_millis(10), gate.admit(false, far))
             .await
             .is_err(),
-        "the caller gives up while its PING is in flight"
+        "the caller gives up first"
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The current-thread runtime polls the spawned PING before it can fire
+    // the caller's timeout, so the PING was in flight when the caller left.
     assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
+    for _ in 0..500 {
+        if gate.counts().abandoned < AbandonGate::CAP {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         gate.counts().abandoned,
         0,
         "the PING answered after its caller left and reopened the gate"
     );
+    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
     assert!(gate.admit(false, far).await.is_some());
 }
 
