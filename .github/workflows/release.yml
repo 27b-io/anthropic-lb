@@ -25,7 +25,7 @@ jobs:
       # if the backend is unreachable, so the release gate can never pass
       # with the suite silently skipped.
       valkey:
-        image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
+        image: valkey/valkey@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7 # 8
         ports:
           - 6379:6379
         env:
@@ -42,7 +42,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Parse version from Cargo.toml
         id: version
@@ -66,9 +66,9 @@ jobs:
       # rustfmt+clippy, and rustup installs them onto the PINNED toolchain.
       # An input here would install onto the discarded "stable" toolchain
       # instead — two sources of truth for the same fact.
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Format check
         run: cargo fmt --check
@@ -105,7 +105,7 @@ jobs:
             runner: macos-latest
             cross: false
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # No `targets:` input: it installs the target's std onto the action's
       # discarded "stable" toolchain (`rustup toolchain install stable
@@ -116,9 +116,9 @@ jobs:
       # provisions its target against the pinned toolchain itself on miss.
       # Adding a genuinely cross-compiled non-`cross` target later needs an
       # explicit `rustup target add <target>` step here, not this input.
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -174,9 +174,9 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Authenticate with crates.io
         id: crates-io
@@ -209,7 +209,7 @@ jobs:
       # generate_release_notes on an existing release appends duplicate
       # auto-notes; omitting all other inputs preserves body + prerelease flag.
       - name: Upload release artifacts
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             artifacts/*.tar.gz
