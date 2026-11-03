@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.3](https://github.com/27b-io/anthropic-lb/compare/v0.4.2...v0.4.3) (2026-10-29)
+
+
+### Bug Fixes
+
+* **LAB-10557:** name a model-not-found rejection in the exhaustion 429, log client and model ([#314](https://github.com/27b-io/anthropic-lb/issues/314)) ([3a77448](https://github.com/27b-io/anthropic-lb/commit/3a774486a822b15ec7f9a5eba29f0cd5af53c8ed))
+* **LAB-10850:** re-PING Redis at once when an answer leaves the response-cache gate closed ([4370704](https://github.com/27b-io/anthropic-lb/commit/437070446985cd0059a3b8e47cc35729692e8ce9))
+* **LAB-10850:** refuse response_cache.redis_url schemes other than redis:// and rediss:// ([4370704](https://github.com/27b-io/anthropic-lb/commit/437070446985cd0059a3b8e47cc35729692e8ce9))
+* **LAB-11037:** quote header-fed log fields so a caller cannot forge another field ([#315](https://github.com/27b-io/anthropic-lb/issues/315)) ([4b7c740](https://github.com/27b-io/anthropic-lb/commit/4b7c740ce77615e230858eb81abf3ec9ec47dccb))
+* **LAB-11064:** write body-fed log fields with Go-compatible escapes ([#316](https://github.com/27b-io/anthropic-lb/issues/316)) ([f11a470](https://github.com/27b-io/anthropic-lb/commit/f11a4706d279c17491768d917dcac7c4bf390f15))
+* **LAB-11094:** cut sink lines between fields; quote Option and Vec log fields ([#317](https://github.com/27b-io/anthropic-lb/issues/317)) ([cf96226](https://github.com/27b-io/anthropic-lb/commit/cf96226a056879aeef6bb75286ac385abd250623))
+* **LAB-11185:** clip header-fed values on the proxied line ([#318](https://github.com/27b-io/anthropic-lb/issues/318)) ([88e5969](https://github.com/27b-io/anthropic-lb/commit/88e5969af997d7ab41a2c2b17bcd8a9433510476))
+* **LAB-11390:** strip browser Origin, Referer and Sec-Fetch-* before the upstream request ([#320](https://github.com/27b-io/anthropic-lb/issues/320)) ([7e5d4ef](https://github.com/27b-io/anthropic-lb/commit/7e5d4ef2c6748d51339aaaca8e0b4c8b7375364b))
+* **LAB-11631:** cap Redis reconnect backoff at 5s, not 30s ([#326](https://github.com/27b-io/anthropic-lb/issues/326)) ([21179c5](https://github.com/27b-io/anthropic-lb/commit/21179c5b36916bd7f67fd94eacb734b971ad044d))
+* **LAB-11737:** a request cancelled mid-PING no longer stalls the response-cache probe ([#328](https://github.com/27b-io/anthropic-lb/issues/328)) ([fec5ac5](https://github.com/27b-io/anthropic-lb/commit/fec5ac5aa3e568879105042afb6a0927fa6709eb))
+* **LAB-4190:** strip `speed` and re-send when the model does not support it ([#311](https://github.com/27b-io/anthropic-lb/issues/311)) ([f6c4711](https://github.com/27b-io/anthropic-lb/commit/f6c4711597982725bbacc6586495b9b17522c586))
+
+
+### Performance Improvements
+
+* **LAB-11601:** read rate info and routing weights every 30s, not every sync tick ([#324](https://github.com/27b-io/anthropic-lb/issues/324)) ([a5bab65](https://github.com/27b-io/anthropic-lb/commit/a5bab65aae0247a7738a4227a7bd86b73254083f))
+
 ## [0.4.2](https://github.com/27b-io/anthropic-lb/compare/v0.4.1...v0.4.2) (2026-10-23)
 
 
