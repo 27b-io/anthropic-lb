@@ -18,7 +18,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
@@ -39,7 +39,7 @@ jobs:
     permissions:
       security-events: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The "stable" ref only bootstraps rustup. Every cargo command below
       # actually runs the version pinned in rust-toolchain.toml, which
       # rustup resolves ahead of the default toolchain. CI is NOT unpinned.
@@ -47,8 +47,8 @@ jobs:
       # rustfmt+clippy, and rustup installs them onto the PINNED toolchain.
       # An input here would install onto the discarded "stable" toolchain
       # instead — two sources of truth for the same fact.
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -62,7 +62,7 @@ jobs:
         continue-on-error: true
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: clippy-results.sarif
           wait-for-processing: true
@@ -75,7 +75,7 @@ jobs:
       # ALB_TEST_REDIS_URL below makes those tests PANIC (not skip) if the
       # backend is unreachable — CI can never silently pass without it.
       valkey:
-        image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
+        image: valkey/valkey@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7 # 8
         ports:
           - 6379:6379
         env:
@@ -90,9 +90,9 @@ jobs:
     env:
       ALB_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Run tests
         run: cargo test
       - name: Check packaging
@@ -108,7 +108,7 @@ jobs:
       # Test job: under CI the redis_integration tests panic (not skip) without
       # ALB_TEST_REDIS_URL. Keep this block in step with `test.services`.
       valkey:
-        image: valkey/valkey@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6 # 8
+        image: valkey/valkey@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7 # 8
         ports:
           - 6379:6379
         env:
@@ -123,13 +123,13 @@ jobs:
     env:
       ALB_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy (guard)
         run: cargo clippy --all-targets --features guard
       - name: Tests (guard)
