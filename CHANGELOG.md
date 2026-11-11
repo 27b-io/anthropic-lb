@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.4](https://github.com/27b-io/anthropic-lb/compare/v0.4.3...v0.4.4) (2026-11-11)
+
+
+### Features
+
+* **LAB-13315:** per-client allowed_endpoints hard allow-list ([#338](https://github.com/27b-io/anthropic-lb/issues/338)) ([f60f41e](https://github.com/27b-io/anthropic-lb/commit/f60f41ec5b2e51fd363f9e08cf578108a7dc7a55))
+
+
+### Bug Fixes
+
+* **LAB-13296:** forward thinking-display-updates-* and thinking-binding-controls-* on OAuth endpoints ([#336](https://github.com/27b-io/anthropic-lb/issues/336)) ([d15aa61](https://github.com/27b-io/anthropic-lb/commit/d15aa61783bd54dfc0a1458bce83cf93d8379dd2))
+
 ## [0.4.3](https://github.com/27b-io/anthropic-lb/compare/v0.4.2...v0.4.3) (2026-10-29)
 
 
