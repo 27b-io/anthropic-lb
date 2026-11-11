@@ -67,7 +67,7 @@ The store keeps its document as the exact bytes it wrote. The document's digest 
 | `clients[].daily_budget` | The client's daily token budget, with the meaning of a config file's `client_budgets`, or `null` for none. |
 | `clients[].utilization_limit` | The client's utilization ceiling, with the meaning of `client_utilization_limits`, or `null` for none. |
 | `clients[].models` | The model patterns the client may request, with the meaning `models` has in a config file's `[[clients]]` entry. An empty list allows every model. |
-| `clients[].preferred_endpoints` | The endpoints the client is pinned to, with the meaning `preferred_endpoints` has in a `[[clients]]` entry. A reader drops a name its own configuration lacks, with a warning. |
+| `clients[].preferred_endpoints` | The endpoints the client is pinned to, with the meaning `preferred_endpoints` has in a `[[clients]]` entry. A reader drops a name its own configuration lacks, or one outside the `allowed_endpoints` its config file gives the client, with a warning. A store cannot set or change `allowed_endpoints`. |
 | `clients[].keys` | The client's keys. Two at most, so a key can rotate with overlap. |
 | `clients[].keys[].id` | A short handle for the key, for logs. |
 | `clients[].keys[].label` | Free text chosen by the operator. |

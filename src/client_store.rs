@@ -1697,7 +1697,7 @@ fn log_report(report: &StoreReport) {
         warn!(client = %name, "client store: a disabled record names an operator or admin reader here; it refuses nothing");
     }
     for (name, pin) in &report.dropped_pins {
-        warn!(client = %name, endpoint = %pin, "client store: pin to an endpoint this instance lacks; dropped");
+        warn!(client = %name, endpoint = %pin, "client store: pin to an endpoint this instance lacks or the client's allowed_endpoints excludes; dropped");
     }
     if report.revoked_outside_store > 0 {
         warn!(

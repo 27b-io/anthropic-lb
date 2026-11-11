@@ -39,6 +39,7 @@ fn guard_block_client() -> ClientConfig {
         key: test_key("block-key"),
         models: vec![],
         preferred_endpoints: vec![],
+        allowed_endpoints: vec![],
         guard: crate::guard::GuardPolicy::Block,
     }
 }

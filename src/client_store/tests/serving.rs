@@ -268,6 +268,60 @@ async fn a_name_in_the_file_and_the_store_keeps_the_file_guard_policy() {
     );
 }
 
+/// Schema 1 has no allow-list, so a name in both keeps the file's: the store
+/// neither clears nor widens it, and a store pin outside it is dropped. A
+/// store-only name has none.
+#[tokio::test]
+async fn a_name_in_the_file_and_the_store_keeps_the_file_allow_list() {
+    let mut both = mk_client("both", &test_key("both"), &[]);
+    both.allowed_endpoints = vec!["acct-a".to_string()];
+    let mut clients = file_clients(&[]);
+    clients.push(both);
+    let inst = Instance::two_endpoints(clients);
+    let doc = document(
+        wall_ms(),
+        vec![
+            client_with(
+                "both",
+                &[&test_key("both-store")],
+                json!({"preferred_endpoints": ["acct-a", "acct-b"]}),
+            ),
+            client("acme", &test_key("acme")),
+        ],
+        &[],
+    );
+    inst.answer(answer(doc_part(&doc), full(&[], &[]))).await;
+    let allowed = ["acct-a".to_string()];
+    let caller = inst.state.caller("both");
+    assert_eq!(caller.allowed_endpoints(), Some(&allowed[..]));
+    assert_eq!(
+        caller.preferred_endpoints(),
+        Some(&allowed[..]),
+        "the store's pin outside the allow-list is dropped"
+    );
+    assert_eq!(
+        inst.store.lock_report().dropped_pins,
+        vec![("both".to_string(), "acct-b".to_string())]
+    );
+    assert_eq!(inst.state.caller("acme").allowed_endpoints(), None);
+
+    // The picker holds the merged client to the file's list.
+    assert_eq!(
+        inst.state
+            .pick_endpoint_for_client(
+                Some("s"),
+                "claude-opus-5",
+                &[0],
+                &caller,
+                FastRequest::STANDARD,
+                false,
+            )
+            .await,
+        None,
+        "with its one allowed endpoint skipped, nothing else may serve"
+    );
+}
+
 #[tokio::test]
 async fn a_revoked_digest_refuses_its_store_key_only() {
     let inst = Instance::offline(&[]);

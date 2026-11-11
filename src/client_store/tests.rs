@@ -187,14 +187,44 @@ impl Instance {
         token: Option<&str>,
         dir: &std::path::Path,
     ) -> Self {
-        let mut acct = mk_endpoint("acct-a", "sk-ant-api-test-aaa");
-        acct.base_url = upstream.to_string();
+        Self::with_endpoints(upstream, clients, poll_url, token, dir, &["acct-a"])
+    }
+
+    /// An offline instance with the endpoints `acct-a` and `acct-b`, for the
+    /// rules that need a second endpoint.
+    fn two_endpoints(clients: Vec<ClientConfig>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inst = Self::with_endpoints(
+            "http://127.0.0.1:9",
+            clients,
+            "https://store.invalid/_clients/poll",
+            None,
+            dir.path(),
+            &["acct-a", "acct-b"],
+        );
+        inst._dir = Some(dir);
+        inst
+    }
+
+    /// `in_dir` with one endpoint per name in `names`, each at `upstream`.
+    fn with_endpoints(
+        upstream: &str,
+        clients: Vec<ClientConfig>,
+        poll_url: &str,
+        token: Option<&str>,
+        dir: &std::path::Path,
+        names: &[&str],
+    ) -> Self {
+        let endpoints = names
+            .iter()
+            .map(|name| mk_endpoint_at(name, &format!("sk-ant-api-test-{name}"), upstream))
+            .collect();
         let (state, base) = TestPolicy::clients(clients)
             .operators(&["ops"])
             .admin_readers(&["viewer"])
             .client_store(poll_url, token)
             .install_keeping(AppState {
-                endpoints: vec![acct],
+                endpoints,
                 ..test_state_base()
             });
         let config = ClientStoreConfig {
@@ -205,7 +235,7 @@ impl Instance {
             ClientStore::new(
                 &config,
                 &base,
-                vec!["acct-a".to_string()],
+                names.iter().map(|n| n.to_string()).collect(),
                 dir.join("config.client-store.json"),
             )
             .unwrap(),
