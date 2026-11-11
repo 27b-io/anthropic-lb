@@ -92,6 +92,9 @@ fn oauth_beta_filter_keeps_claude_code_flag_set() {
         "timing-2026-09-09",
         // Server-side refusal fallback, body-paired (`fallbacks`).
         "server-side-fallback-2026-07-01",
+        // LAB-13296: 2.1.306+ under stream-json, paired with nested
+        // `thinking.display`.
+        "thinking-display-updates-2026-08-18",
     ];
     // Negative control: the point of the allow-list is that it still rejects.
     // Without this, widening the default to "*" would keep the test green.
@@ -1521,5 +1524,90 @@ async fn full_router_rewrite_preserves_client_bytes() {
             .unwrap()
             .get("unknown_config"),
         Some(&1)
+    );
+}
+
+/// LAB-13296: send `flag` with `thinking` through an OAuth endpoint and
+/// return what came out the other side: the `anthropic-beta` tokens and
+/// `thinking` object the upstream received, and the body the client got back.
+async fn thinking_beta_round_trip(
+    flag: &str,
+    thinking: &serde_json::Value,
+    upstream_body: &'static [u8],
+) -> (Vec<String>, serde_json::Value, serde_json::Value) {
+    let (upstream_url, mut seen) = spawn_capturing_upstream(StatusCode::OK, upstream_body).await;
+    let state = Arc::new(TestPolicy::open().install(AppState {
+        endpoints: vec![mk_endpoint_at(
+            "acct-a",
+            "sk-ant-oat01-test-aaa",
+            &upstream_url,
+        )],
+        auto_cache: false,
+        ..test_state_base()
+    }));
+    let addr = serve(build_router(state)).await;
+    let body = serde_json::json!({
+        "model": "claude-fable-5-2",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": thinking,
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-beta", flag)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let client_body: serde_json::Value = resp.json().await.unwrap();
+    let (headers, bytes) = seen.recv().await.expect("upstream must have been hit once");
+    let tokens = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .collect();
+    let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    (tokens, sent["thinking"].clone(), client_body)
+}
+
+/// LAB-13296: `thinking.display: "updates"` is nested in base-schema
+/// `thinking`, so the orphan strip cannot remove it, and dropping the flag
+/// 400s with `thinking.adaptive.display: Input should be 'summarized', 'omitted'`.
+#[tokio::test]
+async fn thinking_display_updates_reaches_oauth_upstream_with_its_field() {
+    let flag = "thinking-display-updates-2026-08-18";
+    let thinking = serde_json::json!({"type": "adaptive", "display": "updates"});
+    let (tokens, sent, _) = thinking_beta_round_trip(flag, &thinking, ANTHROPIC_OK_BODY).await;
+    assert!(
+        tokens.iter().any(|t| t == flag),
+        "flag not forwarded as an exact token: {tokens:?}"
+    );
+    assert_eq!(sent, thinking, "thinking must reach upstream unchanged");
+}
+
+/// LAB-13296: Fable 5.2 account-bound thinking. `thinking.block_binding` goes
+/// up with its flag, and `input_transformations` comes back to the client.
+#[tokio::test]
+async fn thinking_binding_controls_reaches_oauth_upstream_and_returns_transformations() {
+    const UPSTREAM: &[u8] = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"model":"test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"input_transformations":[{"type":"thinking_block_dropped","message_index":1,"content_index":0}]}"#;
+    let flag = "thinking-binding-controls-2026-08-01";
+    let thinking = serde_json::json!({
+        "type": "adaptive",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    });
+    let (tokens, sent, client_body) = thinking_beta_round_trip(flag, &thinking, UPSTREAM).await;
+    assert!(
+        tokens.iter().any(|t| t == flag),
+        "flag not forwarded as an exact token: {tokens:?}"
+    );
+    assert_eq!(sent, thinking, "thinking must reach upstream unchanged");
+    let upstream: serde_json::Value = serde_json::from_slice(UPSTREAM).unwrap();
+    assert_eq!(
+        client_body["input_transformations"], upstream["input_transformations"],
+        "input_transformations must reach the client unchanged: {client_body}"
     );
 }

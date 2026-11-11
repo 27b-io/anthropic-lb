@@ -367,6 +367,19 @@ pub(crate) const DEFAULT_CLIENT_BETA_ALLOWLIST: &[&str] = &[
     // `"default"` form, and mapped in `BETA_BODY_FIELDS` so the pair travels
     // together.
     "server-side-fallback-*",
+    // Thinking-block controls (LAB-13296). Both are paired with fields nested
+    // inside the base-schema `thinking` object, so the orphaned-body strip
+    // never reaches them and dropping either flag is a hard 400 upstream:
+    //  - `thinking-display-updates-*` ↔ `thinking.display: "updates"`. Claude
+    //    Code 2.1.306+ sends it under `--output-format stream-json`; dropped,
+    //    the API answers `thinking.adaptive.display: Input should be
+    //    'summarized', 'omitted'`.
+    //  - `thinking-binding-controls-*` ↔ `thinking.block_binding` in the
+    //    request (`input_transformations` comes back in the response).
+    //    Dropped, the API answers `block_binding: Extra inputs are not
+    //    permitted`.
+    "thinking-display-updates-*",
+    "thinking-binding-controls-*",
 ];
 
 /// Cardinality bound for `beta_flags_dropped` — flag names are
@@ -579,6 +592,9 @@ const BETA_BODY_FIELDS: &[(&str, &[&str])] = &[
     ("mid-conversation-tool-changes-*", &[]),
     ("per-turn-control-*", &[]),
     ("timing-*", &[]),
+    // LAB-13296: paired with fields nested in base-schema `thinking`.
+    ("thinking-display-updates-*", &[]),
+    ("thinking-binding-controls-*", &[]),
 ];
 
 /// Header/body coherence for the beta allow-list (LAB-1261).

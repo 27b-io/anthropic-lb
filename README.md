@@ -482,6 +482,8 @@ can steer are locked down by default:
   - *(nested)* `mid-conversation-tool-changes-*`, `per-turn-control-*`,
     `timing-*` ↔ `tool_addition`/`tool_removal` blocks and
     `output_config.effort`/`timing` on the `role: "system"` entry in `messages`
+  - *(nested)* `thinking-display-updates-*`, `thinking-binding-controls-*` ↔
+    `thinking.display`, `thinking.block_binding`
 - **A dropped flag takes its body field with it.** Some beta families pair a
   header flag with a top-level request-body field that only exists when the
   flag is declared (the top-level pairings above). Forwarding
