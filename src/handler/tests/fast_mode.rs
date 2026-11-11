@@ -610,14 +610,14 @@ async fn fast_mode_disabled_filters_fast_routing_until_expiry() {
             .is_some_and(|s| s > FAST_MODE_DISABLED_TTL.as_secs() - 5),
         "/_stats must expose the remaining TTL"
     );
-    assert!(!state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None));
+    assert!(!state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None, None));
 
     // Mark the other account too: the FAST pool is now unservable, the
     // standard pool is untouched.
     state.note_fast_mode_disabled("b", 1);
-    assert!(state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None));
+    assert!(state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None, None));
     assert!(
-        !state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None),
+        !state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None, None),
         "fast-mode marks must not count against a standard request"
     );
 
@@ -667,9 +667,9 @@ fn pool_cannot_serve_unions_negative_caches() {
     ]);
     state.note_model_unsupported("a", 0, "claude-opus-5");
     state.note_fast_mode_disabled("b", 1);
-    assert!(state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None));
-    assert!(!state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None));
-    assert!(!state.pool_cannot_serve("claude-sonnet-5", FastRequest::FAST, None));
+    assert!(state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None, None));
+    assert!(!state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None, None));
+    assert!(!state.pool_cannot_serve("claude-sonnet-5", FastRequest::FAST, None, None));
 }
 
 /// An OpenAI-protocol endpoint never accrues a fast-mode
@@ -720,11 +720,11 @@ fn pool_cannot_serve_excludes_openai_protocol_for_fast_requests() {
     ]);
     state.note_fast_mode_disabled("anthropic-only", 0);
     assert!(
-        state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None),
+        state.pool_cannot_serve("claude-opus-5", FastRequest::FAST, None, None),
         "an OpenAI fallback must not mask a fully fast-disabled Anthropic pool"
     );
     assert!(
-        !state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None),
+        !state.pool_cannot_serve("claude-opus-5", FastRequest::STANDARD, None, None),
         "the same pool can serve a standard request"
     );
 }

@@ -871,6 +871,7 @@ pub(crate) fn mk_client(name: &str, key: &str, models: &[&str]) -> ClientConfig 
         key: key.to_string(),
         models: models.iter().map(|s| s.to_string()).collect(),
         preferred_endpoints: vec![],
+        allowed_endpoints: vec![],
         #[cfg(feature = "guard")]
         guard: crate::guard::GuardPolicy::default(),
     }

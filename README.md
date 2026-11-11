@@ -178,6 +178,7 @@ token = "sk-ant-api03-..."
 | `clients[].key` | `String` | — | Per-client secret (`x-api-key`; also `Bearer` on `/v1/chat/completions`). At least 32 characters; held only as a digest |
 | `clients[].models` | `[String]` | `[]` | Models this client may request (empty = all; `*` suffix wildcards) |
 | `clients[].preferred_endpoints` | `[String]` | `[]` | Pin this client to named endpoint(s); spills to the full pool when none is healthy (incl. at paid overage). Names are startup-validated |
+| `clients[].allowed_endpoints` | `[String]` | `[]` | Hard allow-list (empty = no restriction): every pick, retry and rotation for this client stays inside these endpoints, whatever state the pool is in. When none of them can serve, the client gets the same refusal a whole pool in that state gives (429 `rate_limit_error` "exhausted all endpoints" for spent or rate-limited accounts, the transient 503 for transport failures, the model-unsupported 404 or fast-mode 400 when every allowed account has refused the model or fast mode); it never spills. `preferred_endpoints` must lie inside it and keeps its soft meaning there, spilling only to the rest of the allow-list. Names are startup-validated. A client-store record for the same name keeps the file's list, and its pins outside the list are dropped with a warning; a store-only client has none. Serving log lines carry `pin=allowed` for this client (`allowed-pinned` / `allowed-spilled` when it also has `preferred_endpoints`). Pool-wide gates (emergency brake, `client_utilization_limits`) still read the whole pool |
 | `proxy_key` | `String?` | `None` | **Legacy** shared secret. Mutually exclusive with `[[clients]]` |
 | `allow_unauthenticated` | `bool` | `false` | The one escape hatch from default-deny: boot with no credentials at all. Trusted-network-only; incompatible with configured credentials |
 | `allowed_ips` | `[String]?` | `None` | IP/CIDR allowlist (unset = **allow all**) |
@@ -1009,6 +1010,10 @@ signal that a caller was actually turned away because of it. Both label values
 are emitted from process start, so a flat zero is a measurement rather than an
 absence of data. These are independent per-replica event counts — aggregate
 with `sum by (kind)`, where `max` would undercount.
+
+For a client with `allowed_endpoints`, "eligible" means its allowed set, so the
+counter also counts that one client's exhausted set while the rest of the pool
+is healthy. The log line of such a refusal carries `allow_listed=true`.
 
 ### Session affinity
 

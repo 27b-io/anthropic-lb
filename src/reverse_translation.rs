@@ -1854,7 +1854,12 @@ pub(crate) async fn openai_chat_handler(
         // carries no `speed`.
         if !last_saw_529
             && !last_saw_transient
-            && state.pool_cannot_serve(&model, FastRequest::STANDARD, extra_usage_refuser)
+            && state.pool_cannot_serve(
+                &model,
+                FastRequest::STANDARD,
+                extra_usage_refuser,
+                caller.allowed_endpoints(),
+            )
         {
             if let Some(resp) = rejected_resp {
                 return resp;
@@ -1864,6 +1869,7 @@ pub(crate) async fn openai_chat_handler(
             if extra_usage_refuser.is_none() {
                 warn!(
                     model = %GoQuoted(&model),
+                    allow_listed = caller.allowed_endpoints().is_some(),
                     "model unsupported on all eligible endpoints"
                 );
                 return model_unsupported_response(&model, true);
@@ -1876,6 +1882,7 @@ pub(crate) async fn openai_chat_handler(
             &client_id,
             &model,
             FastRequest::STANDARD,
+            caller.allowed_endpoints(),
         )
     }
     .await;

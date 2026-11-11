@@ -522,25 +522,36 @@ impl AppState {
         picked.endpoint
     }
 
-    /// Whether `endpoint_idx` is in a `preferred_endpoints` list. The ONE
-    /// membership predicate, shared by the pick-time filter and `pin_status`
-    /// — if they ever diverged, the `pin=` log field would lie about what the
-    /// picker actually did.
-    fn endpoint_is_preferred(&self, preferred: &[String], endpoint_idx: EndpointIdx) -> bool {
-        preferred
+    /// Whether `endpoint_idx` is in a `preferred_endpoints` or
+    /// `allowed_endpoints` list. The ONE membership predicate, shared by the
+    /// pick-time filters, `pin_status` and `reachable` (which scopes the
+    /// unservable/exhausted reply) — if they ever diverged, the `pin=` log
+    /// field or the reply would describe a set the picker did not use.
+    pub(crate) fn endpoint_named_in(&self, names: &[String], endpoint_idx: EndpointIdx) -> bool {
+        names
             .iter()
-            .any(|p| *p == self.endpoints[endpoint_idx].name)
+            .any(|n| *n == self.endpoints[endpoint_idx].name)
     }
 
     /// `pin` field for the per-request serving log lines: "pinned" when the
     /// serving endpoint is in the caller's preferred set, "spilled" when the
     /// caller has preferences but was served outside them, "-" for callers
-    /// without preferences.
+    /// without preferences. A caller with `allowed_endpoints` gets the same
+    /// values prefixed "allowed" ("allowed", "allowed-pinned",
+    /// "allowed-spilled"), so every one of its picks is provably allow-listed
+    /// from the logs, and "disallowed" for an endpoint outside the set, which
+    /// the picker never produces (alert on it).
     pub(crate) fn pin_status(&self, caller: &Caller, endpoint_idx: EndpointIdx) -> &'static str {
-        match caller.preferred_endpoints() {
-            Some(p) if self.endpoint_is_preferred(p, endpoint_idx) => "pinned",
-            Some(_) => "spilled",
-            None => "-",
+        let preferred = caller.preferred_endpoints();
+        let pinned = preferred.is_some_and(|p| self.endpoint_named_in(p, endpoint_idx));
+        match (caller.allowed_endpoints(), preferred.is_some(), pinned) {
+            (Some(a), _, _) if !self.endpoint_named_in(a, endpoint_idx) => "disallowed",
+            (Some(_), false, _) => "allowed",
+            (Some(_), true, true) => "allowed-pinned",
+            (Some(_), true, false) => "allowed-spilled",
+            (None, false, _) => "-",
+            (None, true, true) => "pinned",
+            (None, true, false) => "spilled",
         }
     }
 
@@ -569,7 +580,12 @@ impl AppState {
 
     /// Pick the best available endpoint (account or fallback upstream).
     ///
-    /// Per-client pinning (LAB-2636 / #151) runs first: if the caller has a
+    /// A caller with `allowed_endpoints` is restricted to that set before
+    /// anything else runs, whatever state the pool is in: everything below,
+    /// pinning and its spill included, sees only the allowed candidates, and
+    /// `None` (the exhaustion refusal) when none can serve.
+    ///
+    /// Per-client pinning (LAB-2636 / #151) runs next: if the caller has a
     /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
     /// is a healthy, undemoted candidate (serves the model, not hard-limited,
     /// not transport-unhealthy, not skipped, `is_healthy`, and not
@@ -608,6 +624,12 @@ impl AppState {
         first_pick: bool,
     ) -> Option<EndpointIdx> {
         let mut candidates = self.routing_candidates(model, skip).await;
+        // Hard allow-list: unconditional and first, so no later step (pin
+        // spill, tier fall-through, affinity, a retry's re-pick) can reach an
+        // endpoint outside it. An empty result is the exhaustion refusal.
+        if let Some(allowed) = caller.allowed_endpoints() {
+            candidates.retain(|c| self.endpoint_named_in(allowed, c.endpoint));
+        }
         let fast_disabled = self.fast_mode_disabled_for(fast);
         candidates.retain(|c| {
             if fast_disabled.contains(&c.endpoint) {
@@ -633,8 +655,7 @@ impl AppState {
             true
         });
         if let Some(preferred) = caller.preferred_endpoints() {
-            let is_preferred =
-                |c: &RoutingCandidate| self.endpoint_is_preferred(preferred, c.endpoint);
+            let is_preferred = |c: &RoutingCandidate| self.endpoint_named_in(preferred, c.endpoint);
             // Undemoted = candidate priority equals the configured priority.
             // `routing_candidates` adds `overage_penalty` while an account
             // serves via paid overage (or always-paid Fable) — that demotion
@@ -648,13 +669,20 @@ impl AppState {
                 candidates.retain(is_preferred);
             } else {
                 // Greppable spill marker — the request leaves its dedicated
-                // account(s) and will consume shared-pool cache/claims.
+                // account(s) and will consume shared-pool cache/claims. For an
+                // allow-listed caller that "pool" is the rest of its allow-list
+                // (`spill_to=allowed`), never the general pool.
                 info!(
                     client_id = caller.name(),
                     model = %GoQuoted(model),
                     fast_mode_disabled = fast_disabled
                         .iter()
-                        .any(|&i| self.endpoint_is_preferred(preferred, i)),
+                        .any(|&i| self.endpoint_named_in(preferred, i)),
+                    spill_to = if caller.allowed_endpoints().is_some() {
+                        "allowed"
+                    } else {
+                        "pool"
+                    },
                     "pick: no preferred endpoint viable — spilling to general pool"
                 );
             }

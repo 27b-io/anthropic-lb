@@ -59,6 +59,8 @@ pub(crate) struct ClientEntry {
     pub(crate) name: String,
     pub(crate) models: Vec<String>,
     pub(crate) preferred_endpoints: Vec<String>,
+    /// Always the config file's: a client store cannot set, clear or widen it.
+    pub(crate) allowed_endpoints: Vec<String>,
     #[cfg(feature = "guard")]
     pub(crate) guard: guard::GuardPolicy,
 }
@@ -263,6 +265,13 @@ impl Caller {
             .filter(|p| !p.is_empty())
     }
 
+    /// The caller's non-empty `allowed_endpoints` list, if it has one.
+    pub(crate) fn allowed_endpoints(&self) -> Option<&[String]> {
+        self.entry()
+            .map(|c| c.allowed_endpoints.as_slice())
+            .filter(|a| !a.is_empty())
+    }
+
     /// LAB-3877: the caller's Tier 0 guard policy. An operator's is always
     /// `Off` (it forwards operator-trusted content). Otherwise the entry's
     /// configured policy, defaulting to `Annotate` (shadow mode) for a caller
@@ -429,6 +438,7 @@ impl ClientPolicy {
                 name: c.name.clone(),
                 models: c.models.clone(),
                 preferred_endpoints: c.preferred_endpoints.clone(),
+                allowed_endpoints: c.allowed_endpoints.clone(),
                 #[cfg(feature = "guard")]
                 guard: c.guard,
             })
@@ -528,6 +538,11 @@ impl BuiltPolicy {
             let guard = file_entry
                 .map(|i| next.clients[i].guard)
                 .unwrap_or_default();
+            // Schema 1 has no allow-list, and a store must never widen one
+            // the file set: the file's list stays, empty when it has none.
+            let allowed = file_entry
+                .map(|i| next.clients[i].allowed_endpoints.clone())
+                .unwrap_or_default();
             if let Some(i) = file_entry {
                 next.clients.remove(i);
             }
@@ -539,11 +554,10 @@ impl BuiltPolicy {
                     continue;
                 }
             };
-            let (pins, dropped): (Vec<String>, Vec<String>) = policy
-                .preferred_endpoints
-                .iter()
-                .cloned()
-                .partition(|pin| endpoints.contains(pin));
+            let (pins, dropped): (Vec<String>, Vec<String>) =
+                policy.preferred_endpoints.iter().cloned().partition(|pin| {
+                    endpoints.contains(pin) && (allowed.is_empty() || allowed.contains(pin))
+                });
             report
                 .dropped_pins
                 .extend(dropped.into_iter().map(|pin| (name.clone(), pin)));
@@ -551,6 +565,7 @@ impl BuiltPolicy {
                 name: name.clone(),
                 models: policy.models.clone(),
                 preferred_endpoints: pins,
+                allowed_endpoints: allowed,
                 // Schema 1 has no guard policy, so the config file's stays.
                 #[cfg(feature = "guard")]
                 guard,
@@ -620,8 +635,8 @@ pub(crate) struct StoreReport {
     /// Revoked digests matching a config-file key. A store revokes only its
     /// own keys, so these are ignored here.
     pub(crate) revoked_outside_store: usize,
-    /// Pins dropped for naming an endpoint this instance lacks:
-    /// `(client, endpoint)`.
+    /// Pins dropped for naming an endpoint this instance lacks, or one outside
+    /// the client's `allowed_endpoints`: `(client, endpoint)`.
     pub(crate) dropped_pins: Vec<(String, String)>,
 }
 
@@ -736,6 +751,28 @@ fn check_clients(
                     "client '{}': preferred_endpoints entry '{}' does not match any configured endpoint",
                     c.name, pe
                 ));
+            }
+        }
+        // Same for the allow-list, where a typo is worse: the client would be
+        // refused on every request, not merely un-pinned.
+        for ae in &c.allowed_endpoints {
+            if !config.endpoints.iter().any(|ep| ep.name == *ae) {
+                return Err(format!(
+                    "client '{}': allowed_endpoints entry '{}' does not match any configured endpoint",
+                    c.name, ae
+                ));
+            }
+        }
+        // A pin outside the allow-list could never be served: the picker
+        // filters to the allow-list before it looks at pins.
+        if !c.allowed_endpoints.is_empty() {
+            for pe in &c.preferred_endpoints {
+                if !c.allowed_endpoints.contains(pe) {
+                    return Err(format!(
+                        "client '{}': preferred_endpoints entry '{}' is not in its allowed_endpoints",
+                        c.name, pe
+                    ));
+                }
             }
         }
         // Keys are held and matched as digests, so a duplicate is found as

@@ -184,6 +184,13 @@ pub(crate) struct ClientConfig {
     /// client without the field.
     #[serde(default)]
     pub(crate) preferred_endpoints: Vec<String>,
+    /// Endpoint names this client may be forwarded to: a hard allow-list.
+    /// Non-empty: every pick, retry and rotation stays inside the set, with no
+    /// spill to the rest of the pool; when no allowed endpoint can serve, the
+    /// client gets the pool-exhaustion refusal. `preferred_endpoints` must lie
+    /// inside it and keeps its soft meaning there. Empty = no restriction.
+    #[serde(default)]
+    pub(crate) allowed_endpoints: Vec<String>,
     /// LAB-3877: Tier 0 content-guard policy for this client —
     /// `"off" | "annotate" | "block"`, default `annotate` (shadow mode). The
     /// operator-bypass client is always `off` regardless of this value.
@@ -202,7 +209,8 @@ impl std::fmt::Debug for ClientConfig {
         ds.field("name", &self.name)
             .field("key", &"<redacted>")
             .field("models", &self.models)
-            .field("preferred_endpoints", &self.preferred_endpoints);
+            .field("preferred_endpoints", &self.preferred_endpoints)
+            .field("allowed_endpoints", &self.allowed_endpoints);
         // guard policy is not a secret; include it so the redacted Debug shows
         // the full (non-key) field set.
         #[cfg(feature = "guard")]

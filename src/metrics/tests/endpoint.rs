@@ -2171,6 +2171,7 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
         "metrics-test",
         "",
         FastRequest::STANDARD,
+        None,
     );
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(
@@ -2189,6 +2190,7 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
         "metrics-test",
         "",
         FastRequest::STANDARD,
+        None,
     );
     // Transport-only exhaustion is the other arm → retryable 503.
     let resp = exhaustion_response(
@@ -2198,6 +2200,7 @@ async fn metrics_counts_client_facing_pool_exhaustion() {
         "metrics-test",
         "",
         FastRequest::STANDARD,
+        None,
     );
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
