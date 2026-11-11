@@ -151,6 +151,8 @@ probe_interval_secs = 300
 #   mid-conversation-tool-changes-* / per-turn-control-* / timing-*
 #       <-> tool_addition/tool_removal blocks and output_config.effort/timing
 #           on the role:"system" entry in messages
+#   thinking-display-updates-* / thinking-binding-controls-*
+#       <-> thinking.display / thinking.block_binding
 # To allow one extra flag, copy every entry of DEFAULT_CLIENT_BETA_ALLOWLIST in
 # src/utilization.rs (the authoritative list) and add yours:
 # allowed_client_betas = [
