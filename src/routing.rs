@@ -524,8 +524,9 @@ impl AppState {
 
     /// Whether `endpoint_idx` is in a `preferred_endpoints` or
     /// `allowed_endpoints` list. The ONE membership predicate, shared by the
-    /// pick-time filters and `pin_status` — if they ever diverged, the `pin=`
-    /// log field would lie about what the picker actually did.
+    /// pick-time filters, `pin_status` and `reachable` (which scopes the
+    /// unservable/exhausted reply) — if they ever diverged, the `pin=` log
+    /// field or the reply would describe a set the picker did not use.
     pub(crate) fn endpoint_named_in(&self, names: &[String], endpoint_idx: EndpointIdx) -> bool {
         names
             .iter()

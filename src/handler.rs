@@ -2504,9 +2504,13 @@ pub(crate) async fn proxy_handler(
             // Name the cause whose removal would unblock the request: if the
             // pool serves the model at standard speed, only fast-mode marks
             // stand in the way; otherwise the model itself is unservable.
-            if fast.requested && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None, caller.allowed_endpoints()) {
+            let allowed = caller.allowed_endpoints();
+            if fast.requested
+                && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None, allowed)
+            {
                 warn!(
                     model = %GoQuoted(&model),
+                    allow_listed = allowed.is_some(),
                     "fast mode not enabled on any eligible endpoint"
                 );
                 return proxy_error_response(
@@ -2517,12 +2521,21 @@ pub(crate) async fn proxy_handler(
             }
             warn!(
                 model = %GoQuoted(&model),
+                allow_listed = allowed.is_some(),
                 "model unsupported on all eligible endpoints"
             );
             return model_unsupported_response(&model, false);
         }
     }
-    exhaustion_response(&state, last_saw_transient, last_saw_529, &client_id, &model, fast, caller.allowed_endpoints())
+    exhaustion_response(
+        &state,
+        last_saw_transient,
+        last_saw_529,
+        &client_id,
+        &model,
+        fast,
+        caller.allowed_endpoints(),
+    )
     }
     .await;
 

@@ -1869,6 +1869,7 @@ pub(crate) async fn openai_chat_handler(
             if extra_usage_refuser.is_none() {
                 warn!(
                     model = %GoQuoted(&model),
+                    allow_listed = caller.allowed_endpoints().is_some(),
                     "model unsupported on all eligible endpoints"
                 );
                 return model_unsupported_response(&model, true);

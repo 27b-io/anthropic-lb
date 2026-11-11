@@ -465,4 +465,58 @@ async fn allowed_client_unservable_set_gets_the_pool_unservable_reply() {
             "fast: upstream {i} was reached"
         );
     }
+
+    // A fast request whose allowed accounts refused the MODEL is a 404, not
+    // the fast-mode 400: the standard-speed re-check reads the allowed set
+    // too, though `general` would serve the model at standard speed.
+    let (state, _) = allow_list_app(None).await;
+    for i in OWN {
+        state.note_model_unsupported(&state.endpoints[i].name, i, "claude-opus-5");
+    }
+    let addr = serve(build_router(state.clone())).await;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", test_key("restricted"))
+        .body(r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// The 429's "model not found" wording counts only the accounts the caller
+/// can reach: an out-of-set rejection does not name the model to an
+/// allow-listed client, and an in-set one does.
+#[tokio::test]
+async fn exhaustion_message_names_a_rejection_only_inside_the_allow_list() {
+    let (state, _) = allow_list_app(None).await;
+    let caller = state.caller("restricted");
+    let message = |allowed: Option<&[String]>| {
+        let resp = exhaustion_response(
+            &state,
+            false,
+            false,
+            "restricted",
+            "claude-opus-5",
+            FastRequest::STANDARD,
+            allowed,
+        );
+        async move {
+            let json = parse_error_envelope(Box::new(resp)).await;
+            json["error"]["message"].as_str().unwrap().to_owned()
+        }
+    };
+    state.note_model_unsupported("general", 0, "claude-opus-5");
+    assert!(message(None).await.contains("claude-opus-5"));
+    assert_eq!(
+        message(caller.allowed_endpoints()).await,
+        "exhausted all endpoints"
+    );
+    state.note_model_unsupported("own-a", 1, "claude-opus-5");
+    assert!(
+        message(caller.allowed_endpoints())
+            .await
+            .contains("claude-opus-5")
+    );
 }
