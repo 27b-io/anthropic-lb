@@ -1130,7 +1130,7 @@ async fn exhaustion_message_stays_bare_without_an_eligible_rejection() {
     state.note_model_unsupported("b", 1, "claude-nope-1");
     state.note_model_unsupported("g", 2, "claude-nope-1");
     let message = |model: &'static str, fast: FastRequest| {
-        let resp = exhaustion_response(&state, false, false, "c", model, fast);
+        let resp = exhaustion_response(&state, false, false, "c", model, fast, None);
         async move {
             let json = parse_error_envelope(Box::new(resp)).await;
             json["error"]["message"].as_str().unwrap().to_owned()
@@ -1178,6 +1178,7 @@ fn transient_exhaustion_log_carries_client_and_model() {
         "exhaustion-log-503 client_id=forged-503",
         "claude-x-1",
         FastRequest::STANDARD,
+        None,
     );
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();

@@ -526,30 +526,31 @@ impl AppState {
     /// `allowed_endpoints` list. The ONE membership predicate, shared by the
     /// pick-time filters and `pin_status` — if they ever diverged, the `pin=`
     /// log field would lie about what the picker actually did.
-    fn endpoint_named_in(&self, names: &[String], endpoint_idx: EndpointIdx) -> bool {
+    pub(crate) fn endpoint_named_in(&self, names: &[String], endpoint_idx: EndpointIdx) -> bool {
         names
             .iter()
             .any(|n| *n == self.endpoints[endpoint_idx].name)
     }
 
-    /// `pin` field for the per-request serving log lines. For a caller with
-    /// `allowed_endpoints`: "allowed" when the serving endpoint is in the set,
-    /// "disallowed" otherwise, which the picker never produces (alert on it).
-    /// Otherwise "pinned" when the serving endpoint is in the caller's
-    /// preferred set, "spilled" when the caller has preferences but was
-    /// served outside them, "-" for callers without preferences.
+    /// `pin` field for the per-request serving log lines: "pinned" when the
+    /// serving endpoint is in the caller's preferred set, "spilled" when the
+    /// caller has preferences but was served outside them, "-" for callers
+    /// without preferences. A caller with `allowed_endpoints` gets the same
+    /// values prefixed "allowed" ("allowed", "allowed-pinned",
+    /// "allowed-spilled"), so every one of its picks is provably allow-listed
+    /// from the logs, and "disallowed" for an endpoint outside the set, which
+    /// the picker never produces (alert on it).
     pub(crate) fn pin_status(&self, caller: &Caller, endpoint_idx: EndpointIdx) -> &'static str {
-        if let Some(allowed) = caller.allowed_endpoints() {
-            return if self.endpoint_named_in(allowed, endpoint_idx) {
-                "allowed"
-            } else {
-                "disallowed"
-            };
-        }
-        match caller.preferred_endpoints() {
-            Some(p) if self.endpoint_named_in(p, endpoint_idx) => "pinned",
-            Some(_) => "spilled",
-            None => "-",
+        let preferred = caller.preferred_endpoints();
+        let pinned = preferred.is_some_and(|p| self.endpoint_named_in(p, endpoint_idx));
+        match (caller.allowed_endpoints(), preferred.is_some(), pinned) {
+            (Some(a), _, _) if !self.endpoint_named_in(a, endpoint_idx) => "disallowed",
+            (Some(_), false, _) => "allowed",
+            (Some(_), true, true) => "allowed-pinned",
+            (Some(_), true, false) => "allowed-spilled",
+            (None, false, _) => "-",
+            (None, true, true) => "pinned",
+            (None, true, false) => "spilled",
         }
     }
 
@@ -583,7 +584,7 @@ impl AppState {
     /// pinning and its spill included, sees only the allowed candidates, and
     /// `None` (the exhaustion refusal) when none can serve.
     ///
-    /// Per-client pinning (LAB-2636 / #151) runs first: if the caller has a
+    /// Per-client pinning (LAB-2636 / #151) runs next: if the caller has a
     /// `[[clients]]` entry with `preferred_endpoints` and at least one of them
     /// is a healthy, undemoted candidate (serves the model, not hard-limited,
     /// not transport-unhealthy, not skipped, `is_healthy`, and not

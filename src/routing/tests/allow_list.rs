@@ -262,12 +262,17 @@ async fn preferred_endpoint_spills_inside_the_allow_list_only() {
 
 #[tokio::test]
 async fn pin_status_reports_allow_listed_picks() {
-    let state = allow_list_state(&["own-a"]);
-    let restricted = state.caller("restricted");
-    assert_eq!(state.pin_status(&restricted, 1), "allowed");
-    assert_eq!(state.pin_status(&restricted, 2), "allowed");
-    assert_eq!(state.pin_status(&restricted, 0), "disallowed");
-    assert_eq!(state.pin_status(&state.caller("free"), 0), "-");
+    let pinned = allow_list_state(&["own-a"]);
+    let restricted = pinned.caller("restricted");
+    assert_eq!(pinned.pin_status(&restricted, 1), "allowed-pinned");
+    assert_eq!(pinned.pin_status(&restricted, 2), "allowed-spilled");
+    assert_eq!(pinned.pin_status(&restricted, 0), "disallowed");
+    assert_eq!(pinned.pin_status(&pinned.caller("free"), 0), "-");
+
+    let unpinned = allow_list_state(&[]);
+    let restricted = unpinned.caller("restricted");
+    assert_eq!(unpinned.pin_status(&restricted, 1), "allowed");
+    assert_eq!(unpinned.pin_status(&restricted, 0), "disallowed");
 }
 
 // ── End to end, both surfaces ──
@@ -401,5 +406,63 @@ async fn allowed_client_retries_and_rotations_stay_inside_its_set() {
                 "{what}: general was reached"
             );
         }
+    }
+}
+
+/// When every allowed account has said the model does not exist, the client
+/// gets the 404 a whole pool in that state gives, not a retryable 429 for
+/// ever, though `general` was never asked (both surfaces). Likewise a fast
+/// request whose allowed accounts all lack fast mode gets the 400.
+#[tokio::test]
+async fn allowed_client_unservable_set_gets_the_pool_unservable_reply() {
+    for (path, (auth, key), body) in surfaces() {
+        let (state, hits) = allow_list_app(None).await;
+        for i in OWN {
+            state.note_model_unsupported(&state.endpoints[i].name, i, "claude-opus-5");
+        }
+        let caller = state.caller("restricted");
+        let allowed = caller.allowed_endpoints();
+        let standard = FastRequest::STANDARD;
+        assert!(state.pool_cannot_serve("claude-opus-5", standard, None, allowed));
+        assert!(!state.pool_cannot_serve("claude-opus-5", standard, None, None));
+        let addr = serve(build_router(state.clone())).await;
+        let resp = Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("content-type", "application/json")
+            .header(auth, &key)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
+        for (i, h) in hits.iter().enumerate() {
+            assert_eq!(
+                h.load(Ordering::SeqCst),
+                0,
+                "{path}: upstream {i} was reached"
+            );
+        }
+    }
+
+    let (state, hits) = allow_list_app(None).await;
+    for i in OWN {
+        state.note_fast_mode_disabled(&state.endpoints[i].name, i);
+    }
+    let addr = serve(build_router(state.clone())).await;
+    let resp = Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", test_key("restricted"))
+        .body(r#"{"model":"claude-opus-5","max_tokens":1,"speed":"fast","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    for (i, h) in hits.iter().enumerate() {
+        assert_eq!(
+            h.load(Ordering::SeqCst),
+            0,
+            "fast: upstream {i} was reached"
+        );
     }
 }

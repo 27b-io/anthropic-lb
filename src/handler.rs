@@ -659,6 +659,11 @@ pub(crate) fn round_backoff_delay(retry_round: u32, last_saw_529: bool) -> Durat
 /// model id the accounts that answered did not know. Both log lines carry
 /// `client_id` and `model`, so an exhaustion is attributable without
 /// correlating timestamps against `proxied` lines.
+///
+/// `allowed` is the caller's `allowed_endpoints`: for such a caller the
+/// "pool" is that set, so the reply and its counter describe the set, and
+/// both log lines carry `allow_listed=true` to tell one client's exhausted
+/// set from an exhausted pool.
 pub(crate) fn exhaustion_response(
     state: &AppState,
     last_saw_transient: bool,
@@ -666,6 +671,7 @@ pub(crate) fn exhaustion_response(
     client_id: &str,
     model: &str,
     fast: FastRequest,
+    allowed: Option<&[String]>,
 ) -> Response {
     if last_saw_transient && !last_saw_529 {
         state.pool_exhausted[PoolExhaustion::Transient as usize].fetch_add(1, Ordering::Relaxed);
@@ -676,6 +682,7 @@ pub(crate) fn exhaustion_response(
             // text, so it takes `GoQuoted` (see its rule).
             client_id = ?client_id,
             model = %GoQuoted(&truncate_label(model)),
+            allow_listed = allowed.is_some(),
             "all endpoints transient-failed after backoff; returning retryable 503"
         );
         let mut resp = proxy_error_response(
@@ -691,12 +698,13 @@ pub(crate) fn exhaustion_response(
     warn!(
         client_id = ?client_id,
         model = %GoQuoted(&truncate_label(model)),
+        allow_listed = allowed.is_some(),
         "all endpoints exhausted (rate-limited)"
     );
     // The model is the caller's own, and a negative-cache hit bounds it to
     // UNSUPPORTED_MODEL_MAX_BYTES. No account names or counts: those are pool
     // internals.
-    let message = if state.model_rejected_somewhere(model, fast) {
+    let message = if state.model_rejected_somewhere(model, fast, allowed) {
         format!(
             "exhausted all endpoints: accounts that answered report model {model} not found; \
              the rest are rate-limited or unavailable"
@@ -2479,7 +2487,7 @@ pub(crate) async fn proxy_handler(
     // `model_unsupported_rejection_plus_rate_limited_pool_stays_retryable`.
     if !last_saw_529
         && !last_saw_transient
-        && state.pool_cannot_serve(&model, fast, extra_usage_refuser)
+        && state.pool_cannot_serve(&model, fast, extra_usage_refuser, caller.allowed_endpoints())
     {
         if let Some(resp) = rejected_resp {
             return resp;
@@ -2496,7 +2504,7 @@ pub(crate) async fn proxy_handler(
             // Name the cause whose removal would unblock the request: if the
             // pool serves the model at standard speed, only fast-mode marks
             // stand in the way; otherwise the model itself is unservable.
-            if fast.requested && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None) {
+            if fast.requested && !state.pool_cannot_serve(&model, FastRequest::STANDARD, None, caller.allowed_endpoints()) {
                 warn!(
                     model = %GoQuoted(&model),
                     "fast mode not enabled on any eligible endpoint"
@@ -2514,7 +2522,7 @@ pub(crate) async fn proxy_handler(
             return model_unsupported_response(&model, false);
         }
     }
-    exhaustion_response(&state, last_saw_transient, last_saw_529, &client_id, &model, fast)
+    exhaustion_response(&state, last_saw_transient, last_saw_529, &client_id, &model, fast, caller.allowed_endpoints())
     }
     .await;
 

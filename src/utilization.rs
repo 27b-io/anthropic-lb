@@ -1918,11 +1918,15 @@ impl AppState {
     /// pre-existing 429 semantics). `extra_usage_refuser` answered THIS
     /// request with an entitlement 400: never negative-cached, but skipped
     /// for the rest of the request, so it cannot serve it either.
+    ///
+    /// `allowed` is the caller's `allowed_endpoints`: the pool such a caller
+    /// can reach is that set, so only its endpoints count.
     pub(crate) fn pool_cannot_serve(
         &self,
         model: &str,
         fast: FastRequest,
         extra_usage_refuser: Option<EndpointIdx>,
+        allowed: Option<&[String]>,
     ) -> bool {
         if model.is_empty() {
             return false;
@@ -1932,7 +1936,7 @@ impl AppState {
         excluded.extend(extra_usage_refuser);
         let mut eligible = 0usize;
         for (i, ep) in self.endpoints.iter().enumerate() {
-            if !fast.eligible(ep, model) {
+            if !self.reachable(allowed, i) || !fast.eligible(ep, model) {
                 continue;
             }
             eligible += 1;
@@ -1949,11 +1953,22 @@ impl AppState {
     /// exist. The weak twin of `pool_cannot_serve` — that one decides the
     /// status, this one only lets `exhaustion_response` name the rejection in
     /// its retryable 429, so a bad model id does not read as a capacity
-    /// problem.
-    pub(crate) fn model_rejected_somewhere(&self, model: &str, fast: FastRequest) -> bool {
+    /// problem. Scoped to `allowed` as `pool_cannot_serve` is.
+    pub(crate) fn model_rejected_somewhere(
+        &self,
+        model: &str,
+        fast: FastRequest,
+        allowed: Option<&[String]>,
+    ) -> bool {
         self.unsupported_endpoints_for(model)
             .into_iter()
-            .any(|i| fast.eligible(&self.endpoints[i], model))
+            .any(|i| self.reachable(allowed, i) && fast.eligible(&self.endpoints[i], model))
+    }
+
+    /// Whether a caller with `allowed_endpoints` of `allowed` (`None` = no
+    /// list) can be routed to endpoint `i`: the picker's own filter.
+    fn reachable(&self, allowed: Option<&[String]>, i: EndpointIdx) -> bool {
+        allowed.is_none_or(|a| self.endpoint_named_in(a, i))
     }
 
     /// Record that `endpoint_idx`'s org has fast mode disabled — the upstream
