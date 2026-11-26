@@ -72,62 +72,6 @@ impl cachekit::backend::Backend for ErroringBackend {
     }
 }
 
-/// Backend that hangs like `SlowBackend` while `stalled`, answers like an
-/// empty store otherwise, and counts the calls that reach it.
-#[derive(Default)]
-struct StallableBackend {
-    stalled: AtomicBool,
-    /// Latency of every op while not stalled.
-    delay_ms: AtomicU64,
-    gets: AtomicU64,
-    sets: AtomicU64,
-    pings: AtomicU64,
-}
-
-impl StallableBackend {
-    async fn stall_if_set(&self) {
-        if self.stalled.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(self.delay_ms.load(Ordering::Relaxed))).await;
-    }
-}
-
-#[async_trait::async_trait]
-impl cachekit::backend::Backend for StallableBackend {
-    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, cachekit::BackendError> {
-        self.gets.fetch_add(1, Ordering::Relaxed);
-        self.stall_if_set().await;
-        Ok(None)
-    }
-    async fn set(
-        &self,
-        _key: &str,
-        _value: Vec<u8>,
-        _ttl: Option<Duration>,
-    ) -> Result<(), cachekit::BackendError> {
-        self.sets.fetch_add(1, Ordering::Relaxed);
-        self.stall_if_set().await;
-        Ok(())
-    }
-    async fn delete(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
-        Ok(false)
-    }
-    async fn exists(&self, _key: &str) -> Result<bool, cachekit::BackendError> {
-        Ok(false)
-    }
-    async fn health(&self) -> Result<cachekit::backend::HealthStatus, cachekit::BackendError> {
-        self.pings.fetch_add(1, Ordering::Relaxed);
-        self.stall_if_set().await;
-        Ok(cachekit::backend::HealthStatus {
-            is_healthy: true,
-            latency_ms: 0.0,
-            backend_type: "stallable".to_string(),
-            details: HashMap::new(),
-        })
-    }
-}
-
 /// Backend where every operation hangs well past any op timeout (AC10).
 struct SlowBackend;
 
@@ -888,287 +832,115 @@ async fn response_cache_metrics_absent_without_config() {
     assert!(!text.contains("anthropic_response_cache"));
 }
 
-// LAB-10850: a Redis backend parks every op abandoned at op_timeout in
-// fred's queue until the connection is back. After `CAP` abandoned ops the
-// gate closes: no op reaches the backend, and one PING per interval checks
-// Redis. A PING answer reopens it, even when every request is an L1 hit.
+// LAB-11758: a Redis connection that stops answering is still handed writes
+// until fred closes it, and fred keeps each one, value included, after its
+// caller gave up. So timed-out writes keep their slot for the hold: the
+// write after the last slot is skipped at once, and writes resume after it.
 #[tokio::test]
-async fn response_cache_abandon_gate_closes_and_reopens_on_ping() {
-    let probe_interval = Duration::from_millis(500);
-    let backend = Arc::new(StallableBackend::default());
-    let mut rc = test_response_cache(backend.clone(), &["geo"], 20);
-    rc.gate = Some(AbandonGate::new(backend.clone(), probe_interval));
-    let surface = CacheSurface::Messages;
-    let entry = CachedResponse {
-        status: 200,
-        content_type: "application/json".to_string(),
-        body: b"{}".to_vec(),
-    };
-    let key = |i: u64| format!("{i:064x}");
-    let reached = || {
-        (
-            backend.gets.load(Ordering::Relaxed),
-            backend.sets.load(Ordering::Relaxed),
-            backend.pings.load(Ordering::Relaxed),
-        )
-    };
-    let hot = key(999);
-    rc.store("geo", &hot, &entry, surface).await;
-
-    backend.stalled.store(true, Ordering::Relaxed);
-    for i in 0..AbandonGate::CAP {
-        rc.store("geo", &key(i), &entry, surface).await;
-    }
-    rc.store("geo", &key(100), &entry, surface).await;
-    assert!(rc.lookup("geo", &key(101), surface).await.is_none());
-    assert_eq!(
-        reached(),
-        (0, AbandonGate::CAP + 1, 1),
-        "a closed gate passes no op, and PINGs once per interval"
+async fn response_cache_write_slots_bound_timed_out_writes() {
+    let op_timeout = Duration::from_millis(50);
+    let hold = Duration::from_millis(400);
+    let mut rc = test_response_cache(
+        Arc::new(SlowBackend),
+        &["geo"],
+        op_timeout.as_millis() as u64,
     );
-    assert_eq!(
-        rc.errors_for(surface).load(Ordering::Relaxed),
-        AbandonGate::CAP + 2,
-        "every refused op still counts as an error"
-    );
-
-    tokio::time::sleep(probe_interval).await;
-    assert!(
-        rc.lookup("geo", &hot, surface).await.is_none(),
-        "no L1 hit is served while the gate is closed"
-    );
-    assert_eq!(reached().2, 2, "the next interval PINGs again");
-
-    backend.stalled.store(false, Ordering::Relaxed);
-    tokio::time::sleep(probe_interval).await;
-    assert!(
-        rc.lookup("geo", &hot, surface).await.is_some(),
-        "the PING answer reopens the gate for an L1 hit"
-    );
-    rc.store("geo", &key(102), &entry, surface).await;
-    assert_eq!(reached(), (0, AbandonGate::CAP + 2, 3));
-    assert_eq!(rc.stores_for(surface).load(Ordering::Relaxed), 2);
-}
-
-// LAB-10850: the cap holds for writes started together, before any has
-// timed out, and a write whose caller gives up still holds its place.
-#[tokio::test]
-async fn response_cache_abandon_gate_caps_concurrent_and_cancelled_writes() {
-    let backend = Arc::new(StallableBackend::default());
-    backend.stalled.store(true, Ordering::Relaxed);
-    let mut rc = test_response_cache(backend.clone(), &["geo"], 200);
-    rc.gate = Some(AbandonGate::new(
-        backend.clone(),
-        AbandonGate::PROBE_INTERVAL,
-    ));
+    rc.write_slots = Some(WriteSlots::new(hold));
     let rc = Arc::new(rc);
+    let surface = CacheSurface::Messages;
     let entry = Arc::new(CachedResponse {
         status: 200,
         content_type: "application/json".to_string(),
         body: b"{}".to_vec(),
     });
-    let store = |i: u64| {
+    let errors = || rc.errors_for(surface).load(Ordering::Relaxed);
+    let free = || rc.write_slots.as_ref().unwrap().free.available_permits();
+
+    let mut burst = tokio::task::JoinSet::new();
+    for i in 0..WriteSlots::CAP {
         let (rc, entry) = (rc.clone(), entry.clone());
-        async move {
-            rc.store("geo", &format!("{i:064x}"), &entry, CacheSurface::Messages)
-                .await;
-        }
-    };
+        burst.spawn(async move { rc.store("geo", &format!("k{i}"), &entry, surface).await });
+    }
+    burst.join_all().await;
+    assert_eq!(free(), 0, "timed-out writes keep their slots");
+    assert_eq!(errors(), WriteSlots::CAP as u64, "each timed out");
 
-    // Cancelled long before op_timeout: fred may still hold the SET.
+    let sent = std::time::Instant::now();
+    rc.store("geo", "refused", &entry, surface).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), store(0))
-            .await
-            .is_err()
+        sent.elapsed() < op_timeout,
+        "a write with no slot is skipped at once, not sent"
     );
+    assert_eq!(
+        errors(),
+        WriteSlots::CAP as u64 + 1,
+        "and counts as an error"
+    );
+
+    eventually("the hold to end", Duration::from_secs(5), || {
+        free() == WriteSlots::CAP
+    })
+    .await;
+}
+
+// LAB-11758: a client that disconnects mid-write must not take a slot from
+// every other client, so a cancelled write frees its slot at once.
+#[tokio::test]
+async fn response_cache_write_slots_free_when_the_request_is_cancelled() {
+    let mut rc = test_response_cache(Arc::new(SlowBackend), &["geo"], 30_000);
+    rc.write_slots = Some(WriteSlots::new(Duration::from_secs(3600)));
+    let rc = Arc::new(rc);
+    let free = || rc.write_slots.as_ref().unwrap().free.available_permits();
     let mut writes = tokio::task::JoinSet::new();
-    for i in 1..=40 {
-        writes.spawn(store(i));
-    }
-    writes.join_all().await;
-    assert_eq!(
-        backend.sets.load(Ordering::Relaxed),
-        AbandonGate::CAP,
-        "the cancelled write plus concurrent ones never exceed the cap"
-    );
-}
-
-// LAB-10850: an answer clears only the ops abandoned before the answered op
-// was admitted. A reply that was ready before an outage but read after it
-// says nothing about the ops queued since.
-#[tokio::test]
-async fn response_cache_abandon_gate_late_answer_keeps_newer_abandonments() {
-    let backend = Arc::new(StallableBackend::default());
-    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
-    let deadline = || tokio::time::Instant::now() + Duration::from_secs(1);
-    let closed = |gate: &AbandonGate| gate.counts().abandoned >= AbandonGate::CAP;
-
-    let old = gate.admit(false, deadline()).await.expect("open gate");
-    for _ in 0..AbandonGate::CAP {
-        drop(gate.admit(true, deadline()).await.expect("under the cap"));
-    }
-    assert!(closed(&gate));
-    old.answered();
-    assert!(
-        closed(&gate),
-        "a late answer must not forget newer abandonments"
-    );
-    // That answer makes the next PING due at once; hold it off to show the
-    // gate refuses ops meanwhile.
-    gate.counts().next_probe = std::time::Instant::now() + Duration::from_secs(3600);
-    assert!(gate.admit(true, deadline()).await.is_none());
-
-    // The PING is admitted after every abandonment, so its answer clears them.
-    gate.counts().next_probe = std::time::Instant::now();
-    gate.probe_slot().expect("probe due").answered();
-    assert!(!closed(&gate), "an answer to a newer op reopens the gate");
-}
-
-// LAB-10850: cancelled requests close the gate even on a healthy Redis, so
-// one tenant could pause the cache for all. Each close PINGs at once, and the
-// reply reopens the gate for the very request that sent it.
-#[tokio::test]
-async fn response_cache_abandon_gate_false_close_reopens_at_once() {
-    let backend = Arc::new(StallableBackend::default());
-    let mut rc = test_response_cache(backend.clone(), &["geo"], 100);
-    rc.gate = Some(AbandonGate::new(
-        backend.clone(),
-        AbandonGate::PROBE_INTERVAL,
-    ));
-    let gate = rc.gate.as_ref().unwrap();
-    let surface = CacheSurface::Messages;
-    let far = tokio::time::Instant::now() + Duration::from_secs(1);
-    for round in 1..=2 {
-        for _ in 0..AbandonGate::CAP {
-            // A request cancelled mid-op, on a live backend.
-            drop(gate.admit(true, far).await.expect("gate open"));
-        }
-        assert!(rc.lookup("geo", &"e".repeat(64), surface).await.is_none());
-        assert_eq!(
-            (
-                backend.pings.load(Ordering::Relaxed),
-                rc.misses_for(surface).load(Ordering::Relaxed),
-            ),
-            (round, round),
-            "close {round} PINGs at once and the lookup reaches Redis"
-        );
-    }
-}
-
-// LAB-10850: the probe runs inside the probing op's own op_timeout, so a
-// closed gate never stretches a request past it.
-#[tokio::test]
-async fn response_cache_abandon_gate_probe_shares_the_op_timeout() {
-    let budget = Duration::from_millis(100);
-    let backend = Arc::new(StallableBackend::default());
-    let mut rc = test_response_cache(backend.clone(), &["geo"], budget.as_millis() as u64);
-    rc.gate = Some(AbandonGate::new(
-        backend.clone(),
-        AbandonGate::PROBE_INTERVAL,
-    ));
-    let gate = rc.gate.as_ref().unwrap();
-    let far = tokio::time::Instant::now() + Duration::from_secs(1);
-    for _ in 0..AbandonGate::CAP {
-        drop(gate.admit(true, far).await.expect("under the cap"));
-    }
-
-    // PING and GET take 70 ms each: together they would overrun the budget.
-    backend.delay_ms.store(70, Ordering::Relaxed);
-    let surface = CacheSurface::Messages;
-    let started = std::time::Instant::now();
-    assert!(rc.lookup("geo", &"d".repeat(64), surface).await.is_none());
-    let elapsed = started.elapsed();
-    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        gate.counts().abandoned,
-        1,
-        "the PING answered and reopened the gate; only the GET was abandoned"
-    );
-    assert_eq!(
-        rc.misses_for(surface).load(Ordering::Relaxed),
-        0,
-        "the GET ran past the budget left after the PING ({elapsed:?})"
-    );
-    assert_eq!(rc.errors_for(surface).load(Ordering::Relaxed), 1);
-    assert!(
-        elapsed < budget + Duration::from_millis(30),
-        "the lookup took {elapsed:?} against a {budget:?} budget"
-    );
-}
-
-// LAB-10850: ops admitted before the gate closed and abandoned while the
-// PING is in flight keep it closed after the PONG. Redis just answered, so
-// the next PING goes at once instead of an interval out.
-#[tokio::test]
-async fn response_cache_abandon_gate_answer_while_still_closed_probes_at_once() {
-    let backend = Arc::new(StallableBackend::default());
-    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
-    let far = tokio::time::Instant::now() + Duration::from_secs(1);
-    let mut reads = Vec::new();
-    for _ in 0..2 * AbandonGate::CAP {
-        reads.push(
-            gate.admit(false, far)
+    for i in 0..WriteSlots::CAP {
+        let rc = rc.clone();
+        writes.spawn(async move {
+            let entry = CachedResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: b"{}".to_vec(),
+            };
+            rc.store("geo", &format!("k{i}"), &entry, CacheSurface::Messages)
                 .await
-                .expect("reads pass an open gate"),
-        );
+        });
     }
-    let late = reads.split_off(AbandonGate::CAP as usize);
-    drop(reads);
-    let ping = gate.probe_slot().expect("a close PINGs at once");
-    drop(late);
-    ping.answered();
-    assert_eq!(
-        gate.counts().abandoned,
-        AbandonGate::CAP,
-        "ops abandoned after the PING's admission stay counted"
-    );
-    assert!(
-        gate.probe_slot().is_some(),
-        "an answer that leaves the gate closed makes the next PING due now"
-    );
+    eventually("every write to take a slot", Duration::from_secs(5), || {
+        free() == 0
+    })
+    .await;
+    writes.shutdown().await;
+    assert_eq!(free(), WriteSlots::CAP);
 }
 
-// LAB-11737: a request that wins the probe and disconnects mid-PING does
-// not cancel the PING. Its answer still reopens the gate, so such a caller
-// cannot hold the cache paused one probe interval at a time.
+// LAB-11758: a write that returns, stored or failed, frees its slot at once.
 #[tokio::test]
-async fn response_cache_abandon_gate_cancelled_request_still_lands_its_ping() {
-    let backend = Arc::new(StallableBackend::default());
-    let gate = AbandonGate::new(backend.clone(), AbandonGate::PROBE_INTERVAL);
-    // Far enough out that a loaded runner cannot time the PING out.
-    let far = tokio::time::Instant::now() + Duration::from_secs(60);
-    for _ in 0..AbandonGate::CAP {
-        drop(gate.admit(true, far).await.expect("under the cap"));
-    }
-
-    backend.delay_ms.store(300, Ordering::Relaxed);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(10), gate.admit(false, far))
-            .await
-            .is_err(),
-        "the caller gives up first"
-    );
-    // The current-thread runtime polls the spawned PING before it can fire
-    // the caller's timeout, so the PING was in flight when the caller left.
-    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
-    for _ in 0..500 {
-        if gate.counts().abandoned < AbandonGate::CAP {
-            break;
+async fn response_cache_write_slots_free_when_the_write_returns() {
+    let entry = CachedResponse {
+        status: 200,
+        content_type: "application/json".to_string(),
+        body: b"{}".to_vec(),
+    };
+    let surface = CacheSurface::Messages;
+    let backends: [cachekit::SharedBackend; 2] = [
+        Arc::new(RecordingBackend::default()),
+        Arc::new(ErroringBackend),
+    ];
+    for backend in backends {
+        let mut rc = test_response_cache(backend, &["geo"], 5000);
+        rc.write_slots = Some(WriteSlots::new(Duration::from_secs(3600)));
+        for i in 0..2 * WriteSlots::CAP {
+            rc.store("geo", &format!("k{i}"), &entry, surface).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            rc.write_slots.as_ref().unwrap().free.available_permits(),
+            WriteSlots::CAP
+        );
     }
-    assert_eq!(
-        gate.counts().abandoned,
-        0,
-        "the PING answered after its caller left and reopened the gate"
-    );
-    assert_eq!(backend.pings.load(Ordering::Relaxed), 1);
-    assert!(gate.admit(false, far).await.is_some());
 }
 
 // AC11 (redis): the real fred-backed RedisBackend against a dead port at
-// startup — not a config error, but the cache is disabled, so no op queues
-// in a fred client that will never connect.
+// startup — not a config error, but the cache is disabled: the backend
+// connects once and would never reconnect.
 #[tokio::test]
 async fn response_cache_redis_backend_unreachable_at_startup_disables_cache() {
     let cfg = ResponseCacheConfig {
@@ -1200,7 +972,7 @@ async fn response_cache_redis_backend_unreachable_at_startup_disables_cache() {
         ResponseCache::from_config(&sentinel).await.is_err(),
         "the \"-\" client is refused even while Redis is down"
     );
-    // `AbandonGate` needs one connection answering in order.
+    // `disable_offline_queue` supports one connection only.
     assert!(
         ResponseCache::from_config(&cluster).await.is_err(),
         "a cluster URL is refused"
