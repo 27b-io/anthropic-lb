@@ -1486,24 +1486,14 @@ request proceeds upstream exactly as if the cache did not exist. With
   (logged at error level, and no `anthropic_response_cache_*` series appear)
   until the next restart.
 - A connection dropped mid-run reconnects on its own, with backoff up to 30 s.
-  The Redis driver keeps each operation that timed out or was cancelled
-  queued in memory, value included, and replays it once Redis is back. So a
-  write is sent only while writes in flight plus abandoned operations not yet
-  known to be drained number 16 or fewer: an outage holds at most 16 written
-  entries. On a healthy Redis this also means a 17th concurrent write is
-  skipped. Reads carry no entry and are sent until 16 operations have been
-  abandoned. Then the cache pauses: no operation is sent, L1 hits included.
-  A PING checks Redis at once, inside the paused request's `op_timeout_ms`,
-  and its reply resumes the cache. If operations abandoned while it was in
-  flight keep the cache paused, the next PING is sent at once too. Only a
-  PING that times out or is refused pushes the next one 5 s out; a request
-  that disconnects mid-PING leaves the PING running until Redis answers or
-  that request's `op_timeout_ms` runs out. Operations
-  the cache skips count as errors. The Redis user needs the `PING` command
-  (`+ping` under an ACL), or a pause never ends. `redis_url` must start with
-  `redis://` or `rediss://`; a cluster URL is refused.
+  While it is down, every operation is refused at once and counts as an
+  error: none is queued in memory, and none is replayed once Redis is back.
+  `redis_url` must start with `redis://` or `rediss://`; a cluster or
+  sentinel URL is refused.
 - A connection with a reply pending for more than 5 s is closed and
-  re-established.
+  re-established, within a further 4 s. Until then operations are still
+  written to it and time out at `op_timeout_ms`; most fail when it closes,
+  but some can reach Redis after the reconnect.
 
 Hit / miss / store / error counters are exposed on `/metrics`, one series per endpoint
 (`anthropic_response_cache_*_total{surface="messages"}` and
