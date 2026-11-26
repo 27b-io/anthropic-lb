@@ -1495,9 +1495,11 @@ request proceeds upstream exactly as if the cache did not exist. With
   written to it and time out at `op_timeout_ms`, and the Redis driver keeps
   each one in memory, entry included; most fail when it closes, but some can
   reach Redis after the reconnect. So a write needs one of 16 slots: a write
-  that times out or whose request is cancelled keeps its slot for 10 s, and a
-  write with no free slot is skipped and counts as an error. A stalled
-  connection is handed at most 16 entries per 10 s. On a healthy Redis this
+  that times out keeps its slot for 10 s, and a write with no free slot is
+  skipped and counts as an error. A stalled connection is handed at most 16
+  entries per 10 s, plus any write whose request was cancelled inside its
+  `op_timeout_ms`: that one frees its slot at once, so a client that
+  disconnects cannot hold up other clients' writes. On a healthy Redis this
   also means a 17th concurrent write is skipped. Reads take no slot.
 
 Hit / miss / store / error counters are exposed on `/metrics`, one series per endpoint

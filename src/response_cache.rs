@@ -77,11 +77,17 @@ pub(crate) struct ResponseCache {
 /// caller gave up at `op_timeout`.
 ///
 /// So a write needs one of `CAP` slots. A write that ends, either way, frees
-/// its slot at once. One abandoned, by `op_timeout` or by its request being
-/// cancelled, keeps the slot for `HOLD`, by when fred has closed the
-/// connection and refuses new ops. A stalled connection is therefore handed
-/// at most `CAP` values per `HOLD`. On a healthy Redis this also caps
-/// concurrent writes at `CAP`. Reads carry no value and take no slot.
+/// its slot at once. One that times out keeps the slot for `HOLD`, by when
+/// fred has closed the connection and refuses new ops. A stalled connection
+/// is therefore handed at most `CAP` values per `HOLD`. On a healthy Redis
+/// this also caps concurrent writes at `CAP`. Reads carry no value and take
+/// no slot.
+///
+/// A write whose request is cancelled frees its slot at once, though fred may
+/// still hold it. Holding the slot would let one client that disconnects mid
+/// write, on a healthy Redis, stop every client's writes for `HOLD`. So a
+/// stalled connection can hold more than `CAP` values, by the writes
+/// cancelled inside their `op_timeout`.
 struct WriteSlots {
     free: Arc<tokio::sync::Semaphore>,
     hold: Duration,
@@ -100,41 +106,17 @@ impl WriteSlots {
     }
 
     /// A slot for one write, or `None` when all are taken.
-    fn take(&self) -> Option<WriteSlot> {
-        let permit = self.free.clone().try_acquire_owned().ok()?;
-        Some(WriteSlot {
-            permit: Some(permit),
-            hold: self.hold,
-        })
+    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.free.clone().try_acquire_owned().ok()
     }
-}
 
-/// One write's slot. Dropped without `ended`, the write was abandoned.
-struct WriteSlot {
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    hold: Duration,
-}
-
-impl WriteSlot {
-    /// The write returned, so fred no longer holds its value.
-    fn ended(mut self) {
-        self.permit.take();
-    }
-}
-
-impl Drop for WriteSlot {
-    fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        // No runtime means shutdown: the permit just drops.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let hold = self.hold;
-            runtime.spawn(async move {
-                tokio::time::sleep(hold).await;
-                drop(permit);
-            });
-        }
+    /// Keep a timed-out write's slot taken for `hold`.
+    fn hold(&self, slot: tokio::sync::OwnedSemaphorePermit) {
+        let hold = self.hold;
+        tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
+            drop(slot);
+        });
     }
 }
 
@@ -483,14 +465,14 @@ impl ResponseCache {
                     self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
                     return;
                 };
-                Some(slot)
+                Some((slots, slot))
             }
             None => None,
         };
         let op = async { cache.secure_cache()?.set(key, entry).await };
         let outcome = tokio::time::timeout(self.op_timeout, op).await;
-        if let (Ok(_), Some(slot)) = (&outcome, slot) {
-            slot.ended();
+        if let (Err(_), Some((slots, slot))) = (&outcome, slot) {
+            slots.hold(slot); // fred may still hold the SET and its value
         }
         match outcome {
             Ok(Ok(())) => {

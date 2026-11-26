@@ -834,10 +834,10 @@ async fn response_cache_metrics_absent_without_config() {
 
 // LAB-11758: a Redis connection that stops answering is still handed writes
 // until fred closes it, and fred keeps each one, value included, after its
-// caller gave up. So abandoned writes keep their slot for the hold: the
+// caller gave up. So timed-out writes keep their slot for the hold: the
 // write after the last slot is skipped at once, and writes resume after it.
 #[tokio::test]
-async fn response_cache_write_slots_bound_abandoned_writes() {
+async fn response_cache_write_slots_bound_timed_out_writes() {
     let op_timeout = Duration::from_millis(50);
     let hold = Duration::from_millis(400);
     let mut rc = test_response_cache(
@@ -856,39 +856,60 @@ async fn response_cache_write_slots_bound_abandoned_writes() {
     let errors = || rc.errors_for(surface).load(Ordering::Relaxed);
     let free = || rc.write_slots.as_ref().unwrap().free.available_permits();
 
-    // One write cancelled by its request (or timed out first, on a slow
-    // host), the rest timing out.
-    let cancelled = {
-        let (rc, entry) = (rc.clone(), entry.clone());
-        tokio::spawn(async move { rc.store("geo", "cancelled", &entry, surface).await })
-    };
-    eventually("the write to take its slot", Duration::from_secs(5), || {
-        free() == WriteSlots::CAP - 1
-    })
-    .await;
-    cancelled.abort();
-    let _ = cancelled.await;
     let mut burst = tokio::task::JoinSet::new();
-    for i in 1..WriteSlots::CAP {
+    for i in 0..WriteSlots::CAP {
         let (rc, entry) = (rc.clone(), entry.clone());
         burst.spawn(async move { rc.store("geo", &format!("k{i}"), &entry, surface).await });
     }
     burst.join_all().await;
-    assert_eq!(free(), 0, "abandoned writes keep their slots");
+    assert_eq!(free(), 0, "timed-out writes keep their slots");
+    assert_eq!(errors(), WriteSlots::CAP as u64, "each timed out");
 
-    let errors_before = errors();
     let sent = std::time::Instant::now();
     rc.store("geo", "refused", &entry, surface).await;
     assert!(
         sent.elapsed() < op_timeout,
         "a write with no slot is skipped at once, not sent"
     );
-    assert_eq!(errors(), errors_before + 1, "and counts as an error");
+    assert_eq!(
+        errors(),
+        WriteSlots::CAP as u64 + 1,
+        "and counts as an error"
+    );
 
     eventually("the hold to end", Duration::from_secs(5), || {
         free() == WriteSlots::CAP
     })
     .await;
+}
+
+// LAB-11758: a client that disconnects mid-write must not take a slot from
+// every other client, so a cancelled write frees its slot at once.
+#[tokio::test]
+async fn response_cache_write_slots_free_when_the_request_is_cancelled() {
+    let mut rc = test_response_cache(Arc::new(SlowBackend), &["geo"], 30_000);
+    rc.write_slots = Some(WriteSlots::new(Duration::from_secs(3600)));
+    let rc = Arc::new(rc);
+    let free = || rc.write_slots.as_ref().unwrap().free.available_permits();
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..WriteSlots::CAP {
+        let rc = rc.clone();
+        writes.spawn(async move {
+            let entry = CachedResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: b"{}".to_vec(),
+            };
+            rc.store("geo", &format!("k{i}"), &entry, CacheSurface::Messages)
+                .await
+        });
+    }
+    eventually("every write to take a slot", Duration::from_secs(5), || {
+        free() == 0
+    })
+    .await;
+    writes.shutdown().await;
+    assert_eq!(free(), WriteSlots::CAP);
 }
 
 // LAB-11758: a write that returns, stored or failed, frees its slot at once.
