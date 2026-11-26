@@ -1492,8 +1492,13 @@ request proceeds upstream exactly as if the cache did not exist. With
   sentinel URL is refused.
 - A connection with a reply pending for more than 5 s is closed and
   re-established, within a further 4 s. Until then operations are still
-  written to it and time out at `op_timeout_ms`; most fail when it closes,
-  but some can reach Redis after the reconnect.
+  written to it and time out at `op_timeout_ms`, and the Redis driver keeps
+  each one in memory, entry included; most fail when it closes, but some can
+  reach Redis after the reconnect. So a write needs one of 16 slots: a write
+  that times out or whose request is cancelled keeps its slot for 10 s, and a
+  write with no free slot is skipped and counts as an error. A stalled
+  connection is handed at most 16 entries per 10 s. On a healthy Redis this
+  also means a 17th concurrent write is skipped. Reads take no slot.
 
 Hit / miss / store / error counters are exposed on `/metrics`, one series per endpoint
 (`anthropic_response_cache_*_total{surface="messages"}` and

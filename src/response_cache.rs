@@ -64,6 +64,78 @@ pub(crate) struct ResponseCache {
     count_tokens_misses: AtomicU64,
     count_tokens_errors: AtomicU64,
     count_tokens_stores: AtomicU64,
+    /// Redis backend only: the cachekitio backend's HTTP client cancels an
+    /// abandoned request, so it holds no value past the caller.
+    write_slots: Option<WriteSlots>,
+}
+
+/// Bounds the values fred can hold for a Redis connection that stays open
+/// but stops answering (LAB-11758). `disable_offline_queue` refuses ops only
+/// once fred reports the drop, and fred closes such a connection only after
+/// cachekit's 5 s command timeout plus a check up to 4 s later. Until then
+/// each write is handed to fred, value included, and stays there after its
+/// caller gave up at `op_timeout`.
+///
+/// So a write needs one of `CAP` slots. A write that ends, either way, frees
+/// its slot at once. One abandoned, by `op_timeout` or by its request being
+/// cancelled, keeps the slot for `HOLD`, by when fred has closed the
+/// connection and refuses new ops. A stalled connection is therefore handed
+/// at most `CAP` values per `HOLD`. On a healthy Redis this also caps
+/// concurrent writes at `CAP`. Reads carry no value and take no slot.
+struct WriteSlots {
+    free: Arc<tokio::sync::Semaphore>,
+    hold: Duration,
+}
+
+impl WriteSlots {
+    pub(crate) const CAP: usize = 16;
+    /// Past the 9 s fred can take to close an unanswering connection.
+    const HOLD: Duration = Duration::from_secs(10);
+
+    fn new(hold: Duration) -> Self {
+        Self {
+            free: Arc::new(tokio::sync::Semaphore::new(Self::CAP)),
+            hold,
+        }
+    }
+
+    /// A slot for one write, or `None` when all are taken.
+    fn take(&self) -> Option<WriteSlot> {
+        let permit = self.free.clone().try_acquire_owned().ok()?;
+        Some(WriteSlot {
+            permit: Some(permit),
+            hold: self.hold,
+        })
+    }
+}
+
+/// One write's slot. Dropped without `ended`, the write was abandoned.
+struct WriteSlot {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    hold: Duration,
+}
+
+impl WriteSlot {
+    /// The write returned, so fred no longer holds its value.
+    fn ended(mut self) {
+        self.permit.take();
+    }
+}
+
+impl Drop for WriteSlot {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        // No runtime means shutdown: the permit just drops.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let hold = self.hold;
+            runtime.spawn(async move {
+                tokio::time::sleep(hold).await;
+                drop(permit);
+            });
+        }
+    }
 }
 
 /// First 16 hex chars of a cache-key digest — the ONLY form a cache key may
@@ -210,9 +282,8 @@ impl ResponseCache {
                 // down every op is refused at once and fails open. Without it
                 // fred queues each op abandoned at op_timeout, value included,
                 // and replays it after the reconnect. Not covered: a
-                // connection that stays open but stops answering. Ops are
-                // still written to it until fred closes it, up to 4 s after
-                // the command timeout, and most then fail.
+                // connection that stays open but stops answering, which
+                // `WriteSlots` bounds.
                 let b = std::sync::Arc::new(
                     cachekit::backend::redis::RedisBackend::builder()
                         .url(url)
@@ -271,7 +342,10 @@ impl ResponseCache {
             return Ok(None);
         }
         info!("response cache redis backend connected");
-        Ok(Some(rc))
+        Ok(Some(Self {
+            write_slots: Some(WriteSlots::new(WriteSlots::HOLD)),
+            ..rc
+        }))
     }
 
     /// Assemble per-client caches over a shared backend. Split out from
@@ -318,6 +392,7 @@ impl ResponseCache {
             count_tokens_misses: AtomicU64::new(0),
             count_tokens_errors: AtomicU64::new(0),
             count_tokens_stores: AtomicU64::new(0),
+            write_slots: None,
         })
     }
 
@@ -401,8 +476,23 @@ impl ResponseCache {
         let Some(cache) = self.clients.get(client_id) else {
             return;
         };
+        let slot = match &self.write_slots {
+            Some(slots) => {
+                let Some(slot) = slots.take() else {
+                    // No per-write log: each write that took a slot logged.
+                    self.errors_for(surface).fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                Some(slot)
+            }
+            None => None,
+        };
         let op = async { cache.secure_cache()?.set(key, entry).await };
-        match tokio::time::timeout(self.op_timeout, op).await {
+        let outcome = tokio::time::timeout(self.op_timeout, op).await;
+        if let (Ok(_), Some(slot)) = (&outcome, slot) {
+            slot.ended();
+        }
+        match outcome {
             Ok(Ok(())) => {
                 self.stores_for(surface).fetch_add(1, Ordering::Relaxed);
             }
